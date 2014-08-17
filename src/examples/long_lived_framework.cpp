@@ -25,6 +25,7 @@
 
 #include <mesos/scheduler.hpp>
 
+#include <stout/numify.hpp>
 #include <stout/os.hpp>
 #include <stout/stringify.hpp>
 
@@ -45,7 +46,7 @@ const int32_t MEM_PER_TASK = 32;
 class LongLivedScheduler : public Scheduler
 {
 public:
-  LongLivedScheduler(const ExecutorInfo& _executor)
+  explicit LongLivedScheduler(const ExecutorInfo& _executor)
     : executor(_executor),
       tasksLaunched(0) {}
 
@@ -178,11 +179,9 @@ int main(int argc, char** argv)
   framework.set_user(""); // Have Mesos fill in the current user.
   framework.set_name("Long Lived Framework (C++)");
 
-  // TODO(vinod): Make checkpointing the default when it is default
-  // on the slave.
   if (os::hasenv("MESOS_CHECKPOINT")) {
-    cout << "Enabling checkpoint for the framework" << endl;
-    framework.set_checkpoint(true);
+    framework.set_checkpoint(
+        numify<bool>(os::getenv("MESOS_CHECKPOINT")).get());
   }
 
   MesosSchedulerDriver* driver;
@@ -201,9 +200,13 @@ int main(int argc, char** argv)
     credential.set_principal(getenv("DEFAULT_PRINCIPAL"));
     credential.set_secret(getenv("DEFAULT_SECRET"));
 
+    framework.set_principal(getenv("DEFAULT_PRINCIPAL"));
+
     driver = new MesosSchedulerDriver(
         &scheduler, framework, argv[1], credential);
   } else {
+    framework.set_principal("long-lived-framework-cpp");
+
     driver = new MesosSchedulerDriver(
         &scheduler, framework, argv[1]);
   }

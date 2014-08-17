@@ -17,13 +17,21 @@
  */
 
 #include <map>
+#include <set>
 #include <sstream>
 #include <vector>
 
+#include <process/owned.hpp>
+#include <process/pid.hpp>
+
 #include <stout/exit.hpp>
 #include <stout/foreach.hpp>
+#include <stout/os.hpp>
 #include <stout/path.hpp>
+#include <stout/try.hpp>
 #include <stout/strings.hpp>
+
+#include "authorizer/authorizer.hpp"
 
 #include "common/protobuf_utils.hpp"
 
@@ -45,11 +53,12 @@
 #include "slave/slave.hpp"
 
 #include "state/in_memory.hpp"
-#include "state/leveldb.hpp"
+#include "state/log.hpp"
 #include "state/protobuf.hpp"
 #include "state/storage.hpp"
 
 using namespace mesos::internal;
+using namespace mesos::internal::log;
 
 using mesos::internal::master::allocator::Allocator;
 using mesos::internal::master::allocator::AllocatorProcess;
@@ -63,10 +72,12 @@ using mesos::internal::master::Repairer;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Slave;
 
+using process::Owned;
 using process::PID;
 using process::UPID;
 
 using std::map;
+using std::set;
 using std::string;
 using std::stringstream;
 using std::vector;
@@ -78,6 +89,7 @@ namespace local {
 
 static Allocator* allocator = NULL;
 static AllocatorProcess* allocatorProcess = NULL;
+static Log* log = NULL;
 static state::Storage* storage = NULL;
 static state::protobuf::State* state = NULL;
 static Registrar* registrar = NULL;
@@ -86,6 +98,7 @@ static Master* master = NULL;
 static map<Containerizer*, Slave*> slaves;
 static StandaloneMasterDetector* detector = NULL;
 static MasterContender* contender = NULL;
+static Option<Authorizer*> authorizer = None();
 static Files* files = NULL;
 
 
@@ -116,12 +129,29 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
               << "master flags from the environment: " << load.error();
     }
 
-    if (flags.registry_strict) {
-      EXIT(1) << "Cannot run with --registry_strict; currently not supported";
-    }
-
     if (flags.registry == "in_memory") {
+      if (flags.registry_strict) {
+        EXIT(1) << "Cannot use '--registry_strict' when using in-memory storage"
+                << " based registry";
+      }
       storage = new state::InMemoryStorage();
+    } else if (flags.registry == "replicated_log") {
+      // For local runs, we use a temporary work directory.
+      if (flags.work_dir.isNone()) {
+        CHECK_SOME(os::mkdir("/tmp/mesos/local"));
+
+        Try<string> directory = os::mkdtemp("/tmp/mesos/local/XXXXXX");
+        CHECK_SOME(directory);
+        flags.work_dir = directory.get();
+      }
+
+      // TODO(vinod): Add support for replicated log with ZooKeeper.
+      log = new Log(
+          1,
+          path::join(flags.work_dir.get(), "replicated_log"),
+          set<UPID>(),
+          flags.log_auto_initialize);
+      storage = new state::LogStorage(log);
     } else {
       EXIT(1) << "'" << flags.registry << "' is not a supported"
               << " option for registry persistence";
@@ -135,15 +165,29 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
     contender = new StandaloneMasterContender();
     detector = new StandaloneMasterDetector();
-    master =
-      new Master(
+
+    if (flags.acls.isSome()) {
+      Try<Owned<Authorizer> > authorizer_ =
+        Authorizer::create(flags.acls.get());
+
+      if (authorizer_.isError()) {
+        EXIT(1) << "Failed to initialize the authorizer: "
+                << authorizer_.error() << " (see --acls flag)";
+      }
+      Owned<Authorizer> authorizer__ = authorizer_.get();
+      authorizer = authorizer__.release();
+    }
+
+    master = new Master(
         _allocator,
         registrar,
         repairer,
         files,
         contender,
         detector,
+        authorizer,
         flags);
+
     detector->appoint(master->info());
   }
 
@@ -154,6 +198,7 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
   for (int i = 0; i < flags.num_slaves; i++) {
     slave::Flags flags;
     Try<Nothing> load = flags.load("MESOS_");
+
     if (load.isError()) {
       EXIT(1) << "Failed to start a local cluster while loading "
               << "slave flags from the environment: " << load.error();
@@ -203,6 +248,11 @@ void shutdown()
 
     slaves.clear();
 
+    if (authorizer.isSome()) {
+      delete authorizer.get();
+      authorizer = None();
+    }
+
     delete detector;
     detector = NULL;
 
@@ -223,6 +273,9 @@ void shutdown()
 
     delete storage;
     storage = NULL;
+
+    delete log;
+    log = NULL;
   }
 }
 

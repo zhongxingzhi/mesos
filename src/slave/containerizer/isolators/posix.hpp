@@ -20,11 +20,14 @@
 #define __POSIX_ISOLATOR_HPP__
 
 #include <stout/hashmap.hpp>
+
 #include <stout/os/pstree.hpp>
 
 #include <process/future.hpp>
 
 #include "slave/containerizer/isolator.hpp"
+
+#include "usage/usage.hpp"
 
 namespace mesos {
 namespace internal {
@@ -64,7 +67,7 @@ public:
     return Nothing();
   }
 
-  virtual process::Future<Nothing> prepare(
+  virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
       const ExecutorInfo& executorInfo)
   {
@@ -77,10 +80,10 @@ public:
         new process::Promise<Limitation>());
     promises.put(containerId, promise);
 
-    return Nothing();
+    return None();
   }
 
-  virtual process::Future<Option<CommandInfo> > isolate(
+  virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,
       pid_t pid)
   {
@@ -90,7 +93,7 @@ public:
 
     pids.put(containerId, pid);
 
-    return None();
+    return Nothing();
   }
 
   virtual process::Future<Limitation> watch(
@@ -156,36 +159,13 @@ public:
       return ResourceStatistics();
     }
 
-    Try<os::ProcessTree> tree = os::pstree(pids.get(containerId).get());
-
-    if (!tree.isSome()) {
-      return ResourceStatistics();
+    // Use 'mesos-usage' but only request 'cpus_' values.
+    Try<ResourceStatistics> usage =
+      mesos::internal::usage(pids.get(containerId).get(), false, true);
+    if (usage.isError()) {
+      return Failure(usage.error());
     }
-
-    ResourceStatistics result;
-
-    std::deque<os::ProcessTree> trees;
-    trees.push_back(tree.get());
-
-    while (!trees.empty()) {
-      os::ProcessTree root = trees.front();
-
-      // We only show utime and stime when both are available, otherwise
-      // we're exposing a partial view of the CPU times.
-      if (root.process.utime.isSome() && root.process.stime.isSome()) {
-        result.set_cpus_user_time_secs(
-            result.cpus_user_time_secs() + root.process.utime.get().secs());
-        result.set_cpus_system_time_secs(
-            result.cpus_system_time_secs() + root.process.stime.get().secs());
-      }
-
-      trees.pop_front();
-      foreach (const os::ProcessTree& child, root.children) {
-        trees.push_back(child);
-      }
-    }
-
-    return result;
+    return usage.get();
   }
 
 private:
@@ -212,32 +192,13 @@ public:
       return ResourceStatistics();
     }
 
-    Try<os::ProcessTree> tree = os::pstree(pids.get(containerId).get());
-
-    if (!tree.isSome()) {
-      return ResourceStatistics();
+    // Use 'mesos-usage' but only request 'mem_' values.
+    Try<ResourceStatistics> usage =
+      mesos::internal::usage(pids.get(containerId).get(), true, false);
+    if (usage.isError()) {
+      return Failure(usage.error());
     }
-
-    ResourceStatistics result;
-
-    std::deque<os::ProcessTree> trees;
-    trees.push_back(tree.get());
-
-    while (!trees.empty()) {
-      os::ProcessTree root = trees.front();
-
-      if (root.process.rss.isSome()) {
-        result.set_mem_rss_bytes(
-            result.mem_rss_bytes() + root.process.rss.get().bytes());
-      }
-
-      trees.pop_front();
-      foreach (const os::ProcessTree& child, root.children) {
-        trees.push_back(child);
-      }
-    }
-
-    return result;
+    return usage.get();
   }
 
 private:

@@ -26,13 +26,12 @@
 
 #include <stout/fatal.hpp>
 
-
 // These two macros create a Factory class that constructs instances of
 // subclasses of a type T, whose constructors take a parameter of type P,
 // based on a registered name for each subclass. To use them:
 //
 // 1) In a header file, call DECLARE_FACTORY(T, P).
-// 
+//
 // 2) In a source file, call DEFINE_FACTORY(T, P) { block }, where the block
 //    calls registerClass<C>("name") for each subclass C of T to register.
 //
@@ -114,7 +113,9 @@ protected:
   }
 };
 
-}}}
+} // namespace factory {
+} // namespace internal {
+} // namespace mesos {
 
 
 #endif

@@ -13,6 +13,7 @@
 #include <process/http.hpp>
 #include <process/io.hpp>
 
+#include <stout/base64.hpp>
 #include <stout/gtest.hpp>
 #include <stout/none.hpp>
 #include <stout/nothing.hpp>
@@ -37,10 +38,21 @@ class HttpProcess : public Process<HttpProcess>
 public:
   HttpProcess()
   {
+    route("/auth", None(), &HttpProcess::auth);
     route("/body", None(), &HttpProcess::body);
     route("/pipe", None(), &HttpProcess::pipe);
     route("/get", None(), &HttpProcess::get);
     route("/post", None(), &HttpProcess::post);
+  }
+
+  Future<http::Response> auth(const http::Request& request)
+  {
+    string encodedAuth = base64::encode("testuser:testpass");
+    Option<string> authHeader = request.headers.get("Authorization");
+    if (!authHeader.isSome() || (authHeader.get() != "Basic " + encodedAuth)) {
+      return http::Unauthorized("testrealm");
+    }
+    return http::OK();
   }
 
   MOCK_METHOD1(body, Future<http::Response>(const http::Request&));
@@ -48,6 +60,48 @@ public:
   MOCK_METHOD1(get, Future<http::Response>(const http::Request&));
   MOCK_METHOD1(post, Future<http::Response>(const http::Request&));
 };
+
+
+TEST(HTTP, auth)
+{
+  ASSERT_TRUE(GTEST_IS_THREADSAFE);
+
+  HttpProcess process;
+
+  spawn(process);
+
+  // Test the case where there is no auth.
+  Future<http::Response> noAuthFuture = http::get(process.self(), "auth");
+
+  AWAIT_READY(noAuthFuture);
+  EXPECT_EQ(http::statuses[401], noAuthFuture.get().status);
+  ASSERT_SOME_EQ("Basic realm=\"testrealm\"",
+                 noAuthFuture.get().headers.get("WWW-authenticate"));
+
+  // Now test passing wrong auth header.
+  hashmap<string, string> headers;
+  headers["Authorization"] = "Basic " + base64::encode("testuser:wrongpass");
+
+  Future<http::Response> wrongAuthFuture =
+    http::get(process.self(), "auth", None(), headers);
+
+  AWAIT_READY(wrongAuthFuture);
+  EXPECT_EQ(http::statuses[401], wrongAuthFuture.get().status);
+  ASSERT_SOME_EQ("Basic realm=\"testrealm\"",
+                 wrongAuthFuture.get().headers.get("WWW-authenticate"));
+
+  // Now test passing right auth header.
+  headers["Authorization"] = "Basic " + base64::encode("testuser:testpass");
+
+  Future<http::Response> rightAuthFuture =
+    http::get(process.self(), "auth", None(), headers);
+
+  AWAIT_READY(rightAuthFuture);
+  EXPECT_EQ(http::statuses[200], rightAuthFuture.get().status);
+
+  terminate(process);
+  wait(process);
+}
 
 
 TEST(HTTP, Endpoints)
@@ -133,6 +187,10 @@ TEST(HTTP, Encode)
             "%25%7B%7D%7C%5C%5E%7E%5B%5D%60%19%80%FF%00",
             encoded);
 
+  EXPECT_SOME_EQ(unencoded, http::decode(encoded));
+
+  encoded = "a%24%26%2B%2C%2F%3A%3B%3D%3F%40+%22%3C%3E%23"
+            "%25%7B%7D%7C%5C%5E%7E%5B%5D%60%19%80%FF%00";
   EXPECT_SOME_EQ(unencoded, http::decode(encoded));
 
   EXPECT_ERROR(http::decode("%"));
@@ -265,15 +323,32 @@ TEST(HTTP, Post)
 
   // Test the case where there is a content type but no body.
   Future<http::Response> future =
-    http::post(process.self(), "post", None(), "text/plain");
+    http::post(process.self(), "post", None(), None(), "text/plain");
 
   AWAIT_EXPECT_FAILED(future);
 
   EXPECT_CALL(process, post(_))
     .WillOnce(Invoke(validatePost));
 
+  future = http::post(
+      process.self(),
+      "post",
+      None(),
+      "This is the payload.",
+      "text/plain");
+
+  AWAIT_READY(future);
+  ASSERT_EQ(http::statuses[200], future.get().status);
+
+  // Now test passing headers instead.
+  hashmap<string, string> headers;
+  headers["Content-Type"] = "text/plain";
+
+  EXPECT_CALL(process, post(_))
+    .WillOnce(Invoke(validatePost));
+
   future =
-    http::post(process.self(), "post", "This is the payload.", "text/plain");
+    http::post(process.self(), "post", headers, "This is the payload.");
 
   AWAIT_READY(future);
   ASSERT_EQ(http::statuses[200], future.get().status);

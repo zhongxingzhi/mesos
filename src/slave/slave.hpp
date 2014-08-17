@@ -35,6 +35,9 @@
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
 
+#include <process/metrics/counter.hpp>
+#include <process/metrics/gauge.hpp>
+
 #include <stout/bytes.hpp>
 #include <stout/linkedhashmap.hpp>
 #include <stout/hashmap.hpp>
@@ -68,6 +71,10 @@ namespace internal {
 
 class MasterDetector; // Forward declaration.
 
+namespace sasl {
+class Authenticatee;
+} // namespace sasl {
+
 namespace slave {
 
 using namespace process;
@@ -87,11 +94,11 @@ public:
 
   virtual ~Slave();
 
-  void shutdown(const process::UPID& from);
+  void shutdown(const process::UPID& from, const std::string& message);
 
   void registered(const process::UPID& from, const SlaveID& slaveId);
   void reregistered(const process::UPID& from, const SlaveID& slaveId);
-  void doReliableRegistration();
+  void doReliableRegistration(const Duration& duration);
 
   void runTask(
       const process::UPID& from,
@@ -157,15 +164,26 @@ public:
   // status updates it generated (e.g., TASK_LOST).
   void statusUpdate(const StatusUpdate& update, const process::UPID& pid);
 
+  // Continue handling the status update after optionally updating the
+  // container's resources.
+  void _statusUpdate(
+      const Option<Future<Nothing> >& future,
+      const StatusUpdate& update,
+      const UPID& pid,
+      const ExecutorID& executorId,
+      const ContainerID& containerId,
+      bool checkpoint);
+
   // This is called when the status update manager finishes
   // handling the update. If the handling is successful, an
   // acknowledgment is sent to the executor.
-  void _statusUpdate(
+  void __statusUpdate(
       const process::Future<Nothing>& future,
       const StatusUpdate& update,
       const process::UPID& pid);
 
   void statusUpdateAcknowledgement(
+      const process::UPID& from,
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
       const TaskID& taskId,
@@ -177,16 +195,16 @@ public:
       const FrameworkID& frameworkId,
       const UUID& uuid);
 
-  void executorStarted(
+  void executorLaunched(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const ContainerID& containerId,
-      const process::Future<Nothing>& future);
+      const process::Future<bool>& future);
 
   void executorTerminated(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      const process::Future<Containerizer::Termination>& termination);
+      const process::Future<containerizer::Termination>& termination);
 
   // NOTE: Pulled these to public to make it visible for testing.
   // TODO(vinod): Make tests friends to this class instead.
@@ -195,7 +213,7 @@ public:
   // TODO(vinod): Instead of making this function public, we need to
   // mock both GarbageCollector (and pass it through slave's constructor)
   // and os calls.
-  void _checkDiskUsage(const process::Future<Try<double> >& usage);
+  void _checkDiskUsage(const process::Future<double>& usage);
 
   // Shut down an executor. This is a two phase process. First, an
   // executor receives a shut down message (shut down phase), then
@@ -227,6 +245,12 @@ public:
                     const std::string& path);
 
   Nothing detachFile(const std::string& path);
+
+  // Triggers a re-detection of the master when the slave does
+  // not receive a ping.
+  void pingTimeout(process::Future<Option<MasterInfo> > future);
+
+  void authenticate();
 
   // Helper routine to lookup a framework.
   Framework* getFramework(const FrameworkID& frameworkId);
@@ -289,13 +313,19 @@ public:
   // Schedules a 'path' for gc based on its modification time.
   Future<Nothing> garbageCollect(const std::string& path);
 
+  // Called when the slave was signaled from the specified user.
+  void signaled(int signal, int uid);
+
 private:
+  void _authenticate();
+  void authenticationTimeout(process::Future<bool> future);
+
   // Inner class used to namespace HTTP route handlers (see
   // slave/http.cpp for implementations).
   class Http
   {
   public:
-    Http(const Slave& _slave) : slave(_slave) {}
+    explicit Http(Slave* _slave) : slave(_slave) {}
 
     // /slave/health
     process::Future<process::http::Response> health(
@@ -312,7 +342,7 @@ private:
     static const std::string HEALTH_HELP;
 
   private:
-    const Slave& slave;
+    Slave* slave;
   } http;
 
   friend struct Framework;
@@ -320,6 +350,30 @@ private:
 
   Slave(const Slave&);              // No copying.
   Slave& operator = (const Slave&); // No assigning.
+
+  // Gauge methods.
+  double _frameworks_active()
+  {
+    return frameworks.size();
+  }
+
+  double _uptime_secs()
+  {
+    return (Clock::now() - startTime).secs();
+  }
+
+  double _registered()
+  {
+    return master.isSome() ? 1 : 0;
+  }
+
+  double _tasks_staging();
+  double _tasks_starting();
+  double _tasks_running();
+
+  double _executors_registering();
+  double _executors_running();
+  double _executors_terminating();
 
   const Flags flags;
 
@@ -341,7 +395,8 @@ private:
   Files* files;
 
   // Statistics (initialized in Slave::initialize).
-  struct {
+  struct
+  {
     uint64_t tasks[TaskState_ARRAYSIZE];
     uint64_t validStatusUpdates;
     uint64_t invalidStatusUpdates;
@@ -349,12 +404,52 @@ private:
     uint64_t invalidFrameworkMessages;
   } stats;
 
+  struct Metrics
+  {
+    Metrics(const Slave& slave);
+
+    ~Metrics();
+
+    process::metrics::Gauge uptime_secs;
+    process::metrics::Gauge registered;
+
+    process::metrics::Counter recovery_errors;
+
+    process::metrics::Gauge frameworks_active;
+
+    process::metrics::Gauge tasks_staging;
+    process::metrics::Gauge tasks_starting;
+    process::metrics::Gauge tasks_running;
+    process::metrics::Counter tasks_finished;
+    process::metrics::Counter tasks_failed;
+    process::metrics::Counter tasks_killed;
+    process::metrics::Counter tasks_lost;
+
+    process::metrics::Gauge executors_registering;
+    process::metrics::Gauge executors_running;
+    process::metrics::Gauge executors_terminating;
+    process::metrics::Counter executors_terminated;
+
+    process::metrics::Counter valid_status_updates;
+    process::metrics::Counter invalid_status_updates;
+
+    process::metrics::Counter valid_framework_messages;
+    process::metrics::Counter invalid_framework_messages;
+  } metrics;
+
   process::Time startTime;
 
   GarbageCollector gc;
   ResourceMonitor monitor;
 
   StatusUpdateManager* statusUpdateManager;
+
+  // Master detection future.
+  process::Future<Option<MasterInfo> > detection;
+
+  // Timer for triggering re-detection when no ping is received from
+  // the master.
+  process::Timer pingTimer;
 
   // Flag to indicate if recovery, including reconciling (i.e., reconnect/kill)
   // with executors is finished.
@@ -365,6 +460,19 @@ private:
 
   // Indicates the number of errors ignored in "--no-strict" recovery mode.
   unsigned int recoveryErrors;
+
+  Option<Credential> credential;
+
+  sasl::Authenticatee* authenticatee;
+
+  // Indicates if an authentication attempt is in progress.
+  Option<Future<bool> > authenticating;
+
+  // Indicates if the authentication is successful.
+  bool authenticated;
+
+  // Indicates if a new authentication attempt should be enforced.
+  bool reauthenticate;
 };
 
 
@@ -418,7 +526,11 @@ struct Executor
 
   process::UPID pid;
 
-  Resources resources; // Currently consumed resources.
+  // Currently consumed resources. It is an option type as the
+  // executor info will not be known up-front and the executor
+  // resources therefore cannot be known until after the containerizer
+  // has launched the container.
+  Option<Resources> resources;
 
   // Tasks can be found in one of the following four data structures:
 

@@ -46,6 +46,7 @@
 #endif // __linux__
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 
 #include <list>
 #include <set>
@@ -55,6 +56,7 @@
 #include <stout/duration.hpp>
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
+#include <stout/hashmap.hpp>
 #include <stout/none.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
@@ -62,6 +64,7 @@
 #include <stout/result.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
+#include <stout/unreachable.hpp>
 
 #include <stout/os/exists.hpp>
 #include <stout/os/fork.hpp>
@@ -108,6 +111,41 @@ inline char** environ()
 #else
   return ::environ;
 #endif
+}
+
+
+// Returns the address of os::environ().
+inline char*** environp()
+{
+  // Accessing the list of environment variables is platform-specific.
+  // On OS X, the 'environ' symbol isn't visible to shared libraries,
+  // so we must use the _NSGetEnviron() function (see 'man environ' on
+  // OS X). On other platforms, it's fine to access 'environ' from
+  // shared libraries.
+#ifdef __APPLE__
+  return _NSGetEnviron();
+#else
+  return &::environ;
+#endif
+}
+
+
+inline hashmap<std::string, std::string> environment()
+{
+  char** environ = os::environ();
+
+  hashmap<std::string, std::string> result;
+
+  for (size_t index = 0; environ[index] != NULL; index++) {
+    std::string entry(environ[index]);
+    size_t position = entry.find_first_of('=');
+    if (position == std::string::npos) {
+      continue; // Skip malformed environment entries.
+    }
+    result[entry.substr(0, position)] = entry.substr(position + 1);
+  }
+
+  return result;
 }
 
 
@@ -275,7 +313,7 @@ inline Try<std::string> mktemp(const std::string& path = "/tmp/XXXXXX")
   int fd = ::mkstemp(::strcpy(temp, path.c_str()));
 
   if (fd < 0) {
-    delete temp;
+    delete[] temp;
     return ErrnoError();
   }
 
@@ -285,7 +323,7 @@ inline Try<std::string> mktemp(const std::string& path = "/tmp/XXXXXX")
   os::close(fd);
 
   std::string result(temp);
-  delete temp;
+  delete[] temp;
   return result;
 }
 
@@ -527,13 +565,56 @@ inline Try<Nothing> rmdir(const std::string& directory, bool recursive = true)
 }
 
 
+// Executes a command by calling "/bin/sh -c <command>", and returns
+// after the command has been completed. Returns 0 if succeeds, and
+// return -1 on error (e.g., fork/exec/waitpid failed). This function
+// is async signal safe. We return int instead of returning a Try
+// because Try involves 'new', which is not async signal safe.
 inline int system(const std::string& command)
 {
-  return ::system(command.c_str());
+  pid_t pid = ::fork();
+
+  if (pid == -1) {
+    return -1;
+  } else if (pid == 0) {
+    // In child process.
+    ::execl("/bin/sh", "sh", "-c", command.c_str(), (char*) NULL);
+    ::exit(127);
+  } else {
+    // In parent process.
+    int status;
+    while (::waitpid(pid, &status, 0) == -1) {
+      if (errno != EINTR) {
+        return -1;
+      }
+    }
+
+    return status;
+  }
 }
 
 
-// TODO(bmahler): Clean these bool functions to return Try<Nothing>.
+// This function is a portable version of execvpe ('p' means searching
+// executable from PATH and 'e' means setting environments). We add
+// this function because it is not available on all systems.
+//
+// NOTE: This function is not thread safe. It is supposed to be used
+// only after fork (when there is only one thread). This function is
+// async signal safe.
+inline int execvpe(const char* file, char** argv, char** envp)
+{
+  char** saved = os::environ();
+
+  *os::environp() = envp;
+
+  int result = execvp(file, argv);
+
+  *os::environp() = saved;
+
+  return result;
+}
+
+
 // Changes the specified path's user and group ownership to that of
 // the specified user..
 inline Try<Nothing> chown(
@@ -568,48 +649,155 @@ inline Try<Nothing> chown(
 }
 
 
-inline bool chmod(const std::string& path, int mode)
+inline Try<Nothing> chmod(const std::string& path, int mode)
 {
   if (::chmod(path.c_str(), mode) < 0) {
-    PLOG(ERROR) << "Failed to changed the mode of the path '" << path << "'";
-    return false;
+    return ErrnoError();
   }
 
-  return true;
+  return Nothing();
 }
 
 
-inline bool chdir(const std::string& directory)
+inline Try<Nothing> chdir(const std::string& directory)
 {
   if (::chdir(directory.c_str()) < 0) {
-    PLOG(ERROR) << "Failed to change directory";
-    return false;
+    return ErrnoError();
   }
 
-  return true;
+  return Nothing();
 }
 
 
-inline bool su(const std::string& user)
+inline Result<uid_t> getuid(const Option<std::string>& user = None())
 {
-  passwd* passwd;
-  if ((passwd = ::getpwnam(user.c_str())) == NULL) {
-    PLOG(ERROR) << "Failed to get user information for '"
-                << user << "', getpwnam";
-    return false;
+  if (user.isNone()) {
+    return ::getuid();
   }
 
-  if (::setgid(passwd->pw_gid) < 0) {
-    PLOG(ERROR) << "Failed to set group id, setgid";
-    return false;
+  struct passwd passwd;
+  struct passwd* result = NULL;
+
+  int size = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (size == -1) {
+    // Initial value for buffer size.
+    size = 1024;
   }
 
-  if (::setuid(passwd->pw_uid) < 0) {
-    PLOG(ERROR) << "Failed to set user id, setuid";
-    return false;
+  while (true) {
+    char* buffer = new char[size];
+
+    if (getpwnam_r(user.get().c_str(), &passwd, buffer, size, &result) == 0) {
+      // The usual interpretation of POSIX is that getpwnam_r will
+      // return 0 but set result == NULL if the user is not found.
+      if (result == NULL) {
+        delete[] buffer;
+        return None();
+      }
+
+      uid_t uid = passwd.pw_uid;
+      delete[] buffer;
+      return uid;
+    } else {
+      // RHEL7 (and possibly other systems) will return non-zero and
+      // set one of the following errors for "The given name or uid
+      // was not found." See 'man getpwnam_r'. We only check for the
+      // errors explicitly listed, and do not consider the ellipsis.
+      if (errno == ENOENT ||
+          errno == ESRCH ||
+          errno == EBADF ||
+          errno == EPERM) {
+        return None();
+      }
+
+      if (errno != ERANGE) {
+        delete[] buffer;
+        return ErrnoError("Failed to get username information");
+      }
+      // getpwnam_r set ERANGE so try again with a larger buffer.
+      size *= 2;
+      delete[] buffer;
+    }
   }
 
-  return true;
+  return Result<uid_t>(UNREACHABLE());
+}
+
+
+inline Result<gid_t> getgid(const Option<std::string>& user = None())
+{
+  if (user.isNone()) {
+    return ::getgid();
+  }
+
+  struct passwd passwd;
+  struct passwd* result = NULL;
+
+  int size = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (size == -1) {
+    // Initial value for buffer size.
+    size = 1024;
+  }
+
+  while (true) {
+    char* buffer = new char[size];
+
+    if (getpwnam_r(user.get().c_str(), &passwd, buffer, size, &result) == 0) {
+      // The usual interpretation of POSIX is that getpwnam_r will
+      // return 0 but set result == NULL if the group is not found.
+      if (result == NULL) {
+        delete[] buffer;
+        return None();
+      }
+
+      gid_t gid = passwd.pw_gid;
+      delete[] buffer;
+      return gid;
+    } else {
+      // RHEL7 (and possibly other systems) will return non-zero and
+      // set one of the following errors for "The given name or uid
+      // was not found." See 'man getpwnam_r'. We only check for the
+      // errors explicitly listed, and do not consider the ellipsis.
+      if (errno == ENOENT ||
+          errno == ESRCH ||
+          errno == EBADF ||
+          errno == EPERM) {
+        return None();
+      }
+
+      if (errno != ERANGE) {
+        delete[] buffer;
+        return ErrnoError("Failed to get username information");
+      }
+      // getpwnam_r set ERANGE so try again with a larger buffer.
+      size *= 2;
+      delete[] buffer;
+    }
+  }
+
+  return Result<gid_t>(UNREACHABLE());
+}
+
+
+inline Try<Nothing> su(const std::string& user)
+{
+  Result<gid_t> gid = os::getgid(user);
+  if (gid.isError() || gid.isNone()) {
+    return Error("Failed to getgid: " +
+        (gid.isError() ? gid.error() : "unknown user"));
+  } else if (::setgid(gid.get())) {
+    return ErrnoError("Failed to set gid");
+  }
+
+  Result<uid_t> uid = os::getuid(user);
+  if (uid.isError() || uid.isNone()) {
+    return Error("Failed to getuid: " +
+        (uid.isError() ? uid.error() : "unknown user"));
+  } else if (::setuid(uid.get())) {
+    return ErrnoError("Failed to setuid");
+  }
+
+  return Nothing();
 }
 
 
@@ -654,20 +842,23 @@ inline Try<std::list<std::string> > find(
     return Error("'" + directory + "' is not a directory");
   }
 
-  foreach (const std::string& entry, ls(directory)) {
-    std::string path = path::join(directory, entry);
-    // If it's a directory, recurse.
-    if (isdir(path) && !islink(path)) {
-      Try<std::list<std::string> > matches = find(path, pattern);
-      if (matches.isError()) {
-        return matches;
-      }
-      foreach (const std::string& match, matches.get()) {
-        results.push_back(match);
-      }
-    } else {
-      if (entry.find(pattern) != std::string::npos) {
-        results.push_back(path); // Matched the file pattern!
+  Try<std::list<std::string> > entries = ls(directory);
+  if (entries.isSome()) {
+    foreach (const std::string& entry, entries.get()) {
+      std::string path = path::join(directory, entry);
+      // If it's a directory, recurse.
+      if (isdir(path) && !islink(path)) {
+        Try<std::list<std::string> > matches = find(path, pattern);
+        if (matches.isError()) {
+          return matches;
+        }
+        foreach (const std::string& match, matches.get()) {
+          results.push_back(match);
+        }
+      } else {
+        if (entry.find(pattern) != std::string::npos) {
+          results.push_back(path); // Matched the file pattern!
+        }
       }
     }
   }
@@ -676,14 +867,46 @@ inline Try<std::list<std::string> > find(
 }
 
 
-inline std::string user()
+inline Result<std::string> user(Option<uid_t> uid = None())
 {
-  passwd* passwd;
-  if ((passwd = getpwuid(getuid())) == NULL) {
-    LOG(FATAL) << "Failed to get username information";
+  if (uid.isNone()) {
+    uid = ::getuid();
   }
 
-  return passwd->pw_name;
+  int size = sysconf(_SC_GETPW_R_SIZE_MAX);
+  if (size == -1) {
+    // Initial value for buffer size.
+    size = 1024;
+  }
+
+  struct passwd passwd;
+  struct passwd* result = NULL;
+
+  while (true) {
+    char* buffer = new char[size];
+
+    if (getpwuid_r(uid.get(), &passwd, buffer, size, &result) == 0) {
+      // getpwuid_r will return 0 but set result == NULL if the uid is
+      // not found.
+      if (result == NULL) {
+        delete[] buffer;
+        return None();
+      }
+
+      std::string user(passwd.pw_name);
+      delete[] buffer;
+      return user;
+    } else {
+      if (errno != ERANGE) {
+        delete[] buffer;
+        return ErrnoError();
+      }
+
+      // getpwuid_r set ERANGE so try again with a larger buffer.
+      size *= 2;
+      delete[] buffer;
+    }
+  }
 }
 
 
@@ -960,6 +1183,30 @@ inline Try<std::string> sysname()
 // The OS release level.
 struct Release
 {
+  bool operator == (const Release& other)
+  {
+    return version == other.version &&
+      major == other.major &&
+      minor == other.minor;
+  }
+
+  bool operator < (const Release& other)
+  {
+    // Lexicographic ordering.
+    if (version != other.version) {
+      return version < other.version;
+    } else if (major != other.major) {
+      return major < other.major;
+    } else {
+      return minor < other.minor;
+    }
+  }
+
+  bool operator <= (const Release& other)
+  {
+    return *this < other || *this == other;
+  }
+
   int version;
   int major;
   int minor;

@@ -40,6 +40,9 @@ namespace internal {
 namespace state {
 namespace protobuf {
 
+class State; // Forward declaration.
+
+
 template <typename T>
 class Variable
 {
@@ -71,7 +74,7 @@ private:
 class State : public state::State
 {
 public:
-  State(Storage* storage) : state::State(storage) {}
+  explicit State(Storage* storage) : state::State(storage) {}
   virtual ~State() {}
 
   // Returns a variable from the state, creating a new one if one

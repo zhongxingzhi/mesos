@@ -29,12 +29,12 @@
 #include <process/collect.hpp>
 #include <process/executor.hpp>
 #include <process/protobuf.hpp>
-#include <process/timeout.hpp>
 
 #include <stout/duration.hpp>
 #include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
 #include <stout/nothing.hpp>
+#include <stout/set.hpp>
 #include <stout/unreachable.hpp>
 
 #include "logging/logging.hpp"
@@ -62,7 +62,7 @@ public:
   };
 
   Network();
-  Network(const std::set<process::UPID>& pids);
+  explicit Network(const std::set<process::UPID>& pids);
   virtual ~Network();
 
   // Adds a PID to this network.
@@ -113,10 +113,20 @@ public:
       const std::string& servers,
       const Duration& timeout,
       const std::string& znode,
-      const Option<zookeeper::Authentication>& auth);
+      const Option<zookeeper::Authentication>& auth,
+      const std::set<process::UPID>& base = std::set<process::UPID>());
 
 private:
   typedef ZooKeeperNetwork This;
+
+  // Helper for handling time outs when collecting membership
+  // data. For now, a timeout is treated as a failure.
+  static process::Future<std::list<std::string> > timedout(
+      process::Future<std::list<std::string> > datas)
+  {
+    datas.discard();
+    return process::Failure("Timed out");
+  }
 
   // Not copyable, not assignable.
   ZooKeeperNetwork(const ZooKeeperNetwork&);
@@ -134,6 +144,9 @@ private:
   zookeeper::Group group;
   process::Future<std::set<zookeeper::Group::Membership> > memberships;
 
+  // The set of PIDs that are always in the network.
+  std::set<process::UPID> base;
+
   // NOTE: The declaration order here is important. We want to delete
   // the 'executor' before we delete the 'group' so that we don't get
   // spurious fatal errors when the 'group' is being deleted.
@@ -146,7 +159,7 @@ class NetworkProcess : public ProtobufProcess<NetworkProcess>
 public:
   NetworkProcess() {}
 
-  NetworkProcess(const std::set<process::UPID>& pids)
+  explicit NetworkProcess(const std::set<process::UPID>& pids)
   {
     set(pids);
   }
@@ -373,9 +386,14 @@ inline ZooKeeperNetwork::ZooKeeperNetwork(
     const std::string& servers,
     const Duration& timeout,
     const std::string& znode,
-    const Option<zookeeper::Authentication>& auth)
-  : group(servers, timeout, znode, auth)
+    const Option<zookeeper::Authentication>& auth,
+    const std::set<process::UPID>& _base)
+  : group(servers, timeout, znode, auth),
+    base(_base)
 {
+  // PIDs from the base set are in the network from beginning.
+  set(base);
+
   watch(std::set<zookeeper::Group::Membership>());
 }
 
@@ -411,7 +429,8 @@ inline void ZooKeeperNetwork::watched(
     futures.push_back(group.data(membership));
   }
 
-  process::collect(futures, process::Timeout::in(Seconds(5)))
+  process::collect(futures)
+    .after(Seconds(5), lambda::bind(&This::timedout, lambda::_1))
     .onAny(executor.defer(lambda::bind(&This::collected, this, lambda::_1)));
 }
 
@@ -441,7 +460,9 @@ inline void ZooKeeperNetwork::collected(
 
   LOG(INFO) << "ZooKeeper group PIDs: " << stringify(pids);
 
-  set(pids); // Update the network.
+  // Update the network. We make sure that the PIDs from the base set
+  // are always in the network.
+  set(pids | base);
 
   watch(memberships.get());
 }

@@ -22,13 +22,21 @@
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
+#include <process/help.hpp>
+#include <process/http.hpp>
+#include <process/id.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
+
+#include <process/metrics/gauge.hpp>
+#include <process/metrics/metrics.hpp>
+#include <process/metrics/timer.hpp>
 
 #include <stout/lambda.hpp>
 #include <stout/none.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
+#include <stout/protobuf.hpp>
 
 #include "common/type_utils.hpp"
 
@@ -41,14 +49,24 @@ using mesos::internal::state::protobuf::State;
 using mesos::internal::state::protobuf::Variable;
 
 using process::dispatch;
-using process::Failure;
-using process::Future;
-using process::Owned;
-using process::Process;
-using process::Promise;
 using process::spawn;
 using process::terminate;
 using process::wait; // Necessary on some OS's to disambiguate.
+
+using process::DESCRIPTION;
+using process::Failure;
+using process::Future;
+using process::HELP;
+using process::Owned;
+using process::Process;
+using process::Promise;
+using process::TLDR;
+using process::USAGE;
+
+using process::http::OK;
+
+using process::metrics::Gauge;
+using process::metrics::Timer;
 
 using std::deque;
 using std::string;
@@ -57,11 +75,15 @@ namespace mesos {
 namespace internal {
 namespace master {
 
+using process::http::Response;
+using process::http::Request;
+
 class RegistrarProcess : public Process<RegistrarProcess>
 {
 public:
   RegistrarProcess(const Flags& _flags, State* _state)
-    : ProcessBase("registrar"),
+    : ProcessBase(process::ID::generate("registrar")),
+      metrics(*this),
       updating(false),
       flags(_flags),
       state(_state) {}
@@ -72,15 +94,29 @@ public:
   Future<Registry> recover(const MasterInfo& info);
   Future<bool> apply(Owned<Operation> operation);
 
+protected:
+  virtual void initialize()
+  {
+    route("/registry", registryHelp(), &RegistrarProcess::registry);
+  }
+
 private:
+  // HTTP handlers.
+  // /registrar(N)/registry
+  Future<Response> registry(const Request& request);
+  static string registryHelp();
+
   // The 'Recover' operation adds the latest MasterInfo.
   class Recover : public Operation
   {
   public:
-    Recover(const MasterInfo& _info) : info(_info) {}
+    explicit Recover(const MasterInfo& _info) : info(_info) {}
 
   protected:
-    virtual Try<bool> perform(Registry* registry, bool strict)
+    virtual Try<bool> perform(
+        Registry* registry,
+        hashset<SlaveID>* slaveIDs,
+        bool strict)
     {
       registry->mutable_master()->mutable_info()->CopyFrom(info);
       return true; // Mutation.
@@ -90,9 +126,56 @@ private:
     const MasterInfo info;
   };
 
-  Option<Variable<Registry> > variable;
-  deque<Owned<Operation> > operations;
-  bool updating; // Used to signify fetching (recovering) or storing.
+  // Metrics.
+  struct Metrics
+  {
+    explicit Metrics(const RegistrarProcess& process)
+      : queued_operations(
+            "registrar/queued_operations",
+            defer(process, &RegistrarProcess::_queued_operations)),
+        registry_size_bytes(
+            "registrar/registry_size_bytes",
+            defer(process, &RegistrarProcess::_registry_size_bytes)),
+        state_fetch("registrar/state_fetch"),
+        state_store("registrar/state_store", Days(1))
+    {
+      process::metrics::add(queued_operations);
+      process::metrics::add(registry_size_bytes);
+
+      process::metrics::add(state_fetch);
+      process::metrics::add(state_store);
+    }
+
+    ~Metrics()
+    {
+      process::metrics::remove(queued_operations);
+      process::metrics::remove(registry_size_bytes);
+
+      process::metrics::remove(state_fetch);
+      process::metrics::remove(state_store);
+    }
+
+    Gauge queued_operations;
+    Gauge registry_size_bytes;
+
+    Timer<Milliseconds> state_fetch;
+    Timer<Milliseconds> state_store;
+  } metrics;
+
+  // Gauge handlers
+  double _queued_operations()
+  {
+    return operations.size();
+  }
+
+  Future<double> _registry_size_bytes()
+  {
+    if (variable.isSome()) {
+      return variable.get().get().ByteSize();
+    }
+
+    return Failure("Not recovered yet");
+  }
 
   // Continuations.
   void _recover(
@@ -107,21 +190,135 @@ private:
       const Future<Option<Variable<Registry> > >& store,
       deque<Owned<Operation> > operations);
 
+  // Fails all pending operations and transitions the Registrar
+  // into an error state in which all subsequent operations will fail.
+  // This ensures we don't attempt to re-acquire log leadership by
+  // performing more State storage operations.
+  void abort(const string& message);
+
+  Option<Variable<Registry> > variable;
+  deque<Owned<Operation> > operations;
+  bool updating; // Used to signify fetching (recovering) or storing.
+
   const Flags flags;
   State* state;
 
   // Used to compose our operations with recovery.
   Option<Owned<Promise<Registry> > > recovered;
+
+  // When an error is encountered from abort(), we'll fail all
+  // subsequent operations.
+  Option<Error> error;
 };
+
+
+// Helper for treating State operations that timeout as failures.
+template <typename T>
+Future<T> timeout(
+    const string& operation,
+    const Duration& duration,
+    Future<T> future)
+{
+  future.discard();
+
+  return Failure(
+      "Failed to perform " + operation + " within " + stringify(duration));
+}
+
+
+// Helper for failing a deque of operations.
+void fail(deque<Owned<Operation> >* operations, const string& message)
+{
+  while (!operations->empty()) {
+    Owned<Operation> operation = operations->front();
+    operations->pop_front();
+
+    operation->fail(message);
+  }
+}
+
+
+Future<Response> RegistrarProcess::registry(const Request& request)
+{
+  JSON::Object result;
+
+  if (variable.isSome()) {
+    result = JSON::Protobuf(variable.get().get());
+  }
+
+  return OK(result, request.query.get("jsonp"));
+}
+
+
+string RegistrarProcess::registryHelp()
+{
+  return HELP(
+      TLDR(
+          "Returns the current contents of the Registry in JSON."),
+      USAGE(
+          "/registrar(1)/registry"),
+      DESCRIPTION(
+          "Example:"
+          "",
+          "```",
+          "{",
+          "  \"master\":",
+          "  {",
+          "    \"info\":",
+          "    {",
+          "      \"hostname\": \"localhost\",",
+          "      \"id\": \"20140325-235542-1740121354-5050-33357\",",
+          "      \"ip\": 2130706433,",
+          "      \"pid\": \"master@127.0.0.1:5050\",",
+          "      \"port\": 5050",
+          "    }",
+          "  },",
+          "",
+          "  \"slaves\":",
+          "  {",
+          "    \"slaves\":",
+          "    [",
+          "      {",
+          "        \"info\":",
+          "        {",
+          "          \"checkpoint\": true,",
+          "          \"hostname\": \"localhost\",",
+          "          \"id\":",
+          "          { ",
+          "            \"value\": \"20140325-234618-1740121354-5050-29065-0\"",
+          "          },",
+          "          \"port\": 5051,",
+          "          \"resources\":",
+          "          [",
+          "            {",
+          "              \"name\": \"cpus\",",
+          "              \"role\": \"*\",",
+          "              \"scalar\": { \"value\": 24 },",
+          "              \"type\": \"SCALAR\"",
+          "            }",
+          "          ],",
+          "          \"webui_hostname\": \"localhost\"",
+          "        }",
+          "      }",
+          "    ]",
+          "  }",
+          "}",
+          "```"));
+}
 
 
 Future<Registry> RegistrarProcess::recover(const MasterInfo& info)
 {
-  LOG(INFO) << "Recovering registrar";
-
   if (recovered.isNone()) {
-    // TODO(benh): Don't wait forever to recover?
-    state->fetch<Registry>("registry")
+    LOG(INFO) << "Recovering registrar";
+
+    metrics.state_fetch.time(state->fetch<Registry>("registry"))
+      .after(flags.registry_fetch_timeout,
+             lambda::bind(
+                 &timeout<Variable<Registry> >,
+                 "fetch",
+                 flags.registry_fetch_timeout,
+                 lambda::_1))
       .onAny(defer(self(), &Self::_recover, info, lambda::_1));
     updating = true;
     recovered = Owned<Promise<Registry> >(new Promise<Registry>());
@@ -143,10 +340,11 @@ void RegistrarProcess::_recover(
     recovered.get()->fail("Failed to recover registrar: " +
         (recovery.isFailed() ? recovery.failure() : "discarded"));
   } else {
-    LOG(INFO) << "Successfully recovered registrar";
-
     // Save the registry.
     variable = recovery.get();
+
+    LOG(INFO) << "Successfully fetched the registry "
+              << "(" << Bytes(variable.get().get().ByteSize()) << ")";
 
     // Perform the Recover operation to add the new MasterInfo.
     Owned<Operation> operation(new Recover(info));
@@ -171,6 +369,8 @@ void RegistrarProcess::__recover(const Future<bool>& recover)
     recovered.get()->fail("Failed to recover registrar: "
         "Failed to persist MasterInfo: version mismatch");
   } else {
+    LOG(INFO) << "Successfully recovered registrar";
+
     // At this point _update() has updated 'variable' to contain
     // the Registry with the latest MasterInfo.
     // Set the promise and un-gate any pending operations.
@@ -193,6 +393,10 @@ Future<bool> RegistrarProcess::apply(Owned<Operation> operation)
 
 Future<bool> RegistrarProcess::_apply(Owned<Operation> operation)
 {
+  if (error.isSome()) {
+    return Failure(error.get());
+  }
+
   CHECK_SOME(variable);
 
   operations.push_back(operation);
@@ -211,6 +415,7 @@ void RegistrarProcess::update()
   }
 
   CHECK(!updating);
+  CHECK(error.isNone());
 
   updating = true;
 
@@ -218,17 +423,28 @@ void RegistrarProcess::update()
 
   CHECK_SOME(variable);
 
+  // Create a snapshot of the current registry.
   Registry registry = variable.get().get();
+
+  // Create the 'slaveIDs' accumulator.
+  hashset<SlaveID> slaveIDs;
+  foreach (const Registry::Slave& slave, registry.slaves().slaves()) {
+    slaveIDs.insert(slave.info().id());
+  }
 
   foreach (Owned<Operation> operation, operations) {
     // No need to process the result of the operation.
-    (*operation)(&registry, flags.registry_strict);
+    (*operation)(&registry, &slaveIDs, flags.registry_strict);
   }
 
-  // TODO(benh): Add a timeout so we don't wait forever.
-
-  // Perform the store!
-  state->store(variable.get().mutate(registry))
+  // Perform the store, and time the operation.
+  metrics.state_store.time(state->store(variable.get().mutate(registry)))
+    .after(flags.registry_store_timeout,
+           lambda::bind(
+               &timeout<Option<Variable<Registry> > >,
+               "store",
+               flags.registry_store_timeout,
+               lambda::_1))
     .onAny(defer(self(), &Self::_update, lambda::_1, operations));
 
   // Clear the operations, _update will transition the Promises!
@@ -242,39 +458,48 @@ void RegistrarProcess::_update(
 {
   updating = false;
 
-  // Set the variable if the storage operation succeeded.
-  if (!store.isReady()) {
-    LOG(ERROR) << "Failed to update 'registry': "
-               << (store.isFailed() ? store.failure() : "discarded");
-  } else if (store.get().isNone()) {
-    LOG(WARNING) << "Failed to update 'registry': version mismatch";
-  } else {
-    LOG(INFO) << "Successfully updated 'registry'";
-    variable = store.get().get();
+  // Abort if the storage operation did not succeed.
+  if (!store.isReady() || store.get().isNone()) {
+    string message = "Failed to update 'registry': ";
+
+    if (store.isFailed()) {
+      message += store.failure();
+    } else if (store.isDiscarded()) {
+      message += "discarded";
+    } else {
+      message += "version mismatch";
+    }
+
+    fail(&applied, message);
+    abort(message);
+
+    return;
   }
+
+  LOG(INFO) << "Successfully updated 'registry'";
+  variable = store.get().get();
 
   // Remove the operations.
   while (!applied.empty()) {
     Owned<Operation> operation = applied.front();
     applied.pop_front();
 
-    if (!store.isReady()) {
-      operation->fail("Failed to update 'registry': " +
-          (store.isFailed() ? store.failure() : "discarded"));
-    } else {
-      if (store.get().isNone()) {
-        operation->fail("Failed to update 'registry': version mismatch");
-      } else {
-        operation->set();
-      }
-    }
+    operation->set();
   }
-
-  applied.clear();
 
   if (!operations.empty()) {
     update();
   }
+}
+
+
+void RegistrarProcess::abort(const string& message)
+{
+  error = Error(message);
+
+  LOG(ERROR) << "Registrar aborting: " << message;
+
+  fail(&operations, message);
 }
 
 
@@ -289,6 +514,7 @@ Registrar::~Registrar()
 {
   terminate(process);
   wait(process);
+  delete process;
 }
 
 

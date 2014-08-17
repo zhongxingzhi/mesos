@@ -15,7 +15,8 @@ AC_CONFIG_MACRO_DIR([m4])
 
 # Initialize automake.
 # -Wno-portability, since we require GNU Make for % patterns.
-AM_INIT_AUTOMAKE([-Wall -Werror -Wno-portability foreign])
+# Removal of -Werror due warnings introduced by automake 1.14.
+AM_INIT_AUTOMAKE([-Wall -Wno-portability foreign])
 
 # Required for linking non-POSIX libs.
 m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
@@ -46,7 +47,9 @@ AC_SUBST(CONFIGURE_ARGS)
 AC_CONFIG_SUBDIRS([3rdparty/stout])
 
 AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([include/Makefile])
 AC_CONFIG_FILES([3rdparty/Makefile])
+AC_CONFIG_FILES([3rdparty/gmock_sources.cc])
 
 AC_ARG_ENABLE([install],
               AS_HELP_STRING([--enable-install],
@@ -63,10 +66,65 @@ AC_ARG_ENABLE([perftools],
                              [enable google perftools]),
               [gperftools=yes])
 
+AC_ARG_ENABLE([bundled],
+              AS_HELP_STRING([--disable-bundled],
+                             [build against preinstalled dependencies instead
+                             of bundled libraries]),
+              [enable_bundled=no], [enable_bundled=yes])
+
+AC_ARG_WITH([boost],
+            AS_HELP_STRING([--with-boost@<:@=DIR@:>@],
+                           [excludes building and using the bundled Boost
+                           package in lieu of an installed version at a
+                           location prefixed by the given path]),
+            [without_bundled_boost=yes], [])
+
+AC_ARG_WITH([picojson],
+            AS_HELP_STRING([--with-picojson@<:@=DIR@:>@],
+                           [excludes building and using the bundled picojson
+                           package in lieu of an installed version at a
+                           location prefixed by the given path]),
+            [without_bundled_picojson=yes], [])
+
+AC_ARG_WITH([libev],
+            AS_HELP_STRING([--with-libev@<:@=DIR@:>@],
+                           [excludes building and using the bundled libev
+                           package in lieu of an installed version at a
+                           location prefixed by the given path]),
+            [without_bundled_libev=yes], [])
+
+AC_ARG_WITH([glog],
+            AS_HELP_STRING([--with-glog@<:@=DIR@:>@],
+                           [excludes building and using the bundled glog
+                            package in lieu of an installed version at a
+                            location prefixed by the given path]),
+            [without_bundled_glog=yes], [])
+
+AC_ARG_WITH([gmock],
+            AS_HELP_STRING([--with-gmock@<:@=DIR@:>@],
+                           [excludes building and using the bundled gmock
+                            package in lieu of an installed version at a
+                            location prefixed by the given path]),
+            [without_bundled_gmock=yes], [])
+
+AC_ARG_WITH([http-parser],
+            AS_HELP_STRING([--with-http-parser@<:@=DIR@:>@],
+                           [excludes building and using the bundled http-parser
+                           package in lieu of an installed version at a
+                           location prefixed by the given path]),
+            [without_bundled_http_parser=yes], [])
+
+AC_ARG_WITH([protobuf],
+            AS_HELP_STRING([--with-protobuf@<:@=DIR@:>@],
+                           [excludes building and using the bundled protobuf
+                            package in lieu of an installed version at a
+                            location prefixed by the given path]),
+            [without_bundled_protobuf=yes], [])
+
 AC_ARG_WITH([zlib],
             AS_HELP_STRING([--without-zlib],
                            [disables zlib compression, which means the webui
-                            will be far less responsive; not recommended]),
+                           will be far less responsive; not recommended]),
             [], [with_zlib=yes])
 
 AC_ARG_WITH([cxx11],
@@ -74,6 +132,8 @@ AC_ARG_WITH([cxx11],
                            [builds libprocess without C++11 support (deprecated)]),
             [], [with_cxx11=yes])
 
+# There is no prefix installation of the JAR.
+AC_ARG_VAR([PROTOBUF_JAR], [full path to protobuf jar on prefixed builds])
 
 # Do some OS specific setup.
 case "${target_os}" in
@@ -81,21 +141,316 @@ case "${target_os}" in
     LIBS="$LIBS -lrt" # For clock_gettime() in stout/stopwatch.hpp.
     OS_NAME=linux # Used below for OS_LINUX.
     ;;
+  darwin*)
+    OS_NAME=darwin
+    ;;
   *)
     ;;
 esac
 
+# Include directories used by package managers (e.g., MacPorts).
+if test "x$enable_bundled" != "xyes" && \
+   test "x$OS_NAME" = "xdarwin"; then
+  CPPFLAGS="$CPPFLAGS -I/opt/local/include"
+fi
 
 # Used for conditionally building source files (e.g., only want to
 # build stout/tests/proc_tests.cpp on Linux).
 AM_CONDITIONAL([OS_LINUX], [test "x$OS_NAME" = "xlinux"])
 
+if test -n "`echo $with_boost`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_boost}/include"
+fi
+
+if test -n "`echo $with_picojson`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_picojson}/include"
+fi
+
+if test -n "`echo $with_libev`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_libev}/include"
+  LDFLAGS="$LDFLAGS -L${with_libev}/lib"
+fi
+
+if test -n "`echo $with_glog`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_glog}/include"
+  LDFLAGS="$LDFLAGS -L${with_glog}/lib"
+fi
+
+GMOCKSRC="gmock-all.cc"
+GTESTSRC="gtest-all.cc"
+
+if test -n "`echo $with_gmock`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_gmock} -I${with_gmock}/include \
+    -I${with_gmock}/src -I${with_gmock}/gtest -I${with_gmock}/gtest/include \
+    -I${with_gmock}/gtest/src"
+
+elif test "x$enable_bundled" != "xyes"; then
+  CPPFLAGS="$CPPFLAGS -I/usr/src/gmock"
+  # On system installations the deps are handled separately.
+  # So insert a placeholder for substitution.
+  GTESTSRC="stdio.h"
+  check_gtest=yes
+fi
+
+if test -n "`echo $with_http_parser`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_http_parser}/include"
+  LDFLAGS="$LDFLAGS -L${with_http_parser}/lib"
+fi
+
+if test -n "`echo $with_protobuf`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_protobuf}/include"
+  LDFLAGS="$LDFLAGS -L${with_protobuf}/lib"
+fi
+
+# Check if user has asked us to use a preinstalled gmock, or if they
+# asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_gmock" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADER($GMOCKSRC,
+                  [found_gmock=yes],
+                  [])
+
+  if test "x$found_gmock" = "xyes"; then
+    if test "x$check_gtest" = "xyes"; then
+      # TODO(jieyu): Symbol _init is not availble for libs on OS X.
+      AC_CHECK_LIB([gtest],
+                   [_init],
+                   [],
+                   [AC_MSG_ERROR([gtest missing])])
+    fi
+    with_bundled_gmock=no
+  else
+    AC_MSG_ERROR([cannot find gmock
+-------------------------------------------------------------------
+You have requested the use of a non-bundled gmock but no suitable
+gmock could be found.
+
+You may want specify the location of gmock by providing a prefix
+path via --with-gmock=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_gmock=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_GMOCK], [test "x$with_bundled_gmock" = "xyes"])
+AM_CONDITIONAL([LINKGTEST], [test "check_gtest" = "xyes"])
+AC_SUBST([GMOCKSRC])
+AC_SUBST([GTESTSRC])
+
+# Check if user has asked us to use a preinstalled libev, or if they
+# asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_libev" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([ev.h], [found_libev=yes])
+
+  if test "x$found_libev" = "xyes"; then
+    with_bundled_libev=no
+    AC_MSG_WARN([libev found must have been built with -DEV_CHILD_ENABLE=0])
+  else
+    AC_MSG_ERROR([cannot find libev
+-------------------------------------------------------------------
+You have requested the use of a non-bundled libev but no suitable
+libev could be found.
+
+You may want specify the location of libev by providing a prefix
+path via --with-libev=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_libev=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_LIBEV], [test "x$with_bundled_libev" = "xyes"])
+
+# Check if user has asked us to use a preinstalled Boost, or if they
+# asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_boost" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([boost/version.hpp], [found_boost=yes])
+
+  if test "x$found_boost" = "xyes"; then
+    with_bundled_boost=no
+  else
+    AC_MSG_ERROR([cannot find Boost
+-------------------------------------------------------------------
+You have requested the use of a non-bundled Boost but no suitable
+Boost could be found.
+
+You may want specify the location of Boost by providing a prefix
+path via --with-boost=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_boost=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_BOOST], [test "x$with_bundled_boost" = "xyes"])
+
+# Check if user has asked us to use a preinstalled picojson, or if
+# they asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_picojson" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([picojson.h], [found_picojson=yes])
+
+  if test "x$found_picojson" = "xyes"; then
+    with_bundled_picojson=no
+  else
+    AC_MSG_ERROR([cannot find picojson
+-------------------------------------------------------------------
+You have requested the use of a non-bundled picojson but no suitable
+picojson could be found.
+
+You may want specify the location of picojson by providing a prefix
+path via --with-picojson=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_picojson=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_PICOJSON], [test "x$with_bundled_picojson" = "xyes"])
+
+
+# Check if user has asked us to use a preinstalled glog, or if they
+# asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_glog" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([glog/logging.h],
+                   [AC_LINK_IFELSE(
+                        [AC_LANG_PROGRAM([#include <glog/logging.h>],[])],
+                        [TEST_LIBS="$TEST_LIBS -lglog"] [found_glog=yes],
+                        [AC_MSG_WARN([glog is not installed.])])])
+
+  if test "x$found_glog" = "xyes"; then
+    with_bundled_glog=no
+  else
+    AC_MSG_ERROR([cannot find glog
+-------------------------------------------------------------------
+You have requested the use of a non-bundled glog but no suitable
+glog could be found.
+
+You may want specify the location of glog by providing a prefix
+path via --with-glog=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_glog=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_GLOG], [test "x$with_bundled_glog" = "xyes"])
+
+# Check if user has asked us to use a preinstalled http-parser, or if
+# they asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_http_parser" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([http_parser.h],
+                   [AC_CHECK_LIB([http_parser],
+                                 [http_parser_init],
+                                 [found_http_parser=yes])])
+
+  if test "x$found_http_parser" = "xyes"; then
+    with_bundled_http_parser=no
+  else
+    AC_MSG_ERROR([cannot find http-parser
+-------------------------------------------------------------------
+You have requested the use of a non-bundled http-parser but no suitable
+http-parser could be found.
+
+You may want specify the location of http-parser by providing a prefix
+path via --with-http-parser=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_http_parser=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_HTTP_PARSER],
+               [test "x$with_bundled_http_parser" = "xyes"])
+
+# Check if user has asked us to use a preinstalled protobuf, or if
+# they asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_protobuf" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Use the system default prefix if not specified.
+  if test -n "`echo $with_protobuf`"; then
+    PROTOBUFPREFIX="${with_protobuf}"
+  elif test "x$enable_bundled" != "xyes"; then
+    PROTOBUFPREFIX="/usr"
+  fi
+
+  # Check for protobuf.
+  PKG_CHECK_MODULES([PROTOBUFPREFIX],
+                    [protobuf],
+                    [found_protobuf=yes])
+
+  if test "x$found_protobuf" = "xyes"; then
+    with_bundled_protobuf=no
+    if test -z "`echo $PROTOBUF_JAR`"; then
+      PROTOBUF_JAR="${PROTOBUFPREFIX}/share/java/protobuf.jar"
+    fi
+
+    AC_CHECK_FILE([$PROTOBUF_JAR],
+                  [],
+                  [AC_MSG_ERROR([cannot find PROTOBUF_JAR=$PROTOBUF_JAR])])
+
+    AC_CHECK_TOOL([PROTOCOMPILER_TEST], [protoc], [], [$PROTOBUFPREFIX/bin])
+
+    if test -z "`echo $PROTOCOMPILER_TEST`"; then
+      AC_MSG_ERROR([protoc not found in PATH])
+    fi
+
+  else
+    AC_MSG_ERROR([cannot find protobuf
+-------------------------------------------------------------------
+You have requested the use of a non-bundled protobuf but no suitable
+protobuf could be found.
+
+You may want specify the location of protobuf by providing a prefix
+path via --with-protobuf=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_protobuf=yes
+  PROTOBUF_JAR="\${MESOS_BUILD_DIR}/src/java/target/protobuf-java-2.5.0.jar"
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_PROTOBUF],
+               [test "x$with_bundled_protobuf" = "xyes"])
+
+AC_SUBST([PROTOBUF_JAR])
 
 # Default to gcc toolchain (we rely on some atomic builtins for now,
 # that are also present with clang).
 AC_PROG_CXX([g++])
 AC_PROG_CC([gcc])
-
 
 # Check if we should try and enable optimizations.
 if test "x$enable_optimize" = "xyes"; then
@@ -174,11 +529,11 @@ AM_CONDITIONAL([HAS_GPERFTOOLS], [test "x$gperftools" = "xyes"])
 if test "x$with_zlib" = "xyes"; then
   AC_CHECK_LIB([z], [deflate, gzread, gzwrite, inflate], [],
                [AC_MSG_ERROR([cannot find libz
-  -------------------------------------------------------------------
-  This means HTTP responses will be slower because we cannot use
-  compression; you probably want to download and install zlib, but
-  you can get away without it by doing --without-zlib.
-  -------------------------------------------------------------------
+-------------------------------------------------------------------
+This means HTTP responses will be slower because we cannot use
+compression; you probably want to download and install zlib, but
+you can get away without it by doing --without-zlib.
+-------------------------------------------------------------------
   ])])
 fi
 
@@ -204,6 +559,13 @@ if test "x$with_cxx11" = "xyes"; then
   # Also pass the flags to 3rdparty libraries.
   CONFIGURE_ARGS="$CONFIGURE_ARGS CXXFLAGS='$CXXFLAGS'"
 fi
+
+AC_CHECK_LIB([dl], [dlopen], [AC_MSG_RESULT([found])],
+	     [AC_MSG_ERROR([cannot find libdl
+-------------------------------------------------------------------
+libdl was not found, and is required for compilation.
+-------------------------------------------------------------------
+])])
 
 
 AC_OUTPUT

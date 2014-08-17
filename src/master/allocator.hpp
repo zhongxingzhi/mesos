@@ -88,12 +88,12 @@ public:
   virtual void slaveRemoved(
       const SlaveID& slaveId) = 0;
 
-  // No longer offers resources for the disconnected slave.
-  virtual void slaveDisconnected(
+  // No longer offers resources for the deactivated slave.
+  virtual void slaveDeactivated(
       const SlaveID& slaveId) = 0;
 
-  // Resumes resource offers for the reconnected slave.
-  virtual void slaveReconnected(
+  // Offers resources for the activated slave.
+  virtual void slaveActivated(
       const SlaveID& slaveId) = 0;
 
   virtual void updateWhitelist(
@@ -103,21 +103,15 @@ public:
       const FrameworkID& frameworkId,
       const std::vector<Request>& requests) = 0;
 
-  // Whenever resources offered to a framework go unused (e.g.,
-  // refused) the master invokes this callback.
-  virtual void resourcesUnused(
+  // Whenever resources are "recovered" in the cluster (e.g., a task
+  // finishes, an offer is removed because a framework has failed or
+  // is failing over), or a framework refuses them, the master
+  // invokes this callback.
+  virtual void resourcesRecovered(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
       const Option<Filters>& filters) = 0;
-
-  // Whenever resources are "recovered" in the cluster (e.g., a task
-  // finishes, an offer is removed because a framework has failed or
-  // is failing over) the master invokes this callback.
-  virtual void resourcesRecovered(
-      const FrameworkID& frameworkId,
-      const SlaveID& slaveId,
-      const Resources& resources) = 0;
 
   // Whenever a framework that has filtered resources wants to revive
   // offers for those resources the master invokes this callback.
@@ -135,7 +129,7 @@ public:
   // The AllocatorProcess object passed to the constructor is
   // spawned and terminated by the allocator. But it is the responsibility
   // of the caller to de-allocate the object, if necessary.
-  Allocator(AllocatorProcess* _process);
+  explicit Allocator(AllocatorProcess* _process);
 
   virtual ~Allocator();
 
@@ -167,10 +161,10 @@ public:
   void slaveRemoved(
       const SlaveID& slaveId);
 
-  void slaveDisconnected(
+  void slaveDeactivated(
       const SlaveID& slaveId);
 
-  void slaveReconnected(
+  void slaveActivated(
       const SlaveID& slaveId);
 
   void updateWhitelist(
@@ -180,16 +174,11 @@ public:
       const FrameworkID& frameworkId,
       const std::vector<Request>& requests);
 
-  void resourcesUnused(
+  void resourcesRecovered(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
       const Option<Filters>& filters);
-
-  void resourcesRecovered(
-      const FrameworkID& frameworkId,
-      const SlaveID& slaveId,
-      const Resources& resources);
 
   void offersRevived(
       const FrameworkID& frameworkId);
@@ -299,20 +288,20 @@ inline void Allocator::slaveRemoved(const SlaveID& slaveId)
 }
 
 
-inline void Allocator::slaveDisconnected(const SlaveID& slaveId)
+inline void Allocator::slaveDeactivated(const SlaveID& slaveId)
 {
   process::dispatch(
       process,
-      &AllocatorProcess::slaveDisconnected,
+      &AllocatorProcess::slaveDeactivated,
       slaveId);
 }
 
 
-inline void Allocator::slaveReconnected(const SlaveID& slaveId)
+inline void Allocator::slaveActivated(const SlaveID& slaveId)
 {
   process::dispatch(
       process,
-      &AllocatorProcess::slaveReconnected,
+      &AllocatorProcess::slaveActivated,
       slaveId);
 }
 
@@ -339,7 +328,7 @@ inline void Allocator::resourcesRequested(
 }
 
 
-inline void Allocator::resourcesUnused(
+inline void Allocator::resourcesRecovered(
     const FrameworkID& frameworkId,
     const SlaveID& slaveId,
     const Resources& resources,
@@ -347,25 +336,11 @@ inline void Allocator::resourcesUnused(
 {
   process::dispatch(
       process,
-      &AllocatorProcess::resourcesUnused,
+      &AllocatorProcess::resourcesRecovered,
       frameworkId,
       slaveId,
       resources,
       filters);
-}
-
-
-inline void Allocator::resourcesRecovered(
-    const FrameworkID& frameworkId,
-    const SlaveID& slaveId,
-    const Resources& resources)
-{
-  process::dispatch(
-      process,
-      &AllocatorProcess::resourcesRecovered,
-      frameworkId,
-      slaveId,
-      resources);
 }
 
 

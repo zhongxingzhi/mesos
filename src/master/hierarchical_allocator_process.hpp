@@ -19,6 +19,9 @@
 #ifndef __HIERARCHICAL_ALLOCATOR_PROCESS_HPP__
 #define __HIERARCHICAL_ALLOCATOR_PROCESS_HPP__
 
+#include <algorithm>
+#include <vector>
+
 #include <mesos/resources.hpp>
 
 #include <process/delay.hpp>
@@ -58,9 +61,9 @@ struct Slave
 {
   Slave() {}
 
-  Slave(const SlaveInfo& _info)
+  explicit Slave(const SlaveInfo& _info)
     : available(_info.resources()),
-      connected(true),
+      activated(true),
       whitelisted(false),
       checkpoint(_info.checkpoint()),
       info(_info) {}
@@ -72,9 +75,9 @@ struct Slave
   // Contains all of the resources currently free on this slave.
   Resources available;
 
-  // Whether the slave is connected. Resources are not offered for
-  // disconnected slaves until they reconnect.
-  bool connected;
+  // Whether the slave is activated. Resources are not offered for
+  // deactivated slaves until they are reactivated.
+  bool activated;
 
   // Indicates if the resources on this slave should be offered to
   // frameworks.
@@ -90,7 +93,7 @@ struct Framework
 {
   Framework() {}
 
-  Framework(const FrameworkInfo& _info)
+  explicit Framework(const FrameworkInfo& _info)
     : checkpoint(_info.checkpoint()),
       info(_info) {}
 
@@ -145,10 +148,10 @@ public:
   void slaveRemoved(
       const SlaveID& slaveId);
 
-  void slaveDisconnected(
+  void slaveDeactivated(
       const SlaveID& slaveId);
 
-  void slaveReconnected(
+  void slaveActivated(
       const SlaveID& slaveId);
 
   void updateWhitelist(
@@ -158,16 +161,11 @@ public:
       const FrameworkID& frameworkId,
       const std::vector<Request>& requests);
 
-  void resourcesUnused(
+  void resourcesRecovered(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& resources,
       const Option<Filters>& filters);
-
-  void resourcesRecovered(
-      const FrameworkID& frameworkId,
-      const SlaveID& slaveId,
-      const Resources& resources);
 
   void offersRevived(
       const FrameworkID& frameworkId);
@@ -262,13 +260,13 @@ public:
 
 
 template <class RoleSorter, class FrameworkSorter>
-HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::HierarchicalAllocatorProcess()
+HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::HierarchicalAllocatorProcess() // NOLINT(whitespace/line_length)
   : ProcessBase(process::ID::generate("hierarchical-allocator")),
     initialized(false) {}
 
 
 template <class RoleSorter, class FrameworkSorter>
-HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::~HierarchicalAllocatorProcess()
+HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::~HierarchicalAllocatorProcess() // NOLINT(whitespace/line_length)
 {}
 
 
@@ -276,8 +274,7 @@ template <class RoleSorter, class FrameworkSorter>
 process::PID<HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter> >
 HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::self()
 {
-  return
-    process::PID<HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter> >(this);
+  return process::PID<HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter> >(this); // NOLINT(whitespace/line_length)
 }
 
 
@@ -473,29 +470,29 @@ HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::slaveRemoved(
 
 template <class RoleSorter, class FrameworkSorter>
 void
-HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::slaveDisconnected(
+HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::slaveDeactivated(
     const SlaveID& slaveId)
 {
   CHECK(initialized);
   CHECK(slaves.contains(slaveId));
 
-  slaves[slaveId].connected = false;
+  slaves[slaveId].activated = false;
 
-  LOG(INFO) << "Slave " << slaveId << " disconnected";
+  LOG(INFO) << "Slave " << slaveId << " deactivated";
 }
 
 
 template <class RoleSorter, class FrameworkSorter>
 void
-HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::slaveReconnected(
+HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::slaveActivated(
     const SlaveID& slaveId)
 {
   CHECK(initialized);
   CHECK(slaves.contains(slaveId));
 
-  slaves[slaveId].connected = true;
+  slaves[slaveId].activated = true;
 
-  LOG(INFO)<< "Slave " << slaveId << " reconnected";
+  LOG(INFO)<< "Slave " << slaveId << " reactivated";
 }
 
 
@@ -532,82 +529,11 @@ HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::resourcesRequested(
 
 template <class RoleSorter, class FrameworkSorter>
 void
-HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::resourcesUnused(
+HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::resourcesRecovered(
     const FrameworkID& frameworkId,
     const SlaveID& slaveId,
     const Resources& resources,
     const Option<Filters>& filters)
-{
-  CHECK(initialized);
-
-  if (resources.allocatable().size() == 0) {
-    return;
-  }
-
-  VLOG(1) << "Framework " << frameworkId
-          << " left " << resources.allocatable()
-          << " unused on slave " << slaveId;
-
-  // Update resources allocated to framework. It is
-  // not possible for the role to not be in roles
-  // because resourcesUnused is only called as the
-  // result of a valid task launch by an active
-  // framework that doesn't use the entire offer.
-  CHECK(frameworks.contains(frameworkId));
-
-  const std::string& role = frameworks[frameworkId].role();
-  sorters[role]->unallocated(frameworkId.value(), resources);
-  sorters[role]->remove(resources);
-  roleSorter->unallocated(role, resources);
-
-  // Update resources allocatable on slave.
-  CHECK(slaves.contains(slaveId));
-  slaves[slaveId].available += resources;
-
-  // Create a refused resources filter.
-  Try<Duration> seconds_ = Duration::create(Filters().refuse_seconds());
-  CHECK_SOME(seconds_);
-  Duration seconds = seconds_.get();
-
-  // Update the value of 'seconds' if the input isSome() and is
-  // valid.
-  if (filters.isSome()) {
-    seconds_ = Duration::create(filters.get().refuse_seconds());
-    if (seconds_.isError()) {
-      LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
-                   << "the refused resources filter because the input value is "
-                   << "invalid: " << seconds_.error();
-    } else if (seconds_.get() < Duration::zero()) {
-      LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
-                   << "the refused resources filter because the input value is "
-                   << "negative";
-    } else {
-      seconds = seconds_.get();
-    }
-  }
-
-  if (seconds != Duration::zero()) {
-    LOG(INFO) << "Framework " << frameworkId
-              << " filtered slave " << slaveId
-              << " for " << seconds;
-
-    // Create a new filter and delay it's expiration.
-    Filter* filter =
-      new RefusedFilter(slaveId, resources, process::Timeout::in(seconds));
-
-    frameworks[frameworkId].filters.insert(filter);
-
-    delay(seconds, self(), &Self::expire, frameworkId, filter);
-  }
-}
-
-
-template <class RoleSorter, class FrameworkSorter>
-void
-HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::resourcesRecovered(
-    const FrameworkID& frameworkId,
-    const SlaveID& slaveId,
-    const Resources& resources)
 {
   CHECK(initialized);
 
@@ -638,6 +564,45 @@ HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::resourcesRecovered(
               << " (total allocatable: " << slaves[slaveId].available
               << ") on slave " << slaveId
               << " from framework " << frameworkId;
+  }
+
+  // Create a filter for this slave/framework pair if both exist.
+  if (frameworks.contains(frameworkId) && slaves.contains(slaveId)) {
+    // Create a refused resources filter.
+    Try<Duration> seconds_ = Duration::create(Filters().refuse_seconds());
+    CHECK_SOME(seconds_);
+    Duration seconds = seconds_.get();
+
+    // Update the value of 'seconds' if the input isSome() and is
+    // valid.
+    if (filters.isSome()) {
+      seconds_ = Duration::create(filters.get().refuse_seconds());
+      if (seconds_.isError()) {
+        LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
+                     << "the refused resources filter because the input value "
+                     << "is invalid: " << seconds_.error();
+      } else if (seconds_.get() < Duration::zero()) {
+        LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
+                     << "the refused resources filter because the input value "
+                     << "is negative";
+      } else {
+        seconds = seconds_.get();
+      }
+    }
+
+    if (seconds != Duration::zero()) {
+      VLOG(1) << "Framework " << frameworkId
+              << " filtered slave " << slaveId
+              << " for " << seconds;
+
+      // Create a new filter and delay its expiration.
+      Filter* filter =
+        new RefusedFilter(slaveId, resources, process::Timeout::in(seconds));
+
+      frameworks[frameworkId].filters.insert(filter);
+
+      delay(seconds, self(), &Self::expire, frameworkId, filter);
+    }
   }
 }
 
@@ -713,7 +678,7 @@ HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::allocate(
 template <class RoleSorter, class FrameworkSorter>
 void
 HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::allocate(
-    const hashset<SlaveID>& slaveIds)
+    const hashset<SlaveID>& slaveIds_)
 {
   CHECK(initialized);
 
@@ -722,56 +687,66 @@ HierarchicalAllocatorProcess<RoleSorter, FrameworkSorter>::allocate(
     return;
   }
 
-  if (slaveIds.empty()) {
+  if (slaveIds_.empty()) {
     VLOG(1) << "No resources available to allocate!";
     return;
   }
 
-  foreach (const std::string& role, roleSorter->sort()) {
-    foreach (const std::string& frameworkIdValue, sorters[role]->sort()) {
-      FrameworkID frameworkId;
-      frameworkId.set_value(frameworkIdValue);
+  // Randomize the order in which slaves' resources are allocated.
+  // TODO(vinod): Implement a smarter sorting algorithm.
+  std::vector<SlaveID> slaveIds(slaveIds_.begin(), slaveIds_.end());
+  std::random_shuffle(slaveIds.begin(), slaveIds.end());
 
-      Resources allocatedResources;
-      hashmap<SlaveID, Resources> offerable;
-      foreach (const SlaveID& slaveId, slaveIds) {
+  hashmap<FrameworkID, hashmap<SlaveID, Resources> > offerable;
+  foreach (const SlaveID& slaveId, slaveIds) {
+    // If the slave is not activated or whitelisted, ignore it.
+    if (!slaves[slaveId].activated || !slaves[slaveId].whitelisted) {
+      continue;
+    }
+
+    foreach (const std::string& role, roleSorter->sort()) {
+      foreach (const std::string& frameworkIdValue, sorters[role]->sort()) {
+        FrameworkID frameworkId;
+        frameworkId.set_value(frameworkIdValue);
+
         Resources unreserved = slaves[slaveId].available.extract("*");
         Resources resources = unreserved;
-
         if (role != "*") {
           resources += slaves[slaveId].available.extract(role);
         }
 
-        // Check whether or not this framework filters this slave.
-        bool filtered = isFiltered(frameworkId, slaveId, resources);
-
-        if (!filtered &&
-            slaves[slaveId].connected &&
-            slaves[slaveId].whitelisted &&
-            allocatable(resources)) {
-          VLOG(1)
-            << "Offering " << resources << " on slave " << slaveId
-            << " to framework " << frameworkId;
-
-          offerable[slaveId] = resources;
-
-          // Update framework and slave resources.
-          slaves[slaveId].available -= resources;
-
-          // We only count resources not reserved for this role
-          // in the share the sorter considers.
-          allocatedResources += unreserved;
+        // If the resources are not allocatable, ignore.
+        if (!allocatable(resources)) {
+          continue;
         }
-      }
 
-      if (!offerable.empty()) {
-        sorters[role]->add(allocatedResources);
-        sorters[role]->allocated(frameworkIdValue, allocatedResources);
-        roleSorter->allocated(role, allocatedResources);
+        // If the framework filters these resources, ignore.
+        if (isFiltered(frameworkId, slaveId, resources)) {
+          continue;
+        }
 
-        dispatch(master, &Master::offer, frameworkId, offerable);
+        VLOG(1)
+          << "Offering " << resources << " on slave " << slaveId
+          << " to framework " << frameworkId;
+
+        offerable[frameworkId][slaveId] = resources;
+
+        // Update slave resources.
+        slaves[slaveId].available -= resources;
+
+        // Update the sorters.
+        // We only count resources not reserved for this role
+        // in the share the sorter considers.
+        sorters[role]->add(unreserved);
+        sorters[role]->allocated(frameworkIdValue, unreserved);
+        roleSorter->allocated(role, unreserved);
       }
     }
+  }
+
+  // Now offer the resources to each framework.
+  foreachkey (const FrameworkID& frameworkId, offerable) {
+    dispatch(master, &Master::offer, frameworkId, offerable[frameworkId]);
   }
 }
 

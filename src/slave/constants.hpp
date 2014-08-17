@@ -34,15 +34,29 @@ namespace slave {
 // So we've moved these to have external linkage but perhaps in the future
 // we can revert this.
 
+// TODO(jieyu): Use static functions for all the constants. See more
+// details in MESOS-1023.
+
 extern const Duration EXECUTOR_REGISTRATION_TIMEOUT;
 extern const Duration EXECUTOR_SHUTDOWN_GRACE_PERIOD;
 extern const Duration EXECUTOR_REREGISTER_TIMEOUT;
+extern const Duration EXECUTOR_SIGNAL_ESCALATION_TIMEOUT;
 extern const Duration RECOVERY_TIMEOUT;
 extern const Duration STATUS_UPDATE_RETRY_INTERVAL_MIN;
 extern const Duration STATUS_UPDATE_RETRY_INTERVAL_MAX;
 extern const Duration GC_DELAY;
 extern const Duration DISK_WATCH_INTERVAL;
 extern const Duration RESOURCE_MONITORING_INTERVAL;
+
+// Default backoff interval used by the slave to wait before registration.
+extern const Duration REGISTRATION_BACKOFF_FACTOR;
+
+// The maximum interval the slave waits before retrying registration.
+// Note that this value has to be << 'MIN_SLAVE_REREGISTER_TIMEOUT'
+// declared in 'master/constants.hpp'. This helps the slave to retry
+// (re-)registration multiple times between when the master finishes
+// recovery and when it times out slave re-registration.
+extern const Duration REGISTER_RETRY_INTERVAL_MAX;
 
 // Minimum free disk capacity enforced by the garbage collector.
 extern const double GC_DISK_HEADROOM;
@@ -67,6 +81,22 @@ extern const Bytes DEFAULT_DISK;
 
 // Default ports range offered by the slave.
 extern const std::string DEFAULT_PORTS;
+
+// Default cpu resource given to a command executor.
+const double DEFAULT_EXECUTOR_CPUS = 0.1;
+
+// Default memory resource given to a command executor.
+const Bytes DEFAULT_EXECUTOR_MEM = Megabytes(32);
+
+#ifdef WITH_NETWORK_ISOLATOR
+// Default number of ephemeral ports allocated to a container by the
+// network isolator.
+extern const uint16_t DEFAULT_EPHEMERAL_PORTS_PER_CONTAINER;
+#endif
+
+// If no pings received within this timeout, then the slave will
+// trigger a re-detection of the master to cause a re-registration.
+Duration MASTER_PING_TIMEOUT();
 
 } // namespace slave {
 } // namespace internal {

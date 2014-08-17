@@ -2,6 +2,7 @@
 
 #include <stout/foreach.hpp>
 #include <stout/interval.hpp>
+#include <stout/stringify.hpp>
 
 
 TEST(IntervalTest, Interval)
@@ -118,6 +119,22 @@ TEST(IntervalTest, EmptyInterval)
 }
 
 
+TEST(IntervalTest, IntervalEqual)
+{
+  Interval<int> interval((Bound<int>::closed(1), Bound<int>::open(3)));
+  Interval<int> interval2((Bound<int>::closed(1), Bound<int>::open(3)));
+  Interval<int> interval3((Bound<int>::open(1), Bound<int>::open(1)));
+  Interval<int> interval4((Bound<int>::open(1), Bound<int>::open(1)));
+  Interval<int> interval5((Bound<int>::open(2), Bound<int>::closed(3)));
+
+  EXPECT_EQ(interval, interval2);
+  EXPECT_EQ(interval3, interval4);
+  EXPECT_NE(interval, interval3);
+  EXPECT_NE(interval2, interval5);
+  EXPECT_NE(interval3, interval5);
+}
+
+
 TEST(IntervalTest, Constructor)
 {
   IntervalSet<int> set(0);
@@ -132,6 +149,37 @@ TEST(IntervalTest, Constructor)
   EXPECT_TRUE(set2.contains(2));
   EXPECT_EQ(1u, set2.intervalCount());
   EXPECT_EQ(2u, set2.size());
+}
+
+
+TEST(IntervalTest, Contains)
+{
+  IntervalSet<int> set;
+
+  set += (Bound<int>::closed(1), Bound<int>::closed(10));
+
+  EXPECT_TRUE(set.contains(1));
+  EXPECT_TRUE(set.contains(10));
+  EXPECT_FALSE(set.contains(11));
+  EXPECT_FALSE(set.contains(0));
+
+  EXPECT_TRUE(set.contains((Bound<int>::closed(2), Bound<int>::closed(10))));
+  EXPECT_TRUE(set.contains((Bound<int>::closed(2), Bound<int>::open(11))));
+  EXPECT_TRUE(set.contains((Bound<int>::open(2), Bound<int>::open(4))));
+  EXPECT_FALSE(set.contains((Bound<int>::closed(5), Bound<int>::closed(11))));
+  EXPECT_FALSE(set.contains((Bound<int>::open(0), Bound<int>::closed(20))));
+
+  IntervalSet<int> set2;
+
+  set2 += (Bound<int>::open(4), Bound<int>::open(10));
+
+  EXPECT_TRUE(set.contains(set2));
+  EXPECT_FALSE(set2.contains(set));
+
+  IntervalSet<int> set3;
+
+  EXPECT_TRUE(set.contains(set3));
+  EXPECT_FALSE(set3.contains(set2));
 }
 
 
@@ -242,6 +290,34 @@ TEST(IntervalTest, Intersection)
 }
 
 
+TEST(IntervalTest, IntersectionTest)
+{
+  Interval<int> interval((Bound<int>::open(4), Bound<int>::closed(6)));
+  Interval<int> interval2((Bound<int>::closed(1), Bound<int>::closed(5)));
+  Interval<int> interval3((Bound<int>::closed(7), Bound<int>::closed(8)));
+
+  IntervalSet<int> set((Bound<int>::closed(1), Bound<int>::closed(3)));
+  IntervalSet<int> set2((Bound<int>::open(2), Bound<int>::open(4)));
+  IntervalSet<int> set3((Bound<int>::open(6), Bound<int>::closed(7)));
+
+  EXPECT_FALSE(set.intersects(interval));
+  EXPECT_TRUE(set2.intersects(interval2));
+  EXPECT_TRUE(set3.intersects(interval3));
+
+  EXPECT_FALSE(set2.intersects(interval));
+  EXPECT_TRUE(set2.intersects(interval2));
+  EXPECT_FALSE(set2.intersects(interval3));
+
+  EXPECT_TRUE(set.intersects(set2));
+  EXPECT_TRUE(set2.intersects(set));
+  EXPECT_FALSE(set3.intersects(set2));
+
+  EXPECT_TRUE(interval.intersects(interval2));
+  EXPECT_FALSE(interval2.intersects(interval3));
+  EXPECT_FALSE(interval3.intersects(interval));
+}
+
+
 TEST(IntervalTest, LargeInterval)
 {
   IntervalSet<int> set;
@@ -288,4 +364,41 @@ TEST(IntervalTest, IntervalIteration)
     }
     index++;
   }
+}
+
+
+TEST(IntervalTest, Stream)
+{
+  EXPECT_EQ("[1,3)", stringify((Bound<int>::closed(1), Bound<int>::open(3))));
+  EXPECT_EQ("[1,4)", stringify((Bound<int>::open(0), Bound<int>::closed(3))));
+  EXPECT_EQ("[0,5)", stringify((Bound<int>::closed(0), Bound<int>::closed(4))));
+  EXPECT_EQ("[2,3)", stringify((Bound<int>::open(1), Bound<int>::open(3))));
+  EXPECT_EQ("[)", stringify((Bound<int>::closed(1), Bound<int>::open(1))));
+
+  IntervalSet<int> set;
+
+  set += (Bound<int>::open(7), Bound<int>::closed(9));
+  EXPECT_EQ("{[8,10)}", stringify(set));
+
+  set += 5;
+  EXPECT_EQ("{[5,6)[8,10)}", stringify(set));
+
+  set += (Bound<int>::closed(7), Bound<int>::closed(9));
+  EXPECT_EQ("{[5,6)[7,10)}", stringify(set));
+}
+
+
+TEST(IntervalTest, InfixOperator)
+{
+  IntervalSet<int> set1(Bound<int>::closed(0), Bound<int>::closed(1));
+  IntervalSet<int> set2(Bound<int>::closed(2), Bound<int>::open(3));
+  IntervalSet<int> set3(Bound<int>::closed(0), Bound<int>::closed(2));
+
+  EXPECT_EQ(set3, set1 + set2);
+  EXPECT_EQ(set3, set1 + (Bound<int>::closed(2), Bound<int>::open(3)));
+  EXPECT_EQ(set3, set1 + 2);
+
+  EXPECT_EQ(set1, set3 - set2);
+  EXPECT_EQ(set2, set3 - (Bound<int>::closed(0), Bound<int>::closed(1)));
+  EXPECT_EQ(set1, set3 - 2);
 }

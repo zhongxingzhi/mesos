@@ -3,20 +3,19 @@
 
 #include <unistd.h>
 
-#include <glog/logging.h>
-
 #include <sys/types.h>
 
+#include <map>
 #include <string>
+#include <vector>
 
 #include <process/future.hpp>
-#include <process/reap.hpp>
 
-#include <stout/error.hpp>
+#include <stout/flags.hpp>
 #include <stout/lambda.hpp>
 #include <stout/memory.hpp>
-#include <stout/nothing.hpp>
 #include <stout/option.hpp>
+#include <stout/os.hpp>
 #include <stout/try.hpp>
 
 namespace process {
@@ -27,157 +26,213 @@ namespace process {
 //   1. The subprocess has terminated, and
 //   2. There are no longer any references to the associated
 //      Subprocess object.
-struct Subprocess
+class Subprocess
 {
+public:
+  // Describes how the I/O is redirected for stdin/stdout/stderr.
+  // One of the following three modes are supported:
+  //   1. PIPE: Redirect to a pipe. The pipe will be created
+  //      automatically and the user can read/write the parent side of
+  //      the pipe from in()/out()/err().
+  //   2. PATH: Redirect to a file. The file will be created if it
+  //      does not exist. If the file exists, it will be appended.
+  //   3. FD: Redirect to an open file descriptor.
+  class IO
+  {
+  public:
+    bool isPipe() const { return mode == PIPE; }
+    bool isPath() const { return mode == PATH; }
+    bool isFd() const { return mode == FD; }
+
+  private:
+    friend class Subprocess;
+
+    friend Try<Subprocess> subprocess(
+        const std::string& path,
+        std::vector<std::string> argv,
+        const Subprocess::IO& in,
+        const Subprocess::IO& out,
+        const Subprocess::IO& err,
+        const Option<flags::FlagsBase>& flags,
+        const Option<std::map<std::string, std::string> >& environment,
+        const Option<lambda::function<int()> >& setup,
+        const Option<lambda::function<
+            pid_t(const lambda::function<int()>&)> >& clone);
+
+    enum Mode
+    {
+      PIPE, // Redirect I/O to a pipe.
+      PATH, // Redirect I/O to a file.
+      FD,   // Redirect I/O to an open file descriptor.
+    };
+
+    IO(Mode _mode, const Option<int>& _fd, const Option<std::string>& _path)
+      : mode(_mode), fd(_fd), path(_path) {}
+
+    Mode mode;
+    Option<int> fd;
+    Option<std::string> path;
+  };
+
+  // Syntactic sugar to create IO descriptors.
+  static IO PIPE()
+  {
+    return IO(IO::PIPE, None(), None());
+  }
+
+  static IO PATH(const std::string& path)
+  {
+    return IO(IO::PATH, None(), path);
+  }
+
+  static IO FD(int fd)
+  {
+    return IO(IO::FD, fd, None());
+  }
+
   // Returns the pid for the subprocess.
   pid_t pid() const { return data->pid; }
 
-  // File descriptor accessors for input / output.
-  int in()  const { return data->in;  }
-  int out() const { return data->out; }
-  int err() const { return data->err; }
+  // The parent side of the pipe for stdin/stdout/stderr.
+  Option<int> in()  const { return data->in;  }
+  Option<int> out() const { return data->out; }
+  Option<int> err() const { return data->err; }
 
   // Returns a future from process::reap of this subprocess.
   // Discarding this future has no effect on the subprocess.
   Future<Option<int> > status() const { return data->status; }
 
 private:
-  Subprocess() : data(new Data()) {}
-  friend Try<Subprocess> subprocess(const std::string&);
+  friend Try<Subprocess> subprocess(
+      const std::string& path,
+      std::vector<std::string> argv,
+      const Subprocess::IO& in,
+      const Subprocess::IO& out,
+      const Subprocess::IO& err,
+      const Option<flags::FlagsBase>& flags,
+      const Option<std::map<std::string, std::string> >& environment,
+      const Option<lambda::function<int()> >& setup,
+      const Option<lambda::function<
+          pid_t(const lambda::function<int()>&)> >& clone);
 
   struct Data
   {
     ~Data()
     {
-      os::close(in);
-      os::close(out);
-      os::close(err);
+      if (in.isSome()) { os::close(in.get()); }
+      if (out.isSome()) { os::close(out.get()); }
+      if (err.isSome()) { os::close(err.get()); }
     }
 
     pid_t pid;
 
+    // The parent side of the pipe for stdin/stdout/stderr. If the
+    // mode is not PIPE, None will be stored.
     // NOTE: stdin, stdout, stderr are macros on some systems, hence
     // these names instead.
-    int in;
-    int out;
-    int err;
+    Option<int> in;
+    Option<int> out;
+    Option<int> err;
 
     Future<Option<int> > status;
   };
+
+  Subprocess() : data(new Data()) {}
 
   memory::shared_ptr<Data> data;
 };
 
 
-namespace internal {
+// The Environment is combined with the OS environment and overrides
+// where necessary.
+// The setup function is run after forking but before executing the
+// command. If the return value of that setup function is non-zero,
+// then that is what the subprocess status will be;
+// status = setup && command.
+// NOTE: Take extra care about the design of the setup function as it
+// must not contain any async unsafe code.
+// TODO(dhamon): Add an option to not combine the two environments.
+Try<Subprocess> subprocess(
+    const std::string& path,
+    std::vector<std::string> argv,
+    const Subprocess::IO& in,
+    const Subprocess::IO& out,
+    const Subprocess::IO& err,
+    const Option<flags::FlagsBase>& flags = None(),
+    const Option<std::map<std::string, std::string> >& environment = None(),
+    const Option<lambda::function<int()> >& setup = None(),
+    const Option<lambda::function<
+        pid_t(const lambda::function<int()>&)> >& clone = None());
 
-// See the comment below as to why subprocess is passed to cleanup.
-inline void cleanup(
-    const Future<Option<int> >& result,
-    Promise<Option<int> >* promise,
-    const Subprocess& subprocess)
+
+inline Try<Subprocess> subprocess(
+    const std::string& path,
+    std::vector<std::string> argv,
+    const Option<flags::FlagsBase>& flags = None(),
+    const Option<std::map<std::string, std::string> >& environment = None(),
+    const Option<lambda::function<int()> >& setup = None(),
+    const Option<lambda::function<
+        pid_t(const lambda::function<int()>&)> >& clone = None())
 {
-  CHECK(!result.isPending());
-  CHECK(!result.isDiscarded());
-
-  if (result.isFailed()) {
-    promise->fail(result.failure());
-  } else {
-    promise->set(result.get());
-  }
-
-  delete promise;
+  return subprocess(
+      path,
+      argv,
+      Subprocess::FD(STDIN_FILENO),
+      Subprocess::FD(STDOUT_FILENO),
+      Subprocess::FD(STDERR_FILENO),
+      flags,
+      environment,
+      setup,
+      clone);
 }
 
+
+// Overloads for launching a shell command. Currently, we do not
+// support flags for shell command variants due to the complexity
+// involved in escaping quotes in flags.
+inline Try<Subprocess> subprocess(
+    const std::string& command,
+    const Subprocess::IO& in,
+    const Subprocess::IO& out,
+    const Subprocess::IO& err,
+    const Option<std::map<std::string, std::string> >& environment = None(),
+    const Option<lambda::function<int()> >& setup = None(),
+    const Option<lambda::function<
+        pid_t(const lambda::function<int()>&)> >& clone = None())
+{
+  std::vector<std::string> argv(3);
+  argv[0] = "sh";
+  argv[1] = "-c";
+  argv[2] = command;
+
+  return subprocess(
+      "/bin/sh",
+      argv,
+      in,
+      out,
+      err,
+      None(),
+      environment,
+      setup,
+      clone);
 }
 
 
-// Runs the provided command in a subprocess.
-inline Try<Subprocess> subprocess(const std::string& command)
+inline Try<Subprocess> subprocess(
+    const std::string& command,
+    const Option<std::map<std::string, std::string> >& environment = None(),
+    const Option<lambda::function<int()> >& setup = None(),
+    const Option<lambda::function<
+        pid_t(const lambda::function<int()>&)> >& clone = None())
 {
-  // Create pipes for stdin, stdout, stderr.
-  // Index 0 is for reading, and index 1 is for writing.
-  int stdinPipe[2];
-  int stdoutPipe[2];
-  int stderrPipe[2];
-
-  if (pipe(stdinPipe) == -1) {
-    return ErrnoError("Failed to create pipe");
-  } else if (pipe(stdoutPipe) == -1) {
-    os::close(stdinPipe[0]);
-    os::close(stdinPipe[1]);
-    return ErrnoError("Failed to create pipe");
-  } else if (pipe(stderrPipe) == -1) {
-    os::close(stdinPipe[0]);
-    os::close(stdinPipe[1]);
-    os::close(stdoutPipe[0]);
-    os::close(stdoutPipe[1]);
-    return ErrnoError("Failed to create pipe");
-  }
-
-  pid_t pid;
-  if ((pid = fork()) == -1) {
-    os::close(stdinPipe[0]);
-    os::close(stdinPipe[1]);
-    os::close(stdoutPipe[0]);
-    os::close(stdoutPipe[1]);
-    os::close(stderrPipe[0]);
-    os::close(stderrPipe[1]);
-    return ErrnoError("Failed to fork");
-  }
-
-  Subprocess process;
-  process.data->pid = pid;
-
-  if (process.data->pid == 0) {
-    // Child.
-    // Close parent's end of the pipes.
-    os::close(stdinPipe[1]);
-    os::close(stdoutPipe[0]);
-    os::close(stderrPipe[0]);
-
-    // Make our pipes look like stdin, stderr, stdout before we exec.
-    while (dup2(stdinPipe[0], STDIN_FILENO)   == -1 && errno == EINTR);
-    while (dup2(stdoutPipe[1], STDOUT_FILENO) == -1 && errno == EINTR);
-    while (dup2(stderrPipe[1], STDERR_FILENO) == -1 && errno == EINTR);
-
-    // Close the copies.
-    os::close(stdinPipe[0]);
-    os::close(stdoutPipe[1]);
-    os::close(stderrPipe[1]);
-
-    execl("/bin/sh", "sh", "-c", command.c_str(), (char *) NULL);
-
-    ABORT("Failed to execl '/bin sh -c ", command.c_str(), "'\n");
-  }
-
-  // Parent.
-
-  // Close the child's end of the pipes.
-  os::close(stdinPipe[0]);
-  os::close(stdoutPipe[1]);
-  os::close(stderrPipe[1]);
-
-  process.data->in = stdinPipe[1];
-  process.data->out = stdoutPipe[0];
-  process.data->err = stderrPipe[0];
-
-  // Rather than directly exposing the future from process::reap, we
-  // must use an explicit promise so that we can ensure we can receive
-  // the termination signal. Otherwise, the caller can discard the
-  // reap future, and we will not know when it is safe to close the
-  // file descriptors.
-  Promise<Option<int> >* promise = new Promise<Option<int> >();
-  process.data->status = promise->future();
-
-  // We need to bind a copy of this Subprocess into the onAny callback
-  // below to ensure that we don't close the file descriptors before
-  // the subprocess has terminated (i.e., because the caller doesn't
-  // keep a copy of this Subprocess around themselves).
-  process::reap(process.data->pid)
-    .onAny(lambda::bind(internal::cleanup, lambda::_1, promise, process));
-
-  return process;
+  return subprocess(
+      command,
+      Subprocess::FD(STDIN_FILENO),
+      Subprocess::FD(STDOUT_FILENO),
+      Subprocess::FD(STDERR_FILENO),
+      environment,
+      setup,
+      clone);
 }
 
 } // namespace process {

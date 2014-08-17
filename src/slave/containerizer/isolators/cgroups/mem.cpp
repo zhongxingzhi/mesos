@@ -55,14 +55,17 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
-// Memory subsystem constants.
-const Bytes MIN_MEMORY = Megabytes(32);
 
+template<class T>
+static Future<Option<T> > none() { return None(); }
 
 CgroupsMemIsolatorProcess::CgroupsMemIsolatorProcess(
     const Flags& _flags,
-    const string& _hierarchy)
-  : flags(_flags), hierarchy(_hierarchy) {}
+    const string& _hierarchy,
+    const bool _limitSwap)
+  : flags(_flags),
+    hierarchy(_hierarchy),
+    limitSwap(_limitSwap) {}
 
 
 CgroupsMemIsolatorProcess::~CgroupsMemIsolatorProcess() {}
@@ -77,25 +80,37 @@ Try<Isolator*> CgroupsMemIsolatorProcess::create(const Flags& flags)
     return Error("Failed to create memory cgroup: " + hierarchy.error());
   }
 
-  // Make sure the kernel supports OOM controls.
-  Try<bool> exists = cgroups::exists(
-      hierarchy.get(), flags.cgroups_root, "memory.oom_control");
-  if (exists.isError() || !exists.get()) {
-    return Error("Failed to determine if 'memory.oom_control' control exists");
-  }
-
   // Make sure the kernel OOM-killer is enabled.
   // The Mesos OOM handler, as implemented, is not capable of handling
   // the oom condition by itself safely given the limitations Linux
   // imposes on this code path.
-  Try<Nothing> write = cgroups::write(
-      hierarchy.get(), flags.cgroups_root, "memory.oom_control", "0");
-  if (write.isError()) {
-    return Error("Failed to update memory.oom_control");
+  Try<Nothing> enable = cgroups::memory::oom::killer::enable(
+      hierarchy.get(), flags.cgroups_root);
+
+  if (enable.isError()) {
+    return Error(enable.error());
+  }
+
+  // Determine whether to limit swap or not.
+  bool limitSwap = false;
+
+  if (flags.cgroups_limit_swap) {
+    Result<Bytes> check = cgroups::memory::memsw_limit_in_bytes(
+        hierarchy.get(), flags.cgroups_root);
+
+    if (check.isError()) {
+      return Error(
+          "Failed to read 'memory.memsw.limit_in_bytes': " +
+          check.error());
+    } else if (check.isNone()) {
+      return Error("'memory.memsw.limit_in_bytes' is not available");
+    }
+
+    limitSwap = true;
   }
 
   process::Owned<IsolatorProcess> process(
-      new CgroupsMemIsolatorProcess(flags, hierarchy.get()));
+      new CgroupsMemIsolatorProcess(flags, hierarchy.get(), limitSwap));
 
   return new Isolator(process);
 }
@@ -116,14 +131,10 @@ Future<Nothing> CgroupsMemIsolatorProcess::recover(
     }
 
     const ContainerID& containerId = state.id.get();
+    const string cgroup = path::join(flags.cgroups_root, containerId.value());
 
-    Info* info = new Info(
-        containerId, path::join(flags.cgroups_root, containerId.value()));
-    CHECK_NOTNULL(info);
-
-    Try<bool> exists = cgroups::exists(hierarchy, info->cgroup);
+    Try<bool> exists = cgroups::exists(hierarchy, cgroup);
     if (exists.isError()) {
-      delete info;
       foreachvalue (Info* info, infos) {
         delete info;
       }
@@ -134,15 +145,15 @@ Future<Nothing> CgroupsMemIsolatorProcess::recover(
 
     if (!exists.get()) {
       VLOG(1) << "Couldn't find cgroup for container " << containerId;
-      // This may occur if the executor has exiting and the isolator has
-      // destroyed the cgroup but the slave dies before noticing this. This
-      // will be detected when the containerizer tries to monitor the
-      // executor's pid.
+      // This may occur if the executor has exited and the isolator
+      // has destroyed the cgroup but the slave dies before noticing
+      // this. This will be detected when the containerizer tries to
+      // monitor the executor's pid.
       continue;
     }
 
-    infos[containerId] = info;
-    cgroups.insert(info->cgroup);
+    infos[containerId] = new Info(containerId, cgroup);
+    cgroups.insert(cgroup);
 
     oomListen(containerId);
   }
@@ -158,9 +169,17 @@ Future<Nothing> CgroupsMemIsolatorProcess::recover(
   }
 
   foreach (const string& orphan, orphans.get()) {
+    // Ignore the slave cgroup (see the --slave_subsystems flag).
+    // TODO(idownes): Remove this when the cgroups layout is updated,
+    // see MESOS-1185.
+    if (orphan == path::join(flags.cgroups_root, "slave")) {
+      continue;
+    }
+
     if (!cgroups.contains(orphan)) {
       LOG(INFO) << "Removing orphaned cgroup '" << orphan << "'";
-      cgroups::destroy(hierarchy, orphan);
+      // We don't wait on the destroy as we don't want to block recovery.
+      cgroups::destroy(hierarchy, orphan, cgroups::DESTROY_TIMEOUT);
     }
   }
 
@@ -168,7 +187,7 @@ Future<Nothing> CgroupsMemIsolatorProcess::recover(
 }
 
 
-Future<Nothing> CgroupsMemIsolatorProcess::prepare(
+Future<Option<CommandInfo> > CgroupsMemIsolatorProcess::prepare(
     const ContainerID& containerId,
     const ExecutorInfo& executorInfo)
 {
@@ -176,36 +195,37 @@ Future<Nothing> CgroupsMemIsolatorProcess::prepare(
     return Failure("Container has already been prepared");
   }
 
+  // TODO(bmahler): Don't insert into 'infos' unless we create the
+  // cgroup successfully. It's safe for now because 'cleanup' gets
+  // called if we return a Failure, but cleanup will fail because the
+  // cgroup does not exist when cgroups::destroy is called.
   Info* info = new Info(
       containerId, path::join(flags.cgroups_root, containerId.value()));
 
-  infos[containerId] = CHECK_NOTNULL(info);
+  infos[containerId] = info;
 
   // Create a cgroup for this container.
   Try<bool> exists = cgroups::exists(hierarchy, info->cgroup);
 
   if (exists.isError()) {
     return Failure("Failed to prepare isolator: " + exists.error());
-  }
-
-  if (exists.get()) {
+  } else if (exists.get()) {
     return Failure("Failed to prepare isolator: cgroup already exists");
   }
 
-  if (!exists.get()) {
-    Try<Nothing> create = cgroups::create(hierarchy, info->cgroup);
-    if (create.isError()) {
-      return Failure("Failed to prepare isolator: " + create.error());
-    }
+  Try<Nothing> create = cgroups::create(hierarchy, info->cgroup);
+  if (create.isError()) {
+    return Failure("Failed to prepare isolator: " + create.error());
   }
 
   oomListen(containerId);
 
-  return update(containerId, executorInfo.resources());
+  return update(containerId, executorInfo.resources())
+    .then(lambda::bind(none<CommandInfo>));
 }
 
 
-Future<Option<CommandInfo> > CgroupsMemIsolatorProcess::isolate(
+Future<Nothing> CgroupsMemIsolatorProcess::isolate(
     const ContainerID& containerId,
     pid_t pid)
 {
@@ -226,7 +246,7 @@ Future<Option<CommandInfo> > CgroupsMemIsolatorProcess::isolate(
                    "' : " + assign.error());
   }
 
-  return None();
+  return Nothing();
 }
 
 
@@ -266,42 +286,78 @@ Future<Nothing> CgroupsMemIsolatorProcess::update(
     cgroups::memory::soft_limit_in_bytes(hierarchy, info->cgroup, limit);
 
   if (write.isError()) {
-    return Failure("Failed to set 'memory.soft_limit_in_bytes': "
-        + write.error());
+    return Failure(
+        "Failed to set 'memory.soft_limit_in_bytes': " + write.error());
   }
 
   LOG(INFO) << "Updated 'memory.soft_limit_in_bytes' to " << limit
             << " for container " << containerId;
 
   // Read the existing limit.
-  Try<Bytes> currentLimit =
-    cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
+  Bytes currentLimit;
 
-  if (currentLimit.isError()) {
-    return Failure(
-        "Failed to read 'memory.limit_in_bytes': " + currentLimit.error());
+  if (limitSwap) {
+    Result<Bytes> _currentLimit =
+      cgroups::memory::memsw_limit_in_bytes(hierarchy, info->cgroup);
+
+    if (_currentLimit.isError()) {
+      return Failure(
+          "Failed to read 'memory.memsw.limit_in_bytes': " +
+          _currentLimit.error());
+    } else if (_currentLimit.isNone()) {
+      return Failure("'memory.memsw.limit_in_bytes' is not available");
+    }
+
+    currentLimit = _currentLimit.get();
+  } else {
+    Try<Bytes> _currentLimit =
+      cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
+
+    if (_currentLimit.isError()) {
+      return Failure(
+          "Failed to read 'memory.limit_in_bytes': " +
+          _currentLimit.error());
+    }
+
+    currentLimit = _currentLimit.get();
   }
 
   // Determine whether to set the hard limit. If this is the first
   // time (info->pid.isNone()), or we're raising the existing limit,
   // then we can update the hard limit safely. Otherwise, if we need
   // to decrease 'memory.limit_in_bytes' we may induce an OOM if too
-  // much memory is in use. As a result, we only update the soft
-  // limit when the memory reservation is being reduced. This is
-  // probably okay if the machine has available resources.
+  // much memory is in use. As a result, we only update the soft limit
+  // when the memory reservation is being reduced. This is probably
+  // okay if the machine has available resources.
   // TODO(benh): Introduce a MemoryWatcherProcess which monitors the
-  // discrepancy between usage and soft limit and introduces a "manual oom" if
-  // necessary.
-  if (info->pid.isNone() || limit > currentLimit.get()) {
-    write = cgroups::memory::limit_in_bytes(hierarchy, info->cgroup, limit);
+  // discrepancy between usage and soft limit and introduces a "manual
+  // oom" if necessary.
+  if (info->pid.isNone() || limit > currentLimit) {
+    if (limitSwap) {
+      Try<bool> write = cgroups::memory::memsw_limit_in_bytes(
+          hierarchy, info->cgroup, limit);
 
-    if (write.isError()) {
-      return Failure("Failed to set 'memory.limit_in_bytes': " +
-                     write.error());
+      if (write.isError()) {
+        return Failure(
+            "Failed to set 'memory.memsw.limit_in_bytes': " + write.error());
+      } else if (!write.get()) {
+        return Failure("'memory.memsw.limit_in_bytes' is not available");
+      }
+
+      LOG(INFO) << "Updated 'memory.memsw.limit_in_bytes' to " << limit
+                << " for container " << containerId;
+    } else {
+      Try<Nothing> write = cgroups::memory::limit_in_bytes(
+          hierarchy, info->cgroup, limit);
+
+      if (write.isError()) {
+        return Failure(
+            "Failed to set 'memory.limit_in_bytes': " + write.error());
+      }
+
+      LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << limit
+                << " for container " << containerId;
     }
-
-    LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << limit
-              << " for container " << containerId;
   }
 
   return Nothing();
@@ -360,8 +416,11 @@ Future<ResourceStatistics> CgroupsMemIsolatorProcess::usage(
 Future<Nothing> CgroupsMemIsolatorProcess::cleanup(
     const ContainerID& containerId)
 {
+  // Multiple calls may occur during test clean up.
   if (!infos.contains(containerId)) {
-    return Failure("Unknown container");
+    VLOG(1) << "Ignoring cleanup request for unknown container: "
+            << containerId;
+    return Nothing();
   }
 
   Info* info = CHECK_NOTNULL(infos[containerId]);
@@ -370,17 +429,29 @@ Future<Nothing> CgroupsMemIsolatorProcess::cleanup(
     info->oomNotifier.discard();
   }
 
-  return cgroups::destroy(hierarchy, info->cgroup)
-    .then(defer(PID<CgroupsMemIsolatorProcess>(this),
-                &CgroupsMemIsolatorProcess::_cleanup,
-                containerId));
+  return cgroups::destroy(hierarchy, info->cgroup, cgroups::DESTROY_TIMEOUT)
+    .onAny(defer(PID<CgroupsMemIsolatorProcess>(this),
+                 &CgroupsMemIsolatorProcess::_cleanup,
+                 containerId,
+                 lambda::_1));
 }
 
 
 Future<Nothing> CgroupsMemIsolatorProcess::_cleanup(
-    const ContainerID& containerId)
+    const ContainerID& containerId,
+    const Future<Nothing>& future)
 {
-  CHECK(infos.contains(containerId));
+  if (!infos.contains(containerId)) {
+    return Failure("Unknown container");
+  }
+
+  CHECK_NOTNULL(infos[containerId]);
+
+  if (!future.isReady()) {
+    return Failure("Failed to clean up container " + stringify(containerId) +
+                   " : " + (future.isFailed() ? future.failure()
+                                              : "discarded"));
+  }
 
   delete infos[containerId];
   infos.erase(containerId);
@@ -395,8 +466,7 @@ void CgroupsMemIsolatorProcess::oomListen(
   CHECK(infos.contains(containerId));
   Info* info = CHECK_NOTNULL(infos[containerId]);
 
-  info->oomNotifier =
-    cgroups::listen(hierarchy, info->cgroup, "memory.oom_control");
+  info->oomNotifier = cgroups::memory::oom::listen(hierarchy, info->cgroup);
 
   // If the listening fails immediately, something very wrong
   // happened.  Therefore, we report a fatal error here.
@@ -419,11 +489,8 @@ void CgroupsMemIsolatorProcess::oomListen(
 
 void CgroupsMemIsolatorProcess::oomWaited(
     const ContainerID& containerId,
-    const Future<uint64_t>& future)
+    const Future<Nothing>& future)
 {
-  LOG(INFO) << "OOM notifier is triggered for container "
-            << containerId;
-
   if (future.isDiscarded()) {
     LOG(INFO) << "Discarded OOM notifier for container "
               << containerId;
@@ -432,6 +499,7 @@ void CgroupsMemIsolatorProcess::oomWaited(
                << containerId << ": " << future.failure();
   } else {
     // Out-of-memory event happened, call the handler.
+    LOG(INFO) << "OOM notifier is triggered for container " << containerId;
     oom(containerId);
   }
 }
@@ -459,12 +527,28 @@ void CgroupsMemIsolatorProcess::oom(const ContainerID& containerId)
   message << "Memory limit exceeded: ";
 
   // Output the requested memory limit.
-  Try<Bytes> limit = cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
+  if (limitSwap) {
+    Result<Bytes> limit =
+      cgroups::memory::memsw_limit_in_bytes(hierarchy, info->cgroup);
 
-  if (limit.isError()) {
-    LOG(ERROR) << "Failed to read 'memory.limit_in_bytes': " << limit.error();
+    if (limit.isError()) {
+      LOG(ERROR) << "Failed to read 'memory.memsw.limit_in_bytes': "
+                 << limit.error();
+    } else if (limit.isNone()) {
+      LOG(ERROR) << "'memory.memsw.limit_in_bytes' is not available";
+    } else {
+      message << "Requested: " << limit.get() << " ";
+    }
   } else {
-    message << "Requested: " << limit.get() << " ";
+    Try<Bytes> limit =
+      cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
+
+    if (limit.isError()) {
+      LOG(ERROR) << "Failed to read 'memory.limit_in_bytes': "
+                 << limit.error();
+    } else {
+      message << "Requested: " << limit.get() << " ";
+    }
   }
 
   // Output the maximum memory usage.

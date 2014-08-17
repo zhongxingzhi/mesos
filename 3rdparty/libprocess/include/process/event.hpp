@@ -43,7 +43,7 @@ struct Event
     bool result = false;
     struct IsVisitor : EventVisitor
     {
-      IsVisitor(bool* _result) : result(_result) {}
+      explicit IsVisitor(bool* _result) : result(_result) {}
       virtual void visit(const T& t) { *result = true; }
       bool* result;
     } visitor(&result);
@@ -57,7 +57,7 @@ struct Event
     const T* result = NULL;
     struct AsVisitor : EventVisitor
     {
-      AsVisitor(const T** _result) : result(_result) {}
+      explicit AsVisitor(const T** _result) : result(_result) {}
       virtual void visit(const T& t) { *result = &t; }
       const T** result;
     } visitor(&result);
@@ -73,8 +73,11 @@ struct Event
 
 struct MessageEvent : Event
 {
-  MessageEvent(Message* _message)
+  explicit MessageEvent(Message* _message)
     : message(_message) {}
+
+  MessageEvent(const MessageEvent& that)
+    : message(that.message == NULL ? NULL : new Message(*that.message)) {}
 
   virtual ~MessageEvent()
   {
@@ -89,8 +92,10 @@ struct MessageEvent : Event
   Message* const message;
 
 private:
-  // Not copyable, not assignable.
-  MessageEvent(const MessageEvent&);
+  // Keep MessageEvent not assignable even though we made it
+  // copyable.
+  // Note that we are violating the "rule of three" here but it helps
+  // keep the fields const.
   MessageEvent& operator = (const MessageEvent&);
 };
 
@@ -159,7 +164,7 @@ private:
 
 struct ExitedEvent : Event
 {
-  ExitedEvent(const UPID& _pid)
+  explicit ExitedEvent(const UPID& _pid)
     : pid(_pid) {}
 
   virtual void visit(EventVisitor* visitor) const
@@ -170,15 +175,16 @@ struct ExitedEvent : Event
   const UPID pid;
 
 private:
-  // Not copyable, not assignable.
-  ExitedEvent(const ExitedEvent&);
+  // Keep ExitedEvent not assignable even though we made it copyable.
+  // Note that we are violating the "rule of three" here but it helps
+  // keep the fields const.
   ExitedEvent& operator = (const ExitedEvent&);
 };
 
 
 struct TerminateEvent : Event
 {
-  TerminateEvent(const UPID& _from)
+  explicit TerminateEvent(const UPID& _from)
     : from(_from) {}
 
   virtual void visit(EventVisitor* visitor) const
@@ -194,6 +200,6 @@ private:
   TerminateEvent& operator = (const TerminateEvent&);
 };
 
-} // namespace event {
+} // namespace process {
 
 #endif // __PROCESS_EVENT_HPP__

@@ -56,8 +56,10 @@ public:
 
     add(&Flags::isolation,
         "isolation",
-        "Isolation mechanisms to use, e.g., 'posix/cpu,posix/mem'\n"
-        "or 'cgroups/cpu,cgroups/mem'.",
+        "Isolation mechanisms to use, e.g., 'posix/cpu,posix/mem', or\n"
+        "'cgroups/cpu,cgroups/mem', or network/port_mapping\n"
+        "(configure with flag: --with-network-isolator to enable),\n"
+        "or 'external'.",
         "posix/cpu,posix/mem");
 
     add(&Flags::default_role,
@@ -70,22 +72,23 @@ public:
         "*");
 
     add(&Flags::attributes,
-      "attributes",
-      "Attributes of machine");
+        "attributes",
+        "Attributes of machine, in the form:\n"
+        "rack:2 or 'rack:2,u:1'");
 
     add(&Flags::work_dir,
         "work_dir",
-        "Where to place framework work directories\n",
+        "Directory path to place framework work directories\n",
         "/tmp/mesos");
 
     add(&Flags::launcher_dir, // TODO(benh): This needs a better name.
         "launcher_dir",
-        "Location of Mesos binaries",
+        "Directory path of Mesos binaries",
         PKGLIBEXECDIR);
 
     add(&Flags::hadoop_home,
         "hadoop_home",
-        "Where to find Hadoop installed (for\n"
+        "Path to find Hadoop installed (for\n"
         "fetching framework executors from HDFS)\n"
         "(no default, look for HADOOP_HOME in\n"
         "environment or find hadoop on PATH)",
@@ -100,8 +103,18 @@ public:
 
     add(&Flags::frameworks_home,
         "frameworks_home",
-        "Directory prepended to relative executor URIs",
+        "Directory path prepended to relative executor URIs",
         "");
+
+    add(&Flags::registration_backoff_factor,
+        "registration_backoff_factor",
+        "Slave initially picks a random amount of time between [0, b], where\n"
+        "b = registration_backoff_factor, to (re-)register with a new master.\n"
+        "Subsequent retries are exponentially backed off based on this\n"
+        "interval (e.g., 1st retry uses a random value between [0, b * 2^1],\n"
+        "2nd retry between [0, b * 2^2], 3rd retry between [0, b * 2^3] etc)\n"
+        "up to a maximum of " + stringify(REGISTER_RETRY_INTERVAL_MAX),
+        REGISTRATION_BACKOFF_FACTOR);
 
     add(&Flags::executor_registration_timeout,
         "executor_registration_timeout",
@@ -142,7 +155,7 @@ public:
         "Whether to checkpoint slave and frameworks information\n"
         "to disk. This enables a restarted slave to recover\n"
         "status updates and reconnect with (--recover=reconnect) or\n"
-        "kill (--recover=kill) old executors",
+        "kill (--recover=cleanup) old executors",
         true);
 
     add(&Flags::recover,
@@ -195,7 +208,112 @@ public:
         "Cgroups feature flag to enable hard limits on CPU resources\n"
         "via the CFS bandwidth limiting subfeature.\n",
         false);
+
+    // TODO(antonl): Set default to true in future releases.
+    add(&Flags::cgroups_limit_swap,
+        "cgroups_limit_swap",
+        "Cgroups feature flag to enable memory limits on both memory and\n"
+        "swap instead of just memory.\n",
+        false);
+
+    add(&Flags::slave_subsystems,
+        "slave_subsystems",
+        "List of comma-separated cgroup subsystems to run the slave binary\n"
+        "in, e.g., 'memory,cpuacct'. The default is none.\n"
+        "Present functionality is intended for resource monitoring and\n"
+        "no cgroup limits are set, they are inherited from the root mesos\n"
+        "cgroup.");
+
+    add(&Flags::perf_events,
+        "perf_events",
+        "List of command-separated perf events to sample for each container\n"
+        "when using the perf_event isolator. Default is none.\n"
+        "Run command 'perf list' to see all events. Event names are\n"
+        "sanitized by downcasing and replacing hyphens with underscores\n"
+        "when reported in the PerfStatistics protobuf, e.g., cpu-cycles\n"
+        "becomes cpu_cycles; see the PerfStatistics protobuf for all names.");
+
+    add(&Flags::perf_interval,
+        "perf_interval",
+        "Interval between the start of perf stat samples. Perf samples are\n"
+        "obtained periodically according to perf_interval and the most\n"
+        "recently obtained sample is returned rather than sampling on\n"
+        "demand. For this reason, perf_interval is independent of the\n"
+        "resource monitoring interval",
+        Seconds(60));
+
+    add(&Flags::perf_duration,
+        "perf_duration",
+        "Duration of a perf stat sample. The duration must be less\n"
+        "that the perf_interval.",
+        Seconds(10));
 #endif
+
+    add(&Flags::credential,
+        "credential",
+        "Either a path to a text with a single line\n"
+        "containing 'principal' and 'secret' separated by "
+        "whitespace.\n"
+        "Or a path containing the JSON "
+        "formatted information used for one credential.\n"
+        "Path could be of the form 'file:///path/to/file' or '/path/to/file'."
+        "\n"
+        "Example:\n"
+        "{\n"
+        "    \"principal\": \"username\",\n"
+        "    \"secret\": \"secret\",\n"
+        "}");
+
+    add(&Flags::containerizer_path,
+        "containerizer_path",
+        "The path to the external containerizer executable used when\n"
+        "external isolation is activated (--isolation=external).\n");
+
+    add(&Flags::containerizers,
+        "containerizers",
+        "Comma separated list of containerizer implementations\n"
+        "to compose in order to provide containerization.\n"
+        "Available options are 'mesos', 'external', and\n"
+        "'docker' (on Linux). The order the containerizers\n"
+        "are specified is the order they are tried\n"
+        "(--containerizers=mesos).\n",
+        "mesos");
+
+    add(&Flags::default_container_image,
+        "default_container_image",
+        "The default container image to use if not specified by a task,\n"
+        "when using external containerizer.\n");
+
+    add(&Flags::docker,
+        "docker",
+        "The absolute path to the docker executable for docker\n"
+        "containerizer.\n",
+        "docker");
+
+    add(&Flags::docker_sandbox_directory,
+        "docker_sandbox_directory",
+        "The absolute path for the directory in the container where the\n"
+        "sandbox is mapped to.\n",
+        "/mnt/mesos/sandbox");
+
+#ifdef WITH_NETWORK_ISOLATOR
+    add(&Flags::ephemeral_ports_per_container,
+        "ephemeral_ports_per_container",
+        "Number of ephemeral ports allocated to a container by the network\n"
+        "isolator. This number has to be a power of 2.\n",
+        DEFAULT_EPHEMERAL_PORTS_PER_CONTAINER);
+
+    add(&Flags::eth0_name,
+        "eth0_name",
+        "The name of the public network interface (e.g., eth0). If it is\n"
+        "not specified, the network isolator will try to guess it based\n"
+        "on the host default gateway.");
+
+    add(&Flags::lo_name,
+        "lo_name",
+        "The name of the loopback network interface (e.g., lo). If it is\n"
+        "not specified, the network isolator will try to guess it.");
+#endif // WITH_NETWORK_ISOLATOR
   }
 
   bool version;
@@ -209,6 +327,7 @@ public:
   std::string hadoop_home; // TODO(benh): Make an Option.
   bool switch_user;
   std::string frameworks_home;  // TODO(benh): Make an Option.
+  Duration registration_backoff_factor;
   Duration executor_registration_timeout;
   Duration executor_shutdown_grace_period;
   Duration gc_delay;
@@ -218,16 +337,33 @@ public:
   std::string recover;
   Duration recovery_timeout;
   bool strict;
+  Duration register_retry_interval_min;
 #ifdef __linux__
   std::string cgroups_hierarchy;
   std::string cgroups_root;
   Option<std::string> cgroups_subsystems;
   bool cgroups_enable_cfs;
+  bool cgroups_limit_swap;
+  Option<std::string> slave_subsystems;
+  Option<std::string> perf_events;
+  Duration perf_interval;
+  Duration perf_duration;
+#endif
+  Option<std::string> credential;
+  Option<std::string> containerizer_path;
+  std::string containerizers;
+  Option<std::string> default_container_image;
+  std::string docker;
+  std::string docker_sandbox_directory;
+#ifdef WITH_NETWORK_ISOLATOR
+  uint16_t ephemeral_ports_per_container;
+  Option<std::string> eth0_name;
+  Option<std::string> lo_name;
 #endif
 };
 
-} // namespace mesos {
-} // namespace internal {
 } // namespace slave {
+} // namespace internal {
+} // namespace mesos {
 
 #endif // __SLAVE_FLAGS_HPP__

@@ -23,6 +23,7 @@
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
+#include <process/id.hpp>
 #include <process/logging.hpp>
 #include <process/pid.hpp>
 #include <process/process.hpp>
@@ -54,20 +55,108 @@ namespace internal {
 
 const Duration MASTER_DETECTOR_ZK_SESSION_TIMEOUT = Seconds(10);
 
+// TODO(bmahler): Consider moving these kinds of helpers into
+// libprocess or a common header within mesos.
+namespace promises {
+
+// Helper for setting a set of Promises.
+template <typename T>
+void set(std::set<Promise<T>* >* promises, const T& t)
+{
+  foreach (Promise<T>* promise, *promises) {
+    promise->set(t);
+    delete promise;
+  }
+  promises->clear();
+}
+
+
+// Helper for failing a set of Promises.
+template <typename T>
+void fail(std::set<Promise<T>* >* promises, const string& failure)
+{
+  foreach (Promise<Option<MasterInfo> >* promise, *promises) {
+    promise->fail(failure);
+    delete promise;
+  }
+  promises->clear();
+}
+
+
+// Helper for discarding a set of Promises.
+template <typename T>
+void discard(std::set<Promise<T>* >* promises)
+{
+  foreach (Promise<T>* promise, *promises) {
+    promise->discard();
+    delete promise;
+  }
+  promises->clear();
+}
+
+
+// Helper for discarding an individual promise in the set.
+template <typename T>
+void discard(std::set<Promise<T>* >* promises, const Future<T>& future)
+{
+  foreach (Promise<T>* promise, *promises) {
+    if (promise->future() == future) {
+      promise->discard();
+      promises->erase(promise);
+      delete promise;
+      return;
+    }
+  }
+}
+
+} // namespace promises {
+
 
 class StandaloneMasterDetectorProcess
   : public Process<StandaloneMasterDetectorProcess>
 {
 public:
-  StandaloneMasterDetectorProcess() {}
-  StandaloneMasterDetectorProcess(const MasterInfo& _leader)
-    : leader(_leader) {}
-  ~StandaloneMasterDetectorProcess();
+  StandaloneMasterDetectorProcess()
+    : ProcessBase(ID::generate("standalone-master-detector")) {}
+  explicit StandaloneMasterDetectorProcess(const MasterInfo& _leader)
+    : ProcessBase(ID::generate("standalone-master-detector")),
+      leader(_leader) {}
 
-  void appoint(const Option<MasterInfo>& leader);
-  Future<Option<MasterInfo> > detect(const Option<MasterInfo>& previous = None());
+  ~StandaloneMasterDetectorProcess()
+  {
+    promises::discard(&promises);
+  }
+
+  void appoint(const Option<MasterInfo>& leader_)
+  {
+    leader = leader_;
+
+    promises::set(&promises, leader);
+  }
+
+  Future<Option<MasterInfo> > detect(
+      const Option<MasterInfo>& previous = None())
+  {
+    if (leader != previous) {
+      return leader;
+    }
+
+    Promise<Option<MasterInfo> >* promise = new Promise<Option<MasterInfo> >();
+
+    promise->future()
+      .onDiscard(defer(self(), &Self::discard, promise->future()));
+
+    promises.insert(promise);
+    return promise->future();
+  }
 
 private:
+  void discard(const Future<Option<MasterInfo> >& future)
+  {
+    // Discard the promise holding this future.
+    promises::discard(&promises, future);
+  }
+
   Option<MasterInfo> leader; // The appointed master.
   set<Promise<Option<MasterInfo> >*> promises;
 };
@@ -77,14 +166,16 @@ class ZooKeeperMasterDetectorProcess
   : public Process<ZooKeeperMasterDetectorProcess>
 {
 public:
-  ZooKeeperMasterDetectorProcess(const URL& url);
-  ZooKeeperMasterDetectorProcess(Owned<Group> group);
+  explicit ZooKeeperMasterDetectorProcess(const URL& url);
+  explicit ZooKeeperMasterDetectorProcess(Owned<Group> group);
   ~ZooKeeperMasterDetectorProcess();
 
   virtual void initialize();
   Future<Option<MasterInfo> > detect(const Option<MasterInfo>& previous);
 
 private:
+  void discard(const Future<Option<MasterInfo> >& future);
+
   // Invoked when the group leadership has changed.
   void detected(const Future<Option<Group::Membership> >& leader);
 
@@ -114,7 +205,7 @@ Try<MasterDetector*> MasterDetector::create(const string& master)
     }
     if (url.get().path == "/") {
       return Error(
-	  "Expecting a (chroot) path for ZooKeeper ('/' is not supported)");
+          "Expecting a (chroot) path for ZooKeeper ('/' is not supported)");
     }
     return new ZooKeeperMasterDetector(url.get());
   } else if (master.find("file://") == 0) {
@@ -141,41 +232,6 @@ Try<MasterDetector*> MasterDetector::create(const string& master)
 
 
 MasterDetector::~MasterDetector() {}
-
-
-StandaloneMasterDetectorProcess::~StandaloneMasterDetectorProcess()
-{
-  foreach (Promise<Option<MasterInfo> >* promise, promises) {
-    promise->discard();
-    delete promise;
-  }
-  promises.clear();
-}
-
-
-void StandaloneMasterDetectorProcess::appoint(const Option<MasterInfo>& _leader)
-{
-  leader = _leader;
-
-  foreach (Promise<Option<MasterInfo> >* promise, promises) {
-    promise->set(leader);
-    delete promise;
-  }
-  promises.clear();
-}
-
-
-Future<Option<MasterInfo> > StandaloneMasterDetectorProcess::detect(
-    const Option<MasterInfo>& previous)
-{
-  if (leader != previous) {
-    return leader;
-  }
-
-  Promise<Option<MasterInfo> >* promise = new Promise<Option<MasterInfo> >();
-  promises.insert(promise);
-  return promise->future();
-}
 
 
 StandaloneMasterDetector::StandaloneMasterDetector()
@@ -234,7 +290,8 @@ Future<Option<MasterInfo> > StandaloneMasterDetector::detect(
 // TODO(xujyan): Use peer constructor after switching to C++ 11.
 ZooKeeperMasterDetectorProcess::ZooKeeperMasterDetectorProcess(
     const URL& url)
-  : group(new Group(url.servers,
+  : ProcessBase(ID::generate("zookeeper-master-detector")),
+    group(new Group(url.servers,
                     MASTER_DETECTOR_ZK_SESSION_TIMEOUT,
                     url.path,
                     url.authentication)),
@@ -244,18 +301,15 @@ ZooKeeperMasterDetectorProcess::ZooKeeperMasterDetectorProcess(
 
 ZooKeeperMasterDetectorProcess::ZooKeeperMasterDetectorProcess(
     Owned<Group> _group)
-  : group(_group),
+  : ProcessBase(ID::generate("zookeeper-master-detector")),
+    group(_group),
     detector(group.get()),
     leader(None()) {}
 
 
 ZooKeeperMasterDetectorProcess::~ZooKeeperMasterDetectorProcess()
 {
-  foreach (Promise<Option<MasterInfo> >* promise, promises) {
-    promise->discard();
-    delete promise;
-  }
-  promises.clear();
+  promises::discard(&promises);
 }
 
 
@@ -263,6 +317,14 @@ void ZooKeeperMasterDetectorProcess::initialize()
 {
   detector.detect()
     .onAny(defer(self(), &Self::detected, lambda::_1));
+}
+
+
+void ZooKeeperMasterDetectorProcess::discard(
+    const Future<Option<MasterInfo> >& future)
+{
+  // Discard the promise holding this future.
+  promises::discard(&promises, future);
 }
 
 
@@ -280,6 +342,10 @@ Future<Option<MasterInfo> > ZooKeeperMasterDetectorProcess::detect(
   }
 
   Promise<Option<MasterInfo> >* promise = new Promise<Option<MasterInfo> >();
+
+  promise->future()
+    .onDiscard(defer(self(), &Self::discard, promise->future()));
+
   promises.insert(promise);
   return promise->future();
 }
@@ -298,22 +364,16 @@ void ZooKeeperMasterDetectorProcess::detected(
     // will directly fail as a result.
     error = Error(_leader.failure());
     leader = None();
-    foreach (Promise<Option<MasterInfo> >* promise, promises) {
-      promise->fail(_leader.failure());
-      delete promise;
-    }
-    promises.clear();
+
+    promises::fail(&promises, _leader.failure());
+
     return;
   }
 
   if (_leader.get().isNone()) {
     leader = None();
 
-    foreach (Promise<Option<MasterInfo> >* promise, promises) {
-      promise->set(leader);
-      delete promise;
-    }
-    promises.clear();
+    promises::set(&promises, leader);
   } else {
     // Fetch the data associated with the leader.
     group->data(_leader.get().get())
@@ -334,11 +394,7 @@ void ZooKeeperMasterDetectorProcess::fetched(
 
   if (data.isFailed()) {
     leader = None();
-    foreach (Promise<Option<MasterInfo> >* promise, promises) {
-      promise->fail(data.failure());
-      delete promise;
-    }
-    promises.clear();
+    promises::fail(&promises, data.failure());
     return;
   }
 
@@ -355,32 +411,22 @@ void ZooKeeperMasterDetectorProcess::fetched(
     MasterInfo info;
     if (!info.ParseFromString(data.get())) {
       leader = None();
-      foreach (Promise<Option<MasterInfo> >* promise, promises) {
-        promise->fail("Failed to parse data into MasterInfo");
-        delete promise;
-      }
-      promises.clear();
+      promises::fail(&promises, "Failed to parse data into MasterInfo");
       return;
     }
     leader = info;
   } else {
     leader = None();
-    foreach (Promise<Option<MasterInfo> >* promise, promises) {
-      promise->fail("Failed to parse data of unknown label " + label.get());
-      delete promise;
-    }
-    promises.clear();
+    promises::fail(
+        &promises,
+        "Failed to parse data of unknown label '" + label.get() + "'");
     return;
   }
 
   LOG(INFO) << "A new leading master (UPID="
             << UPID(leader.get().pid()) << ") is detected";
 
-  foreach (Promise<Option<MasterInfo> >* promise, promises) {
-    promise->set(leader);
-    delete promise;
-  }
-  promises.clear();
+  promises::set(&promises, leader);
 }
 
 

@@ -10,19 +10,24 @@
 #include <sstream>
 #include <string>
 
-#include <process/future.hpp>
 #include <process/pid.hpp>
 
 #include <stout/error.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/json.hpp>
 #include <stout/none.hpp>
+#include <stout/numify.hpp>
 #include <stout/option.hpp>
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 
 namespace process {
+
+// Forward declaration to break cyclic dependency.
+template <typename T>
+class Future;
+
 namespace http {
 
 struct Request
@@ -114,7 +119,7 @@ struct Response
     : type(NONE)
   {}
 
-  Response(const std::string& _body)
+  explicit Response(const std::string& _body)
     : type(BODY),
       body(_body)
   {
@@ -167,12 +172,12 @@ struct OK : Response
     status = "200 OK";
   }
 
-  OK(const char* body) : Response(std::string(body))
+  explicit OK(const char* body) : Response(std::string(body))
   {
     status = "200 OK";
   }
 
-  OK(const std::string& body) : Response(body)
+  explicit OK(const std::string& body) : Response(body)
   {
     status = "200 OK";
   }
@@ -204,15 +209,44 @@ struct OK : Response
 };
 
 
+struct Accepted : Response
+{
+  Accepted()
+  {
+    status = "202 Accepted";
+  }
+
+  explicit Accepted(const std::string& body) : Response(body)
+  {
+    status = "202 Accepted";
+  }
+};
+
+
 struct TemporaryRedirect : Response
 {
-  TemporaryRedirect(const std::string& url)
+  explicit TemporaryRedirect(const std::string& url)
   {
     status = "307 Temporary Redirect";
     headers["Location"] = url;
   }
 };
 
+struct Unauthorized : Response
+{
+  Unauthorized(const std::string& realm)
+  {
+    status = "401 Unauthorized";
+    headers["WWW-authenticate"] = "Basic realm=\"" + realm + "\"";
+  }
+
+  Unauthorized(const std::string& realm, const std::string& body)
+    : Response(body)
+  {
+    status = "401 Unauthorized";
+    headers["WWW-authenticate"] = "Basic realm=\"" + realm + "\"";
+  }
+};
 
 struct BadRequest : Response
 {
@@ -221,7 +255,7 @@ struct BadRequest : Response
     status = "400 Bad Request";
   }
 
-  BadRequest(const std::string& body)
+  explicit BadRequest(const std::string& body)
     : Response(body)
   {
     status = "400 Bad Request";
@@ -236,7 +270,7 @@ struct NotFound : Response
     status = "404 Not Found";
   }
 
-  NotFound(const std::string& body) : Response(body)
+  explicit NotFound(const std::string& body) : Response(body)
   {
     status = "404 Not Found";
   }
@@ -250,7 +284,7 @@ struct InternalServerError : Response
     status = "500 Internal Server Error";
   }
 
-  InternalServerError(const std::string& body) : Response(body)
+  explicit InternalServerError(const std::string& body) : Response(body)
   {
     status = "500 Internal Server Error";
   }
@@ -264,7 +298,7 @@ struct ServiceUnavailable : Response
     status = "503 Service Unavailable";
   }
 
-  ServiceUnavailable(const std::string& body) : Response(body)
+  explicit ServiceUnavailable(const std::string& body) : Response(body)
   {
     status = "503 Service Unavailable";
   }
@@ -445,7 +479,7 @@ inline Try<std::string> decode(const std::string& s)
 
   for (size_t i = 0; i < s.length(); ++i) {
     if (s[i] != '%') {
-      out << s[i];
+      out << (s[i] == '+' ? ' ' : s[i]);
       continue;
     }
 
@@ -483,7 +517,8 @@ inline Try<std::string> decode(const std::string& s)
 Future<Response> get(
     const UPID& upid,
     const Option<std::string>& path = None(),
-    const Option<std::string>& query = None());
+    const Option<std::string>& query = None(),
+    const Option<hashmap<std::string, std::string> >& headers = None());
 
 
 // Sends a blocking HTTP POST request to the process with the given upid.
@@ -491,6 +526,7 @@ Future<Response> get(
 Future<Response> post(
     const UPID& upid,
     const Option<std::string>& path = None(),
+    const Option<hashmap<std::string, std::string> >& headers = None(),
     const Option<std::string>& body = None(),
     const Option<std::string>& contentType = None());
 

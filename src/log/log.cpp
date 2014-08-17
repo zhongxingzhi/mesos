@@ -55,7 +55,8 @@ public:
   LogProcess(
       size_t _quorum,
       const string& path,
-      const set<UPID>& pids);
+      const set<UPID>& pids,
+      bool _autoInitialize);
 
   LogProcess(
       size_t _quorum,
@@ -63,7 +64,8 @@ public:
       const string& servers,
       const Duration& timeout,
       const string& znode,
-      const Option<zookeeper::Authentication>& auth);
+      const Option<zookeeper::Authentication>& auth,
+      bool _autoInitialize);
 
   // Recovers the log by catching up if needed. Returns a shared
   // pointer to the local replica if the recovery succeeds.
@@ -91,6 +93,7 @@ private:
   const size_t quorum;
   Shared<Replica> replica;
   Shared<Network> network;
+  const bool autoInitialize;
 
   // For replica recovery.
   Option<Future<Owned<Replica> > > recovering;
@@ -107,7 +110,7 @@ private:
 class LogReaderProcess : public Process<LogReaderProcess>
 {
 public:
-  LogReaderProcess(Log* log);
+  explicit LogReaderProcess(Log* log);
 
   Future<Log::Position> beginning();
   Future<Log::Position> ending();
@@ -151,7 +154,7 @@ private:
 class LogWriterProcess : public Process<LogWriterProcess>
 {
 public:
-  LogWriterProcess(Log* log);
+  explicit LogWriterProcess(Log* log);
 
   Future<Option<Log::Position> > start();
   Future<Option<Log::Position> > append(const string& bytes);
@@ -197,11 +200,13 @@ private:
 LogProcess::LogProcess(
     size_t _quorum,
     const string& path,
-    const set<UPID>& pids)
+    const set<UPID>& pids,
+    bool _autoInitialize)
   : ProcessBase(ID::generate("log")),
     quorum(_quorum),
     replica(new Replica(path)),
     network(new Network(pids + (UPID) replica->pid())),
+    autoInitialize(_autoInitialize),
     group(NULL) {}
 
 
@@ -211,11 +216,18 @@ LogProcess::LogProcess(
     const string& servers,
     const Duration& timeout,
     const string& znode,
-    const Option<zookeeper::Authentication>& auth)
+    const Option<zookeeper::Authentication>& auth,
+    bool _autoInitialize)
   : ProcessBase(ID::generate("log")),
     quorum(_quorum),
     replica(new Replica(path)),
-    network(new ZooKeeperNetwork(servers, timeout, znode, auth)),
+    network(new ZooKeeperNetwork(
+        servers,
+        timeout,
+        znode,
+        auth,
+        Set<UPID>((UPID) replica->pid()))),
+    autoInitialize(_autoInitialize),
     group(new zookeeper::Group(servers, timeout, znode, auth)) {}
 
 
@@ -305,7 +317,12 @@ Future<Shared<Replica> > LogProcess::recover()
     // 'release' in Shared which will provide this CHECK internally.
     CHECK(replica.unique());
 
-    recovering = log::recover(quorum, replica.own().get(), network)
+    recovering =
+      log::recover(
+          quorum,
+          replica.own().get(),
+          network,
+          autoInitialize)
       .onAny(defer(self(), &Self::_recover));
   }
 
@@ -720,11 +737,18 @@ void LogWriterProcess::failed(const string& message, const string& reason)
 Log::Log(
     int quorum,
     const string& path,
-    const set<UPID>& pids)
+    const set<UPID>& pids,
+    bool autoInitialize)
 {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-  process = new LogProcess(quorum, path, pids);
+  process =
+    new LogProcess(
+        quorum,
+        path,
+        pids,
+        autoInitialize);
+
   spawn(process);
 }
 
@@ -734,11 +758,21 @@ Log::Log(
     const string& servers,
     const Duration& timeout,
     const string& znode,
-    const Option<zookeeper::Authentication>& auth)
+    const Option<zookeeper::Authentication>& auth,
+    bool autoInitialize)
 {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-  process = new LogProcess(quorum, path, servers, timeout, znode, auth);
+  process =
+    new LogProcess(
+        quorum,
+        path,
+        servers,
+        timeout,
+        znode,
+        auth,
+        autoInitialize);
+
   spawn(process);
 }
 

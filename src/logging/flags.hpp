@@ -38,9 +38,16 @@ public:
         "Disable logging to stderr",
         false);
 
+    add(&Flags::logging_level,
+        "logging_level",
+        "Log message at or above this level; possible values: \n"
+        "'INFO', 'WARNING', 'ERROR'; if quiet flag is used, this \n"
+        "will affect just the logs from log_dir (if specified)",
+        "INFO");
+
     add(&Flags::log_dir,
         "log_dir",
-        "Location to put log files (no default, nothing\n"
+        "Directory path to put log files (no default, nothing\n"
         "is written to disk unless specified;\n"
         "does not affect logging to stderr)");
 
@@ -48,11 +55,19 @@ public:
         "logbufsecs",
         "How many seconds to buffer log messages for",
         0);
+
+    add(&Flags::initialize_driver_logging,
+        "initialize_driver_logging",
+        "Whether to automatically initialize google logging of scheduler\n"
+        "and/or executor drivers.",
+        true);
   }
 
   bool quiet;
+  std::string logging_level;
   Option<std::string> log_dir;
   int logbufsecs;
+  bool initialize_driver_logging;
 };
 
 } // namespace logging {

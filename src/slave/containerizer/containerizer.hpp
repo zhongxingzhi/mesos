@@ -24,13 +24,17 @@
 #include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
 
+#include <mesos/containerizer/containerizer.hpp>
+
 #include <process/future.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
 
 #include <stout/duration.hpp>
+#include <stout/hashset.hpp>
 #include <stout/option.hpp>
 #include <stout/try.hpp>
+
 
 namespace mesos {
 namespace internal {
@@ -50,26 +54,6 @@ struct SlaveState;
 class Containerizer
 {
 public:
-  // Information about a container termination.
-  struct Termination
-  {
-    Termination(
-        const Option<int>& _status,
-        bool _killed,
-        const std::string& _message)
-      : status(_status),
-        killed(_killed),
-        message(_message) {}
-
-    // Exit status of the executor.
-    const Option<int> status;
-
-    // A container may be killed if it exceeds its resources; this will be
-    // indicated by killed=true and described by the message string.
-    const bool killed;
-    const std::string message;
-  };
-
   // Attempts to create a containerizer as specified by 'isolation' in flags.
   static Try<Containerizer*> create(const Flags& flags, bool local);
 
@@ -88,9 +72,26 @@ public:
   virtual process::Future<Nothing> recover(
       const Option<state::SlaveState>& state) = 0;
 
-  // Launch a containerized executor.
-  virtual process::Future<Nothing> launch(
+  // Launch a containerized executor. Returns true if launching this
+  // ExecutorInfo is supported and it has been launched, otherwise
+  // false or a failure is something went wrong.
+  virtual process::Future<bool> launch(
       const ContainerID& containerId,
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user,
+      const SlaveID& slaveId,
+      const process::PID<Slave>& slavePid,
+      bool checkpoint) = 0;
+
+  // Launch a containerized task. Returns true if launching this
+  // TaskInfo/ExecutorInfo is supported and it has been launched,
+  // otherwise false or a failure is something went wrong.
+  // TODO(nnielsen): Obsolete the executorInfo argument when the slave
+  // doesn't require executors to run standalone tasks.
+  virtual process::Future<bool> launch(
+      const ContainerID& containerId,
+      const TaskInfo& taskInfo,
       const ExecutorInfo& executorInfo,
       const std::string& directory,
       const Option<std::string>& user,
@@ -111,13 +112,16 @@ public:
   // containerizer should also destroy the containerized context. The future
   // may be failed if an error occurs during termination of the executor or
   // destruction of the container.
-  virtual process::Future<Termination> wait(const ContainerID& containerId) = 0;
+  virtual process::Future<containerizer::Termination> wait(
+      const ContainerID& containerId) = 0;
 
   // Destroy a running container, killing all processes and releasing all
   // resources.
   // NOTE: Containerizers will automatically destroy containers on executor
   // termination and manual destruction is not necessary. See wait().
   virtual void destroy(const ContainerID& containerId) = 0;
+
+  virtual process::Future<hashset<ContainerID> > containers() = 0;
 };
 
 
@@ -129,6 +133,14 @@ std::map<std::string, std::string> executorEnvironment(
     const process::PID<Slave>& slavePid,
     bool checkpoint,
     const Duration& recoveryTimeout);
+
+
+std::map<std::string, std::string> fetcherEnvironment(
+    const CommandInfo& commandInfo,
+    const std::string& directory,
+    const Option<std::string>& user,
+    const Flags& flags);
+
 
 } // namespace slave {
 } // namespace internal {

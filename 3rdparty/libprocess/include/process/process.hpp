@@ -25,7 +25,7 @@ namespace process {
 class ProcessBase : public EventVisitor
 {
 public:
-  ProcessBase(const std::string& id = "");
+  explicit ProcessBase(const std::string& id = "");
 
   virtual ~ProcessBase();
 
@@ -162,6 +162,28 @@ protected:
     assets[name] = asset;
   }
 
+  void lock()
+  {
+    pthread_mutex_lock(&m);
+  }
+
+  void unlock()
+  {
+    pthread_mutex_unlock(&m);
+  }
+
+  template<typename T>
+  size_t eventCount()
+  {
+    size_t count = 0U;
+
+    lock();
+    count = std::count_if(events.begin(), events.end(), isEventType<T>);
+    unlock();
+
+    return count;
+  }
+
 private:
   friend class SocketManager;
   friend class ProcessManager;
@@ -178,17 +200,18 @@ private:
     TERMINATED
   } state;
 
+  template<typename T>
+  static bool isEventType(const Event* event)
+  {
+    return event->is<T>();
+  }
+
   // Mutex protecting internals.
   // TODO(benh): Consider replacing with a spinlock, on multi-core systems.
   pthread_mutex_t m;
-  void lock() { pthread_mutex_lock(&m); }
-  void unlock() { pthread_mutex_unlock(&m); }
 
   // Enqueue the specified message, request, or function call.
   void enqueue(Event* event, bool inject = false);
-
-  // Queue of received events.
-  std::deque<Event*> events;
 
   // Delegates for messages.
   std::map<std::string, UPID> delegates;
@@ -208,6 +231,9 @@ private:
 
   // Static assets(s) to provide.
   std::map<std::string, Asset> assets;
+
+  // Queue of received events, requires lock()ed access!
+  std::deque<Event*> events;
 
   // Active references.
   int refs;
@@ -369,6 +395,14 @@ inline bool wait(const ProcessBase* process, const Duration& duration)
 extern ThreadLocal<ProcessBase>* _process_;
 
 #define __process__ (*_process_)
+
+// NOTE: Methods in this namespace should only be used in tests to
+// inject arbitrary events.
+namespace inject {
+// Simulates disconnection of the link between 'from' and 'to' by
+// sending an 'ExitedEvent' to 'to'.
+bool exited(const UPID& from, const UPID& to);
+} // namespace inject {
 
 } // namespace process {
 

@@ -61,6 +61,7 @@ Future<Response> request(
     const string& method,
     const Option<string>& path,
     const Option<string>& query,
+    const Option<hashmap<string, string> >& _headers,
     const Option<string>& body,
     const Option<string>& contentType)
 {
@@ -78,6 +79,15 @@ Future<Response> request(
     return Failure("Failed to cloexec: " + cloexec.error());
   }
 
+  // We use inet_ntop since inet_ntoa is not thread-safe!
+  char ip[INET_ADDRSTRLEN];
+  if (inet_ntop(AF_INET, (in_addr*) &upid.ip, ip, INET_ADDRSTRLEN) == NULL) {
+    return Failure(ErrnoError("Failed to get human-readable IP address for '" +
+                              stringify(upid.ip) + "'"));
+  }
+
+  const string host = string(ip) + ":" + stringify(upid.port);
+
   sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
@@ -86,7 +96,7 @@ Future<Response> request(
 
   if (connect(s, (sockaddr*) &addr, sizeof(addr)) < 0) {
     os::close(s);
-    return Failure(string("Failed to connect: ") + strerror(errno));
+    return Failure(ErrnoError("Failed to connect to '" + host + "'"));
   }
 
   std::ostringstream out;
@@ -103,28 +113,38 @@ Future<Response> request(
 
   out << " HTTP/1.1\r\n";
 
-  // Call inet_ntop since inet_ntoa is not thread-safe!
-  char ip[INET_ADDRSTRLEN];
-  PCHECK(inet_ntop(AF_INET, (in_addr *) &upid.ip, ip, INET_ADDRSTRLEN) != NULL);
+  // Set up the headers as necessary.
+  hashmap<string, string> headers;
 
-  out << "Host: " << ip << ":" << upid.port << "\r\n"
-      << "Connection: close\r\n";
-
-  if (body.isNone() && contentType.isSome()) {
-    os::close(s);
-    return Failure("Attempted to do a POST with a Content-Type but no body");
+  if (_headers.isSome()) {
+    headers = _headers.get();
   }
 
+  // Need to specify the 'Host' header.
+  headers["Host"] = host;
+
+  // Tell the server to close the connection when it's done.
+  headers["Connection"] = "close";
+
+  // Overwrite Content-Type if necessary.
   if (contentType.isSome()) {
-    out << "Content-Type: " << contentType.get() << "\r\n";
+    headers["Content-Type"] = contentType.get();
   }
 
-  if (body.isNone()) {
-    out << "\r\n";
-  } else {
-    out << "Content-Length: " << body.get().length() << "\r\n"
-        << "\r\n"
-        << body.get();
+  // Make sure the Content-Length is set correctly if necessary.
+  if (body.isSome()) {
+    headers["Content-Length"] = stringify(body.get().length());
+  }
+
+  // Emit the headers.
+  foreachpair (const string& key, const string& value, headers) {
+    out << key << ": " << value << "\r\n";
+  }
+
+  out << "\r\n";
+
+  if (body.isSome()) {
+    out << body.get();
   }
 
   Try<Nothing> nonblock = os::nonblock(s);
@@ -149,19 +169,27 @@ Future<Response> request(
 Future<Response> get(
     const UPID& upid,
     const Option<string>& path,
-    const Option<string>& query)
+    const Option<string>& query,
+    const Option<hashmap<string, string> >& headers)
 {
-  return internal::request(upid, "GET", path, query, None(), None());
+  return internal::request(
+      upid, "GET", path, query, headers, None(), None());
 }
 
 
 Future<Response> post(
     const UPID& upid,
     const Option<string>& path,
+    const Option<hashmap<string, string> >& headers,
     const Option<string>& body,
     const Option<string>& contentType)
 {
-  return internal::request(upid, "POST", path, None(), body, contentType);
+  if (body.isNone() && contentType.isSome()) {
+    return Failure("Attempted to do a POST with a Content-Type but no body");
+  }
+
+  return internal::request(
+      upid, "POST", path, None(), headers, body, contentType);
 }
 
 

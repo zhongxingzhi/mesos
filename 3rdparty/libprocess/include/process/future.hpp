@@ -8,11 +8,21 @@
 #include <list>
 #include <queue>
 #include <set>
+#if  __cplusplus >= 201103L
+#include <type_traits>
+#endif // __cplusplus >= 201103L
 
 #include <glog/logging.h>
 
+#if  __cplusplus < 201103L
+#include <boost/type_traits.hpp>
+#endif // __cplusplus < 201103L
+
+#include <process/internal.hpp>
 #include <process/latch.hpp>
+#include <process/owned.hpp>
 #include <process/pid.hpp>
+#include <process/timer.hpp>
 
 #include <stout/duration.hpp>
 #include <stout/error.hpp>
@@ -21,6 +31,7 @@
 #include <stout/none.hpp>
 #include <stout/option.hpp>
 #include <stout/preprocessor.hpp>
+#include <stout/try.hpp>
 
 namespace process {
 
@@ -39,10 +50,6 @@ struct _Deferred;
 template <typename T>
 class Future;
 
-// More forward declarations necessary due to circular dependencies.
-namespace io {
-Future<short> poll(int fd, short events);
-} // namespace io {
 
 namespace internal {
 
@@ -80,14 +87,16 @@ public:
 
   Future();
 
-  Future(const T& _t);
+  /*implicit*/ Future(const T& _t);
 
   template <typename U>
-  Future(const U& u);
+  /*implicit*/ Future(const U& u);
 
-  Future(const Failure& failure);
+  /*implicit*/ Future(const Failure& failure);
 
-  Future(const Future<T>& that);
+  /*implicit*/ Future(const Future<T>& that);
+
+  /*implicit*/ Future(const Try<T>& t);
 
   ~Future();
 
@@ -213,7 +222,7 @@ private:
         }));
   }
 
-  template <typename F, typename = typename std::result_of<F(const std::string&)>::type>
+  template <typename F, typename = typename std::result_of<F(const std::string&)>::type> // NOLINT(whitespace/line_length)
   const Future<T>& onFailed(F&& f, Prefer) const
   {
     return onFailed(std::function<void(const std::string&)>(
@@ -231,11 +240,11 @@ private:
         }));
   }
 
-  template <typename F, typename = typename std::result_of<F(const Future<T>&)>::type>
+  template <typename F, typename = typename std::result_of<F(const Future<T>&)>::type> // NOLINT(whitespace/line_length)
   const Future<T>& onAny(F&& f, Prefer) const
   {
     return onAny(std::function<void(const Future<T>&)>(
-        [=] (const Future<T>& future) {
+        [=] (const Future<T>& future) mutable {
           f(future);
         }));
   }
@@ -318,9 +327,15 @@ public:
     return then(lambda::function<X(const T&)>(lambda::bind(f)));
   }
 
+  template <typename X>
+  Future<X> then(const Deferred<Future<X>(T)>& f) const
+  {
+    return then(lambda::function<Future<X>(const T&)>(f));
+  }
+
 #if __cplusplus >= 201103L
 private:
-  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F(const T&)>::type>::type>
+  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F(const T&)>::type>::type> // NOLINT(whitespace/line_length)
   Future<X> then(_Deferred<F>&& f, Prefer) const
   {
     // note the then<X> is necessary to not have an infinite loop with
@@ -328,19 +343,19 @@ private:
     return then<X>(std::function<Future<X>(const T&)>(f));
   }
 
-  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F()>::type>::type>
+  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F()>::type>::type> // NOLINT(whitespace/line_length)
   Future<X> then(_Deferred<F>&& f, LessPrefer) const
   {
     return then<X>(std::function<Future<X>()>(f));
   }
 
-  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F(const T&)>::type>::type>
+  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F(const T&)>::type>::type> // NOLINT(whitespace/line_length)
   Future<X> then(F&& f, Prefer) const
   {
     return then<X>(std::function<Future<X>(const T&)>(f));
   }
 
-  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F()>::type>::type>
+  template <typename F, typename X = typename internal::unwrap<typename std::result_of<F()>::type>::type> // NOLINT(whitespace/line_length)
   Future<X> then(F&& f, LessPrefer) const
   {
     return then<X>(std::function<Future<X>()>(f));
@@ -451,6 +466,62 @@ public:
 #undef TEMPLATE
 #endif // __cplusplus >= 201103L
 
+  // Invokes the specified function after some duration if this future
+  // has not been completed (set, failed, or discarded). Note that
+  // this function is agnostic of discard semantics and while it will
+  // propagate discarding "up the chain" it will still invoke the
+  // specified callback after the specified duration even if 'discard'
+  // was called on the returned future.
+  Future<T> after(
+      const Duration& duration,
+      const lambda::function<Future<T>(const Future<T>&)>& f) const;
+
+  // TODO(benh): Add overloads of 'after' that don't require passing
+  // in a function that takes the 'const Future<T>&' parameter and use
+  // Prefer/LessPrefer to disambiguate.
+
+#if __cplusplus >= 201103L
+  template <typename F>
+  Future<T> after(
+      const Duration& duration,
+      _Deferred<F>&& f,
+      typename std::enable_if<std::is_convertible<_Deferred<F>, std::function<Future<T>(const Future<T>&)>>::value>::type* = NULL) const // NOLINT(whitespace/line_length)
+  {
+    return after(duration, std::function<Future<T>(const Future<T>&)>(f));
+  }
+
+  template <typename F>
+  Future<T> after(
+      const Duration& duration,
+      _Deferred<F>&& f,
+      typename std::enable_if<std::is_convertible<_Deferred<F>, std::function<Future<T>()>>::value>::type* = NULL) const // NOLINT(whitespace/line_length)
+  {
+    return after(
+        duration,
+        std::function<Future<T>(const Future<T>&)>(std::bind(f)));
+  }
+#else
+  template <typename F>
+  Future<T> after(
+      const Duration& duration,
+      const _Defer<F>& f,
+      typename boost::enable_if<boost::is_convertible<_Defer<F>, std::tr1::function<Future<T>(const Future<T>&)> > >::type* = NULL) const // NOLINT(whitespace/line_length)
+  {
+    return after(duration, std::tr1::function<Future<T>(const Future<T>&)>(f));
+  }
+
+  template <typename F>
+  Future<T> after(
+      const Duration& duration,
+      const _Defer<F>& f,
+      typename boost::enable_if<boost::is_convertible<_Defer<F>, std::tr1::function<Future<T>()> > >::type* = NULL) const // NOLINT(whitespace/line_length)
+  {
+    return after(
+        duration,
+        std::tr1::function<Future<T>(const Future<T>&)>(std::tr1::bind(f)));
+  }
+#endif // __cplusplus >= 201103L
+
 private:
   friend class Promise<T>;
   friend class WeakFuture<T>;
@@ -469,9 +540,9 @@ private:
     ~Data();
 
     int lock;
-    Latch* latch;
     State state;
     bool discard;
+    bool associated;
     T* t;
     std::string* message; // Message associated with failure.
     std::queue<DiscardCallback> onDiscardCallbacks;
@@ -499,11 +570,11 @@ template <typename T>
 class WeakFuture
 {
 public:
-  WeakFuture(const Future<T>& future);
+  explicit WeakFuture(const Future<T>& future);
 
   // Converts this weak reference to a concrete future. Returns none
   // if the conversion is not successful.
-  Option<Future<T> > get();
+  Option<Future<T> > get() const;
 
 private:
   memory::weak_ptr<typename Future<T>::Data> data;
@@ -516,7 +587,7 @@ WeakFuture<T>::WeakFuture(const Future<T>& future)
 
 
 template <typename T>
-Option<Future<T> > WeakFuture<T>::get()
+Option<Future<T> > WeakFuture<T>::get() const
 {
   Future<T> future;
   future.data = data.lock();
@@ -532,8 +603,8 @@ Option<Future<T> > WeakFuture<T>::get()
 // Helper for creating failed futures.
 struct Failure
 {
-  Failure(const std::string& _message) : message(_message) {}
-  Failure(const Error& error) : message(error.message) {}
+  explicit Failure(const std::string& _message) : message(_message) {}
+  explicit Failure(const Error& error) : message(error.message) {}
 
   const std::string message;
 };
@@ -552,7 +623,7 @@ class Promise
 {
 public:
   Promise();
-  Promise(const T& t);
+  explicit Promise(const T& t);
   virtual ~Promise();
 
   bool discard();
@@ -638,14 +709,20 @@ Promise<T>::~Promise()
 template <typename T>
 bool Promise<T>::discard()
 {
-  return discard(f);
+  if (!f.data->associated) {
+    return discard(f);
+  }
+  return false;
 }
 
 
 template <typename T>
 bool Promise<T>::set(const T& t)
 {
-  return f.set(t);
+  if (!f.data->associated) {
+    return f.set(t);
+  }
+  return false;
 }
 
 
@@ -659,47 +736,59 @@ bool Promise<T>::set(const Future<T>& future)
 template <typename T>
 bool Promise<T>::associate(const Future<T>& future)
 {
-  // Don't associate if this promise has completed. Note that this
-  // does not include if Future::discard was called on this future
-  // since in that case that would still leave the future PENDING
-  // (note that we cover that case below).
-  if (!f.isPending()) {
-    return false;
+  bool associated = false;
+
+  internal::acquire(&f.data->lock);
+  {
+    // Don't associate if this promise has completed. Note that this
+    // does not include if Future::discard was called on this future
+    // since in that case that would still leave the future PENDING
+    // (note that we cover that case below).
+    if (f.data->state == Future<T>::PENDING && !f.data->associated) {
+      associated = f.data->associated = true;
+
+      // After this point we don't allow 'f' to be completed via the
+      // promise since we've set 'associated' but Future::discard on
+      // 'f' might get called which will get propagated via the
+      // 'f.onDiscard' below. Note that we currently don't propagate a
+      // discard from 'future.onDiscard' but these semantics might
+      // change if/when we make 'f' and 'future' true aliases of one
+      // another.
+    }
+  }
+  internal::release(&f.data->lock);
+
+  // Note that we do the actual associating after releasing the lock
+  // above to avoid deadlocking by attempting to require the lock
+  // within from invoking 'f.onDiscard' and/or 'f.set/fail' via the
+  // bind statements from doing 'future.onReady/onFailed'.
+  if (associated) {
+    // TODO(jieyu): Make 'f' a true alias of 'future'. Currently, only
+    // 'discard' is associated in both directions. In other words, if
+    // a future gets discarded, the other future will also get
+    // discarded.  For 'set' and 'fail', they are associated only in
+    // one direction.  In other words, calling 'set' or 'fail' on this
+    // promise will not affect the result of the future that we
+    // associated.
+    f.onDiscard(lambda::bind(&internal::discard<T>, WeakFuture<T>(future)));
+
+    future
+      .onReady(lambda::bind(&Future<T>::set, f, lambda::_1))
+      .onFailed(lambda::bind(&Future<T>::fail, f, lambda::_1))
+      .onDiscarded(lambda::bind(&internal::discarded<T>, f));
   }
 
-  // TODO(jieyu): Make 'f' a true alias of 'future'. Currently, only
-  // 'discard' is associated in both directions. In other words, if a
-  // future gets discarded, the other future will also get discarded.
-  // For 'set' and 'fail', they are associated only in one direction.
-  // In other words, calling 'set' or 'fail' on this promise will not
-  // affect the result of the future that we associated. To avoid
-  // cyclic dependencies, we keep a weak future in the callback.
-  f.onDiscard(lambda::bind(&internal::discard<T>, WeakFuture<T>(future)));
-
-  // Note that we currently don't propagate a discard from
-  // 'future.onDiscard' but these semantics might change if/when we
-  // make 'f' and 'future' true aliases of one another.
-
-  // TODO(benh): Note that Promise::discard shouldn't get called after
-  // this point in time since the promise has been associated, but
-  // Future::discard on this promise's future might get called which
-  // will get propagated above. We should really try and keep
-  // Promise::set, Promise::fail, Promise::discard from getting called
-  // after an associate!
-
-  future
-    .onReady(lambda::bind(&Future<T>::set, f, lambda::_1))
-    .onFailed(lambda::bind(&Future<T>::fail, f, lambda::_1))
-    .onDiscarded(lambda::bind(&internal::discarded<T>, f));
-
-  return true;
+  return associated;
 }
 
 
 template <typename T>
 bool Promise<T>::fail(const std::string& message)
 {
-  return f.fail(message);
+  if (!f.data->associated) {
+    return f.fail(message);
+  }
+  return false;
 }
 
 
@@ -741,24 +830,6 @@ struct unwrap<Future<X> >
 };
 
 
-inline void acquire(int* lock)
-{
-  // TODO(dhamon): std::atomic when C++11 rolls out.
-  while (!__sync_bool_compare_and_swap(lock, 0, 1)) {
-    asm volatile ("pause");
-  }
-}
-
-
-inline void release(int* lock)
-{
-  // TODO(dhamon): std::atomic when C++11 rolls out.
-  // Unlock via a compare-and-swap so we get a memory barrier too.
-  bool unlocked = __sync_bool_compare_and_swap(lock, 1, 0);
-  assert(unlocked);
-}
-
-
 template <typename T>
 void select(
     const Future<T>& future,
@@ -786,6 +857,9 @@ Future<Future<T> > select(const std::set<Future<T> >& futures)
 {
   memory::shared_ptr<Promise<Future<T> > > promise(
       new Promise<Future<T> >());
+
+  promise->future().onDiscard(
+      lambda::bind(&internal::discarded<Future<T> >, promise->future()));
 
 #if __cplusplus >= 201103L
   typename std::set<Future<T>>::iterator iterator;
@@ -833,28 +907,6 @@ void discard(const std::list<Future<T> >& futures)
 }
 
 
-template <class T>
-void fail(const std::vector<Promise<T>*>& promises, const std::string& message)
-{
-  typename std::vector<Promise<T>*>::const_iterator iterator;
-  for (iterator = promises.begin(); iterator != promises.end(); ++iterator) {
-    Promise<T>* promise = *iterator;
-    promise->fail(message);
-  }
-}
-
-
-template <class T>
-void fail(const std::list<Promise<T>*>& promises, const std::string& message)
-{
-  typename std::list<Promise<T>*>::const_iterator iterator;
-  for (iterator = promises.begin(); iterator != promises.end(); ++iterator) {
-    Promise<T>* promise = *iterator;
-    promise->fail(message);
-  }
-}
-
-
 template <typename T>
 bool Promise<T>::discard(Future<T> future)
 {
@@ -866,9 +918,6 @@ bool Promise<T>::discard(Future<T> future)
   {
     if (data->state == Future<T>::PENDING) {
       data->state = Future<T>::DISCARDED;
-      if (data->latch != NULL) {
-        data->latch->trigger();
-      }
       result = true;
     }
   }
@@ -907,9 +956,9 @@ Future<T> Future<T>::failed(const std::string& message)
 template <typename T>
 Future<T>::Data::Data()
   : lock(0),
-    latch(NULL),
     state(PENDING),
     discard(false),
+    associated(false),
     t(NULL),
     message(NULL) {}
 
@@ -917,7 +966,6 @@ Future<T>::Data::Data()
 template <typename T>
 Future<T>::Data::~Data()
 {
-  delete latch;
   delete t;
   delete message;
 }
@@ -956,6 +1004,18 @@ Future<T>::Future(const Failure& failure)
 template <typename T>
 Future<T>::Future(const Future<T>& that)
   : data(that.data) {}
+
+
+template <typename T>
+Future<T>::Future(const Try<T>& t)
+  : data(new Data())
+{
+  if (t.isSome()){
+    set(t.get());
+  } else {
+    fail(t.error());
+  }
+}
 
 
 template <typename T>
@@ -1057,24 +1117,32 @@ bool Future<T>::hasDiscard() const
 }
 
 
+namespace internal {
+
+inline void awaited(const Owned<Latch>& latch)
+{
+  latch->trigger();
+}
+
+} // namespace internal {
+
+
 template <typename T>
 bool Future<T>::await(const Duration& duration) const
 {
-  bool await = false;
+  Owned<Latch> latch;
 
   internal::acquire(&data->lock);
   {
     if (data->state == PENDING) {
-      if (data->latch == NULL) {
-        data->latch = new Latch();
-      }
-      await = true;
+      latch.reset(new Latch());
+      data->onAnyCallbacks.push(lambda::bind(&internal::awaited, latch));
     }
   }
   internal::release(&data->lock);
 
-  if (await) {
-    return data->latch->await(duration);
+  if (latch.get() != NULL) {
+    return latch->await(duration);
   }
 
   return true;
@@ -1392,6 +1460,41 @@ void then(const memory::shared_ptr<Promise<X> >& promise,
   }
 }
 
+
+template <typename T>
+void expired(
+    const lambda::function<Future<T>(const Future<T>&)>& f,
+    const memory::shared_ptr<Latch>& latch,
+    const memory::shared_ptr<Promise<T> >& promise,
+    const Future<T>& future)
+{
+  if (latch->trigger()) {
+    // Note that we don't bother checking if 'future' has been
+    // discarded (i.e., 'future.isDiscarded()' returns true) since
+    // there is a race between when we make that check and when we
+    // would invoke 'f(future)' so the callee 'f' should ALWAYS check
+    // if the future has been discarded and rather than hiding a
+    // non-deterministic bug we always call 'f' if the timer has
+    // expired.
+    promise->associate(f(future));
+  }
+}
+
+
+template <typename T>
+void after(
+    const memory::shared_ptr<Latch>& latch,
+    const memory::shared_ptr<Promise<T> >& promise,
+    const Timer& timer,
+    const Future<T>& future)
+{
+  CHECK(!future.isPending());
+  if (latch->trigger()) {
+    Timer::cancel(timer);
+    promise->associate(future);
+  }
+}
+
 } // namespace internal {
 
 
@@ -1436,6 +1539,36 @@ Future<X> Future<T>::then(const lambda::function<X(const T&)>& f) const
 
 
 template <typename T>
+Future<T> Future<T>::after(
+    const Duration& duration,
+    const lambda::function<Future<T>(const Future<T>&)>& f) const
+{
+  // TODO(benh): Using a Latch here but Once might be cleaner.
+  // Unfortunately, Once depends on Future so we can't easily use it
+  // from here.
+  memory::shared_ptr<Latch> latch(new Latch());
+  memory::shared_ptr<Promise<T> > promise(new Promise<T>());
+
+  // Set up a timer to invoke the callback if this future has not
+  // completed. Note that we do not pass a weak reference for this
+  // future as we don't want the future to get cleaned up and then
+  // have the timer expire.
+  Timer timer = Timer::create(
+      duration,
+      lambda::bind(&internal::expired<T>, f, latch, promise, *this));
+
+  onAny(lambda::bind(&internal::after<T>, latch, promise, timer, lambda::_1));
+
+  // Propagate discarding up the chain. To avoid cyclic dependencies,
+  // we keep a weak future in the callback.
+  promise->future().onDiscard(
+      lambda::bind(&internal::discard<T>, WeakFuture<T>(*this)));
+
+  return promise->future();
+}
+
+
+template <typename T>
 bool Future<T>::set(const T& _t)
 {
   bool result = false;
@@ -1445,9 +1578,6 @@ bool Future<T>::set(const T& _t)
     if (data->state == PENDING) {
       data->t = new T(_t);
       data->state = READY;
-      if (data->latch != NULL) {
-        data->latch->trigger();
-      }
       result = true;
     }
   }
@@ -1484,9 +1614,6 @@ bool Future<T>::fail(const std::string& _message)
     if (data->state == PENDING) {
       data->message = new std::string(_message);
       data->state = FAILED;
-      if (data->latch != NULL) {
-        data->latch->trigger();
-      }
       result = true;
     }
   }

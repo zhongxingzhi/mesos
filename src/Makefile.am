@@ -18,6 +18,7 @@
 # which is necessary for dealing with naming conflicts, i.e,,
 # master/http.cpp and slave/http.cpp.
 AUTOMAKE_OPTIONS = subdir-objects
+MESOS_BUILD_DIR=@abs_top_builddir@
 
 include ../3rdparty/versions.am
 include ../3rdparty/libprocess/3rdparty/versions.am
@@ -44,9 +45,14 @@ PICOJSON = $(LIBPROCESS)/3rdparty/picojson-$(PICOJSON_VERSION)
 pkglibexecdir = $(libexecdir)/$(PACKAGE)
 pkglocalstatedir = $(localstatedir)/$(PACKAGE)
 
-# Protocol buffer compiler.
-PROTOC = ../$(PROTOBUF)/src/protoc
-PROTOCFLAGS = -I$(top_srcdir)/include/mesos -I$(srcdir)
+if WITH_BUNDLED_PROTOBUF
+  # Protocol buffer compiler.
+  PROTOC = ../$(PROTOBUF)/src/protoc
+else
+  PROTOC = @PROTOCOMPILER@
+endif
+
+PROTOCFLAGS = -I$(top_srcdir)/include -I$(srcdir)
 
 # Initialize variables here so we can use += operator everywhere else.
 lib_LTLIBRARIES =
@@ -81,17 +87,37 @@ MESOS_CPPFLAGS += -I$(top_srcdir)/include
 MESOS_CPPFLAGS += -I$(top_srcdir)/$(LIBPROCESS)/include
 MESOS_CPPFLAGS += -I$(top_srcdir)/$(STOUT)/include
 MESOS_CPPFLAGS += -I../include
-MESOS_CPPFLAGS += -I../$(BOOST)
-MESOS_CPPFLAGS += -I../$(PROTOBUF)/src
-MESOS_CPPFLAGS += -I../$(PICOJSON)
-MESOS_CPPFLAGS += -I../$(GLOG)/src
-MESOS_CPPFLAGS += -I../$(LEVELDB)/include
 
-if WITH_INCLUDED_ZOOKEEPER
+# Protobuf headers that depend on mesos.pb.h need this.
+MESOS_CPPFLAGS += -I../include/mesos
+
+# Header only dependencies will be ignored for --disable-bundled.
+MESOS_CPPFLAGS += -I../$(BOOST)
+MESOS_CPPFLAGS += -I../$(PICOJSON)
+
+MESOS_CPPFLAGS += -I../$(PROTOBUF)/src
+MESOS_CPPFLAGS += -I../$(GLOG)/src
+
+if WITH_BUNDLED_GLOG
+  MESOS_CPPFLAGS += -I../$(GLOG)/src
+endif
+
+if WITH_BUNDLED_LEVELDB
+  MESOS_CPPFLAGS += -I../$(LEVELDB)/include
+endif
+
+if WITH_BUNDLED_ZOOKEEPER
   MESOS_CPPFLAGS += -I../$(ZOOKEEPER)/include
   MESOS_CPPFLAGS += -I../$(ZOOKEEPER)/generated
 endif
 
+if WITH_NETWORK_ISOLATOR
+  MESOS_CPPFLAGS += $(LIBNL_CFLAGS)
+endif
+
+if WITH_BUNDLED_PROTOBUF
+  MESOS_CPPFLAGS += -I../$(PROTOBUF)/src
+endif
 
 # README: we build the Mesos library out of a collection of
 # convenience libraries (that is, libraries that do not get installed
@@ -103,9 +129,27 @@ endif
 
 MESOS_PROTO = $(top_srcdir)/include/mesos/mesos.proto
 
-CXX_PROTOS = mesos.pb.cc mesos.pb.h
-JAVA_PROTOS = java/generated/org/apache/mesos/Protos.java
-PYTHON_PROTOS = python/src/mesos_pb2.py
+CONTAINERIZER_PROTO =							\
+  $(top_srcdir)/include/mesos/containerizer/containerizer.proto
+
+SCHEDULER_PROTO =							\
+  $(top_srcdir)/include/mesos/scheduler/scheduler.proto
+
+CXX_PROTOS =								\
+  mesos.pb.cc								\
+  ../include/mesos/mesos.pb.h						\
+  containerizer/containerizer.pb.cc					\
+  ../include/mesos/containerizer/containerizer.pb.h			\
+  scheduler/scheduler.pb.cc						\
+  ../include/mesos/scheduler/scheduler.pb.h
+
+JAVA_PROTOS =								\
+  java/generated/org/apache/mesos/Protos.java				\
+  java/generated/org/apache/mesos/containerizer/Protos.java
+
+PYTHON_PROTOS =								\
+  python/interface/src/mesos/interface/mesos_pb2.py			\
+  python/interface/src/mesos/interface/containerizer_pb2.py
 
 BUILT_SOURCES += $(CXX_PROTOS) $(JAVA_PROTOS) $(PYTHON_PROTOS)
 CLEANFILES += $(CXX_PROTOS) $(JAVA_PROTOS) $(PYTHON_PROTOS)
@@ -131,21 +175,56 @@ BUILT_SOURCES += $(REGISTRY_PROTOS)
 CLEANFILES += $(REGISTRY_PROTOS)
 
 # Targets for generating protocol buffer code.
-%.pb.cc %.pb.h: $(top_srcdir)/include/mesos/%.proto
+# For the include headers, place the header files in the include
+# directory and leave the cc files in src.
+%.pb.cc ../include/mesos/%.pb.h: $(top_srcdir)/include/mesos/%.proto
 	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --cpp_out=. $^
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include $^
+	mv ../include/mesos/*.pb.cc .
+
+containerizer/%.pb.cc ../include/mesos/containerizer/%.pb.h: $(CONTAINERIZER_PROTO)
+	$(MKDIR_P) $(@D)
+	$(MKDIR_P) ../include/mesos/containerizer
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include $^
+	mv ../include/mesos/containerizer/*.pb.cc $(@D)
+
+scheduler/%.pb.cc ../include/mesos/scheduler/%.pb.h: $(SCHEDULER_PROTO)
+	$(MKDIR_P) $(@D)
+	$(MKDIR_P) ../include/mesos/scheduler
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include $^
+	mv ../include/mesos/scheduler/*.pb.cc $(@D)
 
 %.pb.cc %.pb.h: %.proto
 	$(MKDIR_P) $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --cpp_out=. $^
 
-$(JAVA_PROTOS): $(MESOS_PROTO)
+java/generated/org/apache/mesos/Protos.java: $(MESOS_PROTO)
 	$(MKDIR_P)  $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
 
-$(PYTHON_PROTOS): $(MESOS_PROTO)
+java/generated/org/apache/mesos/containerizer/Protos.java:		\
+		$(CONTAINERIZER_PROTO)
+	$(MKDIR_P)  $(@D)
+	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
+
+java/generated/org/apache/mesos/scheduler/Protos.java: $(SCHEDULER_PROTO)
+	$(MKDIR_P)  $(@D)
+	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
+
+python/interface/src/mesos/interface/mesos_pb2.py: $(MESOS_PROTO)
 	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --python_out=python/src $^
+	$(PROTOC) -I$(top_srcdir)/include/mesos				\
+		$(PROTOCFLAGS) --python_out=python/interface/src/mesos/interface $^
+
+python/interface/src/mesos/interface/containerizer_pb2.py: $(CONTAINERIZER_PROTO)
+	$(MKDIR_P) $(@D)
+	$(PROTOC) -I$(top_srcdir)/include/mesos/containerizer		\
+		$(PROTOCFLAGS) --python_out=python/interface/src/mesos/interface $^
+
+python/interface/src/mesos/interface/scheduler_pb2.py: $(SCHEDULER_PROTO)
+	$(MKDIR_P) $(@D)
+	$(PROTOC) -I$(top_srcdir)/include/mesos/scheduler		\
+		$(PROTOCFLAGS) --python_out=python/interface/src/mesos/interface $^
 
 # We even use a convenience library for most of Mesos so that we can
 # exclude third party libraries so setuptools/distribute can build a
@@ -159,12 +238,22 @@ nodist_libmesos_no_3rdparty_la_SOURCES =				\
   $(REGISTRY_PROTOS)
 
 libmesos_no_3rdparty_la_SOURCES =					\
-	sasl/authenticatee.hpp						\
-	sasl/authenticator.hpp						\
-	sasl/auxprop.hpp						\
-	sasl/auxprop.cpp						\
-	sched/sched.cpp							\
+	authorizer/authorizer.cpp					\
+	common/attributes.cpp						\
+	common/date_utils.cpp						\
+	common/http.cpp							\
+	common/lock.cpp							\
+	common/protobuf_utils.cpp					\
+	common/resources.cpp						\
+	common/thread.cpp						\
+	common/type_utils.cpp						\
+	common/values.cpp						\
+	docker/docker.hpp					        \
+	docker/docker.cpp					        \
+	exec/exec.cpp							\
+	files/files.cpp							\
 	local/local.cpp							\
+	logging/logging.cpp						\
 	master/contender.cpp						\
 	master/constants.cpp						\
 	master/detector.cpp						\
@@ -175,26 +264,30 @@ libmesos_no_3rdparty_la_SOURCES =					\
 	master/registry.proto                                           \
 	master/registrar.cpp						\
 	master/repairer.cpp						\
+	sasl/authenticatee.hpp						\
+	sasl/authenticator.hpp						\
+	sasl/auxprop.hpp						\
+	sasl/auxprop.cpp						\
+	sched/sched.cpp							\
+	scheduler/scheduler.cpp						\
 	slave/constants.cpp						\
 	slave/gc.cpp							\
+	slave/http.cpp							\
 	slave/monitor.cpp						\
 	slave/state.cpp							\
 	slave/slave.cpp							\
-	slave/http.cpp							\
 	slave/containerizer/containerizer.cpp				\
+	slave/containerizer/composing.cpp				\
+	slave/containerizer/composing.hpp				\
+	slave/containerizer/docker.cpp					\
+	slave/containerizer/docker.hpp					\
+	slave/containerizer/external_containerizer.cpp			\
 	slave/containerizer/isolator.cpp				\
 	slave/containerizer/launcher.cpp				\
-	slave/containerizer/mesos_containerizer.cpp			\
+	slave/containerizer/mesos/containerizer.cpp			\
+	slave/containerizer/mesos/launch.cpp				\
 	slave/status_update_manager.cpp					\
-	exec/exec.cpp							\
-	common/lock.cpp							\
-	common/http.cpp							\
-	common/date_utils.cpp						\
-	common/resources.cpp						\
-	common/attributes.cpp						\
-	common/values.cpp						\
-	files/files.cpp							\
-	logging/logging.cpp						\
+	usage/usage.cpp							\
 	zookeeper/contender.cpp						\
 	zookeeper/detector.cpp						\
 	zookeeper/zookeeper.cpp						\
@@ -202,67 +295,152 @@ libmesos_no_3rdparty_la_SOURCES =					\
 	zookeeper/group.cpp						\
 	messages/messages.proto
 
-pkginclude_HEADERS = $(top_srcdir)/include/mesos/executor.hpp	\
-		     $(top_srcdir)/include/mesos/scheduler.hpp	\
-                     $(top_srcdir)/include/mesos/resources.hpp	\
-                     $(top_srcdir)/include/mesos/values.hpp	\
-		     $(top_srcdir)/include/mesos/mesos.proto
+pkginclude_HEADERS =							\
+  $(top_srcdir)/include/mesos/executor.hpp				\
+  $(top_srcdir)/include/mesos/scheduler.hpp				\
+  $(top_srcdir)/include/mesos/resources.hpp				\
+  $(top_srcdir)/include/mesos/values.hpp				\
+  $(top_srcdir)/include/mesos/mesos.proto
 
-nodist_pkginclude_HEADERS = ../include/mesos/mesos.hpp mesos.pb.h
+nodist_pkginclude_HEADERS =						\
+  ../include/mesos/mesos.hpp						\
+  ../include/mesos/mesos.pb.h
+
+containerizerdir = $(pkgincludedir)/containerizer
+
+containerizer_HEADERS =							\
+  $(top_srcdir)/include/mesos/containerizer/containerizer.hpp		\
+  $(top_srcdir)/include/mesos/containerizer/containerizer.proto
+
+nodist_containerizer_HEADERS = ../include/mesos/containerizer/containerizer.pb.h
+
+schedulerdir = $(pkgincludedir)/scheduler
+
+scheduler_HEADERS =							\
+  $(top_srcdir)/include/mesos/scheduler/scheduler.hpp			\
+  $(top_srcdir)/include/mesos/scheduler/scheduler.proto
+
+nodist_scheduler_HEADERS = ../include/mesos/scheduler/scheduler.pb.h
 
 if OS_LINUX
   libmesos_no_3rdparty_la_SOURCES += linux/cgroups.cpp
+  libmesos_no_3rdparty_la_SOURCES += linux/fs.cpp
+  libmesos_no_3rdparty_la_SOURCES += linux/perf.cpp
   libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/cpushare.cpp
   libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/mem.cpp
-  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/cgroups_launcher.cpp
-  libmesos_no_3rdparty_la_SOURCES += linux/fs.cpp
+  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/perf_event.cpp
+  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/linux_launcher.cpp
 else
   EXTRA_DIST += linux/cgroups.cpp
   EXTRA_DIST += linux/fs.cpp
 endif
 
-libmesos_no_3rdparty_la_SOURCES += common/attributes.hpp		\
-	common/build.hpp common/date_utils.hpp common/factory.hpp	\
-	common/protobuf_utils.hpp					\
+if WITH_NETWORK_ISOLATOR
+  libmesos_no_3rdparty_la_SOURCES +=					\
+	linux/routing/route.cpp						\
+	linux/routing/utils.cpp						\
+	linux/routing/filter/arp.cpp					\
+	linux/routing/filter/icmp.cpp					\
+	linux/routing/filter/ip.cpp					\
+	linux/routing/link/link.cpp					\
+	linux/routing/queueing/handle.cpp				\
+	linux/routing/queueing/ingress.cpp
+
+  libmesos_no_3rdparty_la_SOURCES +=					\
+	linux/routing/internal.hpp					\
+	linux/routing/route.hpp						\
+	linux/routing/utils.hpp						\
+	linux/routing/filter/action.hpp					\
+	linux/routing/filter/arp.hpp					\
+	linux/routing/filter/filter.hpp					\
+	linux/routing/filter/icmp.hpp					\
+	linux/routing/filter/internal.hpp				\
+	linux/routing/filter/ip.hpp					\
+	linux/routing/filter/priority.hpp				\
+	linux/routing/link/internal.hpp					\
+	linux/routing/link/link.hpp					\
+	linux/routing/queueing/handle.hpp				\
+	linux/routing/queueing/ingress.hpp				\
+	linux/routing/queueing/internal.hpp
+
+  libmesos_no_3rdparty_la_SOURCES +=					\
+	slave/containerizer/isolators/network/port_mapping.cpp		\
+	slave/containerizer/isolators/network/port_mapping.hpp
+endif
+
+libmesos_no_3rdparty_la_SOURCES +=					\
+	authorizer/authorizer.hpp					\
+	common/attributes.hpp						\
+	common/build.hpp						\
+	common/date_utils.hpp						\
+	common/factory.hpp						\
 	common/http.hpp							\
 	common/lock.hpp							\
-	common/type_utils.hpp common/thread.hpp				\
-	examples/utils.hpp files/files.hpp				\
+	common/parse.hpp						\
+	common/protobuf_utils.hpp					\
+	common/status_utils.hpp						\
+	common/type_utils.hpp						\
+	common/thread.hpp						\
+	credentials/credentials.hpp					\
+	examples/utils.hpp						\
+	files/files.hpp							\
 	hdfs/hdfs.hpp							\
 	linux/cgroups.hpp						\
-	linux/fs.hpp local/flags.hpp local/local.hpp			\
-	logging/flags.hpp logging/logging.hpp				\
+	linux/fs.hpp							\
+	linux/perf.hpp							\
+	local/flags.hpp							\
+	local/local.hpp							\
+	logging/flags.hpp						\
+	logging/logging.hpp						\
 	master/allocator.hpp						\
 	master/contender.hpp						\
 	master/constants.hpp						\
 	master/detector.hpp						\
-	master/drf_sorter.hpp master/flags.hpp				\
+	master/drf_sorter.hpp						\
+	master/flags.hpp						\
 	master/hierarchical_allocator_process.hpp			\
+	master/master.hpp						\
+	master/repairer.hpp						\
 	master/registrar.hpp						\
-	master/master.hpp master/sorter.hpp				\
-	messages/messages.hpp slave/constants.hpp			\
-	slave/containerizer/cgroups_launcher.hpp			\
+	master/sorter.hpp						\
+	messages/messages.hpp						\
+	slave/constants.hpp						\
+	slave/flags.hpp							\
+	slave/gc.hpp							\
+	slave/monitor.hpp						\
+	slave/paths.hpp							\
+	slave/slave.hpp							\
+	slave/state.hpp							\
+	slave/status_update_manager.hpp					\
 	slave/containerizer/containerizer.hpp				\
+	slave/containerizer/external_containerizer.hpp			\
 	slave/containerizer/isolator.hpp				\
+	slave/containerizer/launcher.hpp				\
+	slave/containerizer/linux_launcher.hpp				\
+	slave/containerizer/isolators/posix.hpp				\
 	slave/containerizer/isolators/cgroups/cpushare.hpp		\
 	slave/containerizer/isolators/cgroups/mem.hpp			\
-	slave/containerizer/isolators/posix.hpp				\
-	slave/containerizer/launcher.hpp				\
-	slave/containerizer/mesos_containerizer.hpp			\
-	slave/flags.hpp slave/gc.hpp slave/monitor.hpp			\
-	slave/paths.hpp slave/state.hpp					\
-	slave/status_update_manager.hpp					\
-	slave/slave.hpp							\
-	tests/environment.hpp tests/script.hpp				\
-	tests/zookeeper.hpp tests/flags.hpp tests/utils.hpp		\
+	slave/containerizer/isolators/cgroups/perf_event.hpp		\
+	slave/containerizer/mesos/containerizer.hpp			\
+	slave/containerizer/mesos/launch.hpp				\
 	tests/cluster.hpp						\
 	tests/containerizer.hpp						\
+	tests/environment.hpp						\
+	tests/flags.hpp							\
+	tests/isolator.hpp						\
 	tests/mesos.hpp							\
-	tests/zookeeper_test_server.hpp zookeeper/authentication.hpp	\
+	tests/script.hpp						\
+	tests/utils.hpp							\
+	tests/zookeeper.hpp						\
+	tests/zookeeper_test_server.hpp					\
+	usage/usage.hpp							\
+	zookeeper/authentication.hpp					\
 	zookeeper/contender.hpp						\
 	zookeeper/detector.hpp						\
-	zookeeper/group.hpp zookeeper/watcher.hpp			\
-	zookeeper/zookeeper.hpp zookeeper/url.hpp
+	zookeeper/group.hpp						\
+	zookeeper/url.hpp						\
+	zookeeper/watcher.hpp						\
+	zookeeper/zookeeper.hpp
 
 libmesos_no_3rdparty_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 
@@ -276,6 +454,7 @@ libbuild_la_CPPFLAGS += $(MESOS_CPPFLAGS)
 libbuild_la_CPPFLAGS += -DBUILD_DATE="\"$$(date '+%Y-%m-%d %H:%M:%S')\""
 libbuild_la_CPPFLAGS += -DBUILD_TIME="\"$$(date '+%s')\""
 libbuild_la_CPPFLAGS += -DBUILD_USER="\"$$USER\""
+libbuild_la_CPPFLAGS += -DBUILD_JAVA_JVM_LIBRARY=\"$(JAVA_JVM_LIBRARY)\"
 
 if GIT_REPO
     BUILD_GIT_SHA=$$(sh -c 'cd $(top_srcdir); \
@@ -350,10 +529,12 @@ noinst_LTLIBRARIES += libstate.la
 libstate_la_SOURCES =							\
   state/in_memory.cpp							\
   state/leveldb.cpp							\
+  state/log.cpp								\
   state/zookeeper.cpp
 libstate_la_SOURCES +=							\
   state/in_memory.hpp							\
   state/leveldb.hpp							\
+  state/log.hpp								\
   state/protobuf.hpp							\
   state/state.hpp							\
   state/storage.hpp							\
@@ -368,9 +549,10 @@ libmesos_no_3rdparty_la_LIBADD += libstate.la
 # The final result!
 lib_LTLIBRARIES += libmesos.la
 
-libmesos_la_SOURCES = $(MESOS_PROTO) # Include as part of the distribution.
+# Include as part of the distribution.
+libmesos_la_SOURCES = $(MESOS_PROTO) $(CONTAINERIZER_PROTO) $(SCHEDULER_PROTO)
 
-libmesos_la_LDFLAGS = -release $(PACKAGE_VERSION) -shared
+libmesos_la_LDFLAGS = -release $(PACKAGE_VERSION)
 
 # Since we just include the convenience library (and no sources), we
 # need to tell libtool to build this as a C++ library.
@@ -382,20 +564,35 @@ libmesos_la_LIBADD = libmesos_no_3rdparty.la
 # For non-convenience libraries we need to link them in to make the shared
 # library each time. (Currently, we don't support platforms where this is not
 # possible.)
-libmesos_la_LIBADD += ../$(PROTOBUF)/src/libprotobuf.la
-libmesos_la_LIBADD += ../$(GLOG)/libglog.la
+if WITH_BUNDLED_GLOG
+  libmesos_la_LIBADD += ../$(GLOG)/libglog.la
+else
+  libmesos_la_LIBADD += -lglog
+endif
 
+if WITH_BUNDLED_LEVELDB
 # We need to directly include the leveldb library in order to avoid
 # the installed libmesos.la file to include leveldb in
 # 'dependency_libs' (via '-L../3rdparty/leveldb -lleveldb').
-libmesos_la_LIBADD += ../$(LEVELDB)/libleveldb.a
 
-if WITH_INCLUDED_ZOOKEEPER
+  libmesos_la_LIBADD += ../$(LEVELDB)/libleveldb.a
+else
+  libmesos_la_LIBADD += -lleveldb
+endif
+
+if WITH_BUNDLED_ZOOKEEPER
   libmesos_la_LIBADD += ../$(ZOOKEEPER)/libzookeeper_mt.la
+else
+  libmesos_la_LIBADD += -lzookeeper_mt
+endif
+
+if WITH_BUNDLED_PROTOBUF
+  libmesos_la_LIBADD += ../$(PROTOBUF)/src/libprotobuf.la
+else
+  libmesos_la_LIBADD += -lprotobuf
 endif
 
 libmesos_la_LIBADD += ../$(LIBPROCESS)/libprocess.la
-
 
 # Binaries.
 sbin_PROGRAMS += mesos-master
@@ -422,6 +619,28 @@ pkglibexec_PROGRAMS += mesos-executor
 mesos_executor_SOURCES = launcher/executor.cpp
 mesos_executor_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_executor_LDADD = libmesos.la
+
+pkglibexec_PROGRAMS += mesos-containerizer
+mesos_containerizer_SOURCES = slave/containerizer/mesos/main.cpp
+mesos_containerizer_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_containerizer_LDADD = libmesos.la
+
+if WITH_NETWORK_ISOLATOR
+pkglibexec_PROGRAMS += mesos-network-helper
+mesos_network_helper_SOURCES = slave/containerizer/isolators/network/helper.cpp
+mesos_network_helper_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_network_helper_LDADD = libmesos.la
+endif
+
+pkglibexec_PROGRAMS += mesos-health-check
+mesos_health_check_SOURCES = health-check/main.cpp
+mesos_health_check_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_health_check_LDADD = libmesos.la
+
+pkglibexec_PROGRAMS += mesos-usage
+mesos_usage_SOURCES = usage/main.cpp
+mesos_usage_CPPFLAGS = $(MESOS_CPPFLAGS)
+mesos_usage_LDADD = libmesos.la
 
 bin_PROGRAMS += mesos-log
 mesos_log_SOURCES = log/main.cpp
@@ -544,7 +763,7 @@ EXTRA_DIST += deploy/mesos-deploy-env.sh.template			\
 # to EXTRA_DIST unconditionally.
 
 # Mesos JAR.
-MESOS_JAR = mesos-$(PACKAGE_VERSION).jar
+MESOS_JAR = java/target/mesos-$(PACKAGE_VERSION).jar
 MESOS_JAR_SOURCE =							\
 	$(srcdir)/java/src/org/apache/mesos/ExecutorDriver.java		\
 	$(srcdir)/java/src/org/apache/mesos/Executor.java		\
@@ -576,46 +795,10 @@ EXTRA_DIST += $(EXAMPLES_SOURCE)
 
 
 if HAS_JAVA
-# Protocol buffers JAR.
-PROTOBUF_JAR = ../protobuf-$(PROTOBUF_VERSION).jar
 
-# TODO(charles): Move into 3rdparty/Makefile.am.
-$(PROTOBUF_JAR): # TODO(charles): Specify dependencies for the jar.
-	@echo "Building protobuf-$(PROTOBUF_VERSION).jar ..."
-	$(MKDIR_P) ../$(PROTOBUF)/java/src/main/java
-	$(PROTOC) --java_out=../$(PROTOBUF)/java/src/main/java		\
-          -I../$(PROTOBUF)/src						\
-          ../$(PROTOBUF)/src/google/protobuf/descriptor.proto
-	$(JAVA_HOME)/bin/javac -source 1.6 -target 1.6			\
-          -d ../$(PROTOBUF)/java/src/main/java				\
-          ../$(PROTOBUF)/java/src/main/java/com/google/protobuf/*.java	\
-          ../$(PROTOBUF)/java/src/main/java/com/google/protobuf/*.java
-	$(JAVA_HOME)/bin/jar cf $@ -C ../$(PROTOBUF)/java/src/main/java com
-
-CLEANFILES += $(PROTOBUF_JAR)
-
-
-$(MESOS_JAR): $(MESOS_JAR_SOURCE) $(MESOS_JAR_GENERATED) $(PROTOBUF_JAR)
+$(MESOS_JAR): $(MESOS_JAR_SOURCE) $(MESOS_JAR_GENERATED) java/mesos.pom
 	@echo "Building mesos-$(PACKAGE_VERSION).jar ..."
-	-rm -rf java/classes/org/apache/mesos
-	$(MKDIR_P) java/classes/org/apache/mesos
-	$(JAVA_HOME)/bin/javac -source 1.6 -target 1.6			\
-          -cp $(PROTOBUF_JAR)						\
-          -d java/classes $(MESOS_JAR_SOURCE) $(MESOS_JAR_GENERATED)
-	$(JAVA_HOME)/bin/jar cf $@ -C java/classes org
-
-CLEANFILES += $(MESOS_JAR)
-
-
-MESOS_SOURCES_JAR = ../src/mesos-$(PACKAGE_VERSION)-sources.jar
-
-$(MESOS_SOURCES_JAR): $(MESOS_JAR_SOURCE)
-	-rm -f $(MESOS_SOURCES_JAR)
-	$(JAVA_HOME)/bin/jar cf $@ -C $(srcdir)/java/src org
-	$(JAVA_HOME)/bin/jar uf $@ -C java/generated org
-
-CLEANFILES += $(MESOS_SOURCES_JAR)
-
+	@cd $(abs_top_builddir)/src/java && $(MVN) -f mesos.pom clean package
 
 # Convenience library for JNI bindings.
 # TODO(Charles Reiss): We really should be building the Java library
@@ -649,16 +832,12 @@ libjava_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 libjava_la_CPPFLAGS += $(JAVA_CPPFLAGS)
 libjava_la_CPPFLAGS += -I$(srcdir)/java/jni -Ijava/jni
 
-libjava_la_DEPENDENCIES = $(MESOS_PROTO)
-
-libjava_la_LIBADD = $(JAVA_LDFLAGS)
+libjava_la_DEPENDENCIES = $(MESOS_PROTO) $(CONTAINERIZER_PROTO)
 
 # We don't add libjava.la to libmesos_no_3rdparty.la so we don't
 # include the JNI bindings in the Python egg (but we might want to
-# reconsider this in the future). We also need to add the JAVA_LDFLAGS
-# to libmesos.la so on Linux we set the rpath for libmesos.so.
+# reconsider this in the future).
 libmesos_la_LIBADD += libjava.la
-libmesos_la_LIBADD += $(JAVA_LDFLAGS)
 
 # We need to generate the JNI header files before we build the sources
 # and the easiest way to do that with autotools is with the
@@ -679,76 +858,85 @@ nodist_libjava_la_SOURCES =						\
 BUILT_SOURCES += $(nodist_libjava_la_SOURCES)
 
 java/jni/org_apache_mesos_MesosSchedulerDriver.h: $(MESOS_JAR)
-	$(JAVA_HOME)/bin/javah -d java/jni -classpath			\
-          $(PROTOBUF_JAR):java/classes					\
-          org.apache.mesos.MesosSchedulerDriver
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
+	  org.apache.mesos.MesosSchedulerDriver
 
 java/jni/org_apache_mesos_MesosExecutorDriver.h: $(MESOS_JAR)
-	$(JAVA_HOME)/bin/javah -d java/jni -classpath			\
-          $(PROTOBUF_JAR):java/classes					\
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
           org.apache.mesos.MesosExecutorDriver
 
 java/jni/org_apache_mesos_Log.h: $(MESOS_JAR)
-	$(JAVA_HOME)/bin/javah -d java/jni -classpath			\
-          $(PROTOBUF_JAR):java/classes org.apache.mesos.Log
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
+	  org.apache.mesos.Log
 
 java/jni/org_apache_mesos_state_AbstractState.h: $(MESOS_JAR)
-	$(JAVA_HOME)/bin/javah -d java/jni -classpath		\
-          $(PROTOBUF_JAR):java/classes org.apache.mesos.state.AbstractState
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
+	  org.apache.mesos.state.AbstractState
 
 java/jni/org_apache_mesos_state_LevelDBState.h: $(MESOS_JAR)
-	$(JAVA_HOME)/bin/javah -d java/jni -classpath		\
-          $(PROTOBUF_JAR):java/classes org.apache.mesos.state.LevelDBState
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
+	  org.apache.mesos.state.LevelDBState
 
 java/jni/org_apache_mesos_state_Variable.h: $(MESOS_JAR)
-	$(JAVA_HOME)/bin/javah -d java/jni -classpath			\
-          $(PROTOBUF_JAR):java/classes org.apache.mesos.state.Variable
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
+	  org.apache.mesos.state.Variable
 
 java/jni/org_apache_mesos_state_ZooKeeperState.h: $(MESOS_JAR)
-	$(JAVA_HOME)/bin/javah -d java/jni -classpath			\
-          $(PROTOBUF_JAR):java/classes org.apache.mesos.state.ZooKeeperState
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
+	  org.apache.mesos.state.ZooKeeperState
 
 $(EXAMPLES_JAR): $(EXAMPLES_SOURCE)
 	@echo "Building examples.jar ..."
 	$(MKDIR_P) examples/java
 	$(JAVA_HOME)/bin/javac -source 1.6 -target 1.6			\
-          -cp ../$(ZOOKEEPER_JAR):$(PROTOBUF_JAR):$(MESOS_JAR):$(srcdir)/examples/java	\
+          -cp ../$(ZOOKEEPER_JAR):@PROTOBUF_JAR@:$(MESOS_JAR):$(srcdir)/examples/java	\
           -sourcepath $(srcdir)/examples/java -d examples/java	        \
           $(srcdir)/examples/java/*.java
 	$(JAVA_HOME)/bin/jar cf $@ -C examples/java .
 
 CLEANFILES += $(EXAMPLES_JAR)
 
-maven-install: $(MESOS_JAR) $(MESOS_SOURCES_JAR) java/mesos.pom
-	mvn install:install-file -Dfile=$(MESOS_JAR)			\
-          -Dsources=$(MESOS_SOURCES_JAR) -DpomFile=java/mesos.pom
+maven-install: $(MESOS_JAR) java/mesos.pom
+	$(MVN) -f java/mesos.pom install
 
 PHONY_TARGETS += maven-install
 endif # HAS_JAVA
 
-# We remove mesos-*.jar here to make sure any older versions of the
-# jar are removed.
 clean-java:
-	-rm -rf java/classes
+	-rm -rf java/target
 	-rm -f examples/java/*.class
 	-rm -f java/jni/org_apache_mesos*.h
-	-rm -f mesos-*.jar
 
 PHONY_TARGETS += clean-java
 
 
 # Python files listed outside HAS_PYTHON so they are included with the
 # distribution unconditionally.
-EXTRA_DIST += python/src/mesos.py					\
-	      python/native/mesos_executor_driver_impl.cpp		\
-	      python/native/mesos_executor_driver_impl.hpp		\
-	      python/native/mesos_scheduler_driver_impl.cpp		\
-	      python/native/mesos_scheduler_driver_impl.hpp		\
-	      python/native/module.cpp python/native/module.hpp		\
-	      python/native/proxy_executor.cpp				\
-	      python/native/proxy_executor.hpp				\
-	      python/native/proxy_scheduler.cpp				\
-	      python/native/proxy_scheduler.hpp
+PYTHON_SOURCE =									\
+	python/src/mesos/__init__.py						\
+	python/interface/src/mesos/__init__.py					\
+	python/interface/src/mesos/interface/__init__.py			\
+	python/native/src/mesos/__init__.py					\
+	python/native/src/mesos/native/__init__.py				\
+	python/native/src/mesos/native/mesos_executor_driver_impl.cpp		\
+	python/native/src/mesos/native/mesos_executor_driver_impl.hpp		\
+	python/native/src/mesos/native/mesos_scheduler_driver_impl.cpp		\
+	python/native/src/mesos/native/mesos_scheduler_driver_impl.hpp		\
+	python/native/src/mesos/native/module.cpp				\
+	python/native/src/mesos/native/module.hpp				\
+	python/native/src/mesos/native/proxy_executor.cpp			\
+	python/native/src/mesos/native/proxy_executor.hpp			\
+	python/native/src/mesos/native/proxy_scheduler.cpp			\
+	python/native/src/mesos/native/proxy_scheduler.hpp
+
+EXTRA_DIST += $(PYTHON_SOURCE)
 
 if HAS_PYTHON
 # Used for building Python eggs.
@@ -756,19 +944,21 @@ DISTRIBUTE_EGG_SUFFIX = $(DISTRIBUTE_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg
 DISTRIBUTE_EGG = \
   $(abs_top_builddir)/$(DISTRIBUTE)/dist/distribute-$(DISTRIBUTE_EGG_SUFFIX)
 
-# Build a protobuf Python egg.
-PROTOBUF_EGG_SUFFIX = $(PROTOBUF_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg
-PROTOBUF_EGG = ../$(PROTOBUF)/python/dist/protobuf-$(PROTOBUF_EGG_SUFFIX)
+if WITH_BUNDLED_PROTOBUF
+  # Build a protobuf Python egg.
+  PROTOBUF_EGG_SUFFIX = $(PROTOBUF_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg
+  PROTOBUF_EGG = ../$(PROTOBUF)/python/dist/protobuf-$(PROTOBUF_EGG_SUFFIX)
 
-$(PROTOBUF_EGG):
+  $(PROTOBUF_EGG):
 	@echo "Building protobuf Python egg ..."
 	cd ../$(PROTOBUF)/python && \
           CC="$(CC)" CXX="$(CXX)" CFLAGS="$(CFLAGS)" CXXFLAGS="$(CXXFLAGS)" \
 	  PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) setup.py build bdist_egg
 
-CLEANFILES += $(PROTOBUF_EGG)
+  CLEANFILES += $(PROTOBUF_EGG)
+endif
 
-# This builds a Python egg against libmesos_no_3rdparty.a that is
+# This builds the mesos.native egg against libmesos_no_3rdparty.a that is
 # self-contained. It currently depends on the libraries in 3rdparty
 # being built as .a's. (If this is changed, the setup.py will need to
 # be edited).
@@ -783,44 +973,51 @@ CLEANFILES += $(PROTOBUF_EGG)
 # system versions of our dependencies (since we won't be able to
 # create a standalone egg anyways).
 
-MESOS_EGG = python/dist/mesos-$(PACKAGE_VERSION)$(PYTHON_EGG_POSTFIX).egg
+PHONY_TARGETS += $(PYTHON_SOURCE)
 
-$(MESOS_EGG): python/setup.py $(srcdir)/python/src/mesos.py		\
-              $(PYTHON_PROTOS) libmesos_no_3rdparty.la			\
-              $(PROTOBUF_EGG)
-	@echo "Building Mesos Python egg ..."
-	@if test "$(top_srcdir)" != "$(top_builddir)"; then		\
-	  $(MKDIR_P) python/src;					\
-	  cp -pf $(srcdir)/python/src/mesos.py python/src;		\
-	fi
-	@LIBS="$(LIBS)" CC="$(CC)" CXX="$(CXX)"				\
-	CFLAGS="$(PYTHON_CFLAGS)" CPPFLAGS="$(PYTHON_CPPFLAGS)"		\
-	PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) python/setup.py bdist_egg
+$(PYTHON_SOURCE):
+	test "$(top_srcdir)" = "$(top_builddir)" ||				\
+		($(MKDIR_P) $(@D) && cp -pf $(srcdir)/$@ $@)
 
-CLEANFILES += $(MESOS_EGG) python/build/temp.*/native/*.o python/build/lib.*/*
+MESOS_EGGS =										\
+	python/dist/mesos-$(PACKAGE_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg		\
+	python/interface/dist/mesos.interface-$(PACKAGE_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg	\
+	python/native/dist/mesos.native-$(PACKAGE_VERSION)$(PYTHON_EGG_POSTFIX).egg
+
+$(MESOS_EGGS):									\
+		$(PYTHON_PROTOS)						\
+		$(PYTHON_SOURCE)						\
+		libmesos_no_3rdparty.la						\
+		$(PROTOBUF_EGG)
+	@cd `echo $@ | awk -F"dist" '{print $$1}'` &&				\
+	LIBS="$(LIBS)" CC="$(CC)" CXX="$(CXX)"					\
+	CFLAGS="$(PYTHON_CFLAGS)" CPPFLAGS="$(PYTHON_CPPFLAGS)"			\
+	LDFLAGS="$(PYTHON_LDFLAGS)"						\
+	PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) setup.py bdist_egg
+
+CLEANFILES += $(MESOS_EGGS) python/*/build python/*/dist $(PYTHON_SOURCE)
 
 # Make sure the egg gets built via 'make all'.
-all-local: $(MESOS_EGG)
+all-local: $(MESOS_EGGS)
 endif # HAS_PYTHON
 
-# Note that to clean up the copied Python files we have to 'chmod u+w
-# python/native' because creating a distribution can eliminate write
-# permissions for the owner which are conserved even after we 'cp -p'
-# so we won't be able to delete the files until we update permissions.
-#
-# We remove mesos-*.egg here to make sure any older versions of the
-# egg or versions for different architectures are removed.
 clean-python:
-	test "$(top_srcdir)" = "$(top_builddir)" ||			\
-	  (chmod -R u+w python/native;					\
-	   rm -rf python/src/mesos.py python/native)
-	-rm -rf python/src/mesos.egg-info python/build
-	-rm -f python/dist/mesos-*.egg
+	find python -name "build" -o -name "dist" -o -name "*.pyc"		\
+		-o -name "*.egg-info" | xargs rm -rf
 
 PHONY_TARGETS += clean-python
 
-
 # Test (make check) binaries.
+check_PROGRAMS += low-level-scheduler-libprocess
+low_level_scheduler_libprocess_SOURCES = examples/low_level_scheduler_libprocess.cpp
+low_level_scheduler_libprocess_CPPFLAGS = $(MESOS_CPPFLAGS)
+low_level_scheduler_libprocess_LDADD = libmesos.la
+
+check_PROGRAMS += low-level-scheduler-pthread
+low_level_scheduler_pthread_SOURCES = examples/low_level_scheduler_pthread.cpp
+low_level_scheduler_pthread_CPPFLAGS = $(MESOS_CPPFLAGS)
+low_level_scheduler_pthread_LDADD = libmesos.la
+
 check_PROGRAMS += test-framework
 test_framework_SOURCES = examples/test_framework.cpp
 test_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -846,6 +1043,11 @@ no_executor_framework_SOURCES = examples/no_executor_framework.cpp
 no_executor_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
 no_executor_framework_LDADD = libmesos.la
 
+check_PROGRAMS += docker-no-executor-framework
+docker_no_executor_framework_SOURCES = examples/docker_no_executor_framework.cpp
+docker_no_executor_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
+docker_no_executor_framework_LDADD = libmesos.la
+
 check_PROGRAMS += balloon-framework
 balloon_framework_SOURCES = examples/balloon_framework.cpp
 balloon_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -856,18 +1058,30 @@ balloon_executor_SOURCES = examples/balloon_executor.cpp
 balloon_executor_CPPFLAGS = $(MESOS_CPPFLAGS)
 balloon_executor_LDADD = libmesos.la
 
+check_PROGRAMS += load-generator-framework
+load_generator_framework_SOURCES = examples/load_generator_framework.cpp
+load_generator_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
+load_generator_framework_LDADD = libmesos.la
+
 check_PROGRAMS += mesos-tests
 
 mesos_tests_SOURCES =				\
   tests/allocator_tests.cpp			\
   tests/attributes_tests.cpp			\
   tests/authentication_tests.cpp		\
+  tests/authorization_tests.cpp		        \
   tests/containerizer.cpp			\
   tests/containerizer_tests.cpp			\
+  tests/credentials_tests.cpp			\
+  tests/docker_containerizer_tests.cpp          \
+  tests/docker_tests.cpp			\
   tests/environment.cpp				\
   tests/examples_tests.cpp			\
   tests/exception_tests.cpp			\
+  tests/external_containerizer_test.cpp		\
+  tests/health_check_tests.cpp                  \
   tests/fault_tolerance_tests.cpp		\
+  tests/fetcher_tests.cpp                       \
   tests/files_tests.cpp				\
   tests/flags.cpp				\
   tests/gc_tests.cpp				\
@@ -875,24 +1089,32 @@ mesos_tests_SOURCES =				\
   tests/log_tests.cpp				\
   tests/logging_tests.cpp			\
   tests/main.cpp				\
+  tests/master_authorization_tests.cpp		\
   tests/master_contender_detector_tests.cpp	\
   tests/master_tests.cpp			\
   tests/mesos.cpp				\
   tests/monitor_tests.cpp			\
   tests/paths_tests.cpp				\
   tests/protobuf_io_tests.cpp			\
+  tests/rate_limiting_tests.cpp			\
+  tests/reconciliation_tests.cpp		\
   tests/registrar_tests.cpp			\
   tests/repair_tests.cpp			\
   tests/resource_offers_tests.cpp		\
   tests/resources_tests.cpp			\
   tests/sasl_tests.cpp				\
+  tests/scheduler_tests.cpp			\
   tests/script.cpp				\
+  tests/shutdown_tests.cpp			\
   tests/slave_recovery_tests.cpp		\
+  tests/slave_tests.cpp				\
   tests/sorter_tests.cpp			\
   tests/state_tests.cpp				\
   tests/status_update_manager_tests.cpp		\
   tests/utils.cpp				\
-  tests/zookeeper_url_tests.cpp
+  tests/values_tests.cpp			\
+  tests/zookeeper_url_tests.cpp			\
+  tests/common/http_tests.cpp
 
 mesos_tests_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_tests_CPPFLAGS += -DSOURCE_DIR=\"$(abs_top_srcdir)\"
@@ -908,24 +1130,31 @@ if OS_LINUX
   mesos_tests_SOURCES += tests/cgroups_isolator_tests.cpp
   mesos_tests_SOURCES += tests/cgroups_tests.cpp
   mesos_tests_SOURCES += tests/fs_tests.cpp
+  mesos_tests_SOURCES += tests/perf_tests.cpp
+endif
+
+if WITH_NETWORK_ISOLATOR
+  mesos_tests_SOURCES += tests/routing_tests.cpp
+  mesos_tests_SOURCES += tests/port_mapping_tests.cpp
 endif
 
 if HAS_JAVA
-  mesos_tests_SOURCES += tests/zookeeper.cpp				\
+  mesos_tests_SOURCES += tests/group_tests.cpp				\
+			 tests/registrar_zookeeper_tests.cpp		\
+			 tests/zookeeper.cpp				\
                          tests/zookeeper_test_server.cpp		\
-                         tests/zookeeper_tests.cpp			\
-                         tests/group_tests.cpp				\
-                         tests/allocator_zookeeper_tests.cpp
+                         tests/zookeeper_tests.cpp
+
   mesos_tests_CPPFLAGS += $(JAVA_CPPFLAGS)
   mesos_tests_CPPFLAGS += -DZOOKEEPER_VERSION=\"$(ZOOKEEPER_VERSION)\"
-  mesos_tests_LDFLAGS = $(JAVA_LDFLAGS) $(AM_LDFLAGS)
+  mesos_tests_LDFLAGS = $(AM_LDFLAGS)
   mesos_tests_DEPENDENCIES += $(EXAMPLES_JAR)
 
-  EXAMPLESSCRIPTSJAVA = examples/java/test-framework			\
-			examples/java/test-executor			\
-			examples/java/test-exception-framework		\
-			examples/java/test-multiple-executors-framework \
-			examples/java/test-log
+  EXAMPLESCRIPTSJAVA = examples/java/test-framework			\
+                       examples/java/test-executor			\
+                       examples/java/test-exception-framework		\
+                       examples/java/test-multiple-executors-framework	\
+                       examples/java/test-log
 
   check_SCRIPTS += $(EXAMPLESCRIPTSJAVA)
   mesos_tests_DEPENDENCIES += $(EXAMPLESCRIPTSJAVA)
@@ -934,7 +1163,9 @@ endif
 if HAS_PYTHON
   mesos_tests_DEPENDENCIES += $(MESOS_EGG)
 
-  EXAMPLESCRIPTSPYTHON = examples/python/test_framework.py		\
+  EXAMPLESCRIPTSPYTHON = examples/python/test_containerizer.py		\
+			 examples/python/test-containerizer		\
+			 examples/python/test_framework.py		\
 			 examples/python/test-framework			\
 			 examples/python/test_executor.py		\
 			 examples/python/test-executor
@@ -943,18 +1174,21 @@ if HAS_PYTHON
   mesos_tests_DEPENDENCIES += $(EXAMPLESCRIPTSPYTHON)
 endif
 
-EXTRA_DIST += examples/python/test_framework.py				\
-	      examples/python/test_executor.py
+EXTRA_DIST += examples/python/test_containerizer.py			\
+	      examples/python/test_executor.py				\
+	      examples/python/test_framework.py
 
 
 dist_check_SCRIPTS +=							\
   tests/balloon_framework_test.sh					\
-  tests/test_framework_test.sh						\
-  tests/no_executor_framework_test.sh					\
+  tests/low_level_scheduler_libprocess_test.sh				\
+  tests/low_level_scheduler_pthread_test.sh				\
   tests/java_exception_test.sh						\
   tests/java_framework_test.sh						\
   tests/java_log_test.sh						\
-  tests/python_framework_test.sh
+  tests/no_executor_framework_test.sh					\
+  tests/python_framework_test.sh					\
+  tests/test_framework_test.sh
 
 # We use a check-local target for now to avoid the parallel test
 # runner that ships with newer versions of autotools.

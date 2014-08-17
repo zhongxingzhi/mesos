@@ -610,6 +610,41 @@ TEST_F(CoordinatorTest, Elect)
 }
 
 
+// Verifies that a coordinator can get elected with clock paused (no
+// retry involved) for an empty log.
+TEST_F(CoordinatorTest, ElectWithClockPaused)
+{
+  Clock::pause();
+
+  const string path1 = os::getcwd() + "/.log1";
+  initializer.flags.path = path1;
+  initializer.execute();
+
+  const string path2 = os::getcwd() + "/.log2";
+  initializer.flags.path = path2;
+  initializer.execute();
+
+  Shared<Replica> replica1(new Replica(path1));
+  Shared<Replica> replica2(new Replica(path2));
+
+  set<UPID> pids;
+  pids.insert(replica1->pid());
+  pids.insert(replica2->pid());
+
+  Shared<Network> network(new Network(pids));
+
+  Coordinator coord(2, replica1, network);
+
+  {
+    Future<Option<uint64_t> > electing = coord.elect();
+    AWAIT_READY(electing);
+    EXPECT_SOME_EQ(0u, electing.get());
+  }
+
+  Clock::resume();
+}
+
+
 TEST_F(CoordinatorTest, AppendRead)
 {
   const string path1 = os::getcwd() + "/.log1";
@@ -1663,6 +1698,144 @@ TEST_F(RecoverTest, CatchupRetry)
 }
 
 
+TEST_F(RecoverTest, AutoInitialization)
+{
+  const string path1 = os::getcwd() + "/.log1";
+  const string path2 = os::getcwd() + "/.log2";
+  const string path3 = os::getcwd() + "/.log3";
+
+  Owned<Replica> replica1(new Replica(path1));
+  Owned<Replica> replica2(new Replica(path2));
+  Owned<Replica> replica3(new Replica(path3));
+
+  set<UPID> pids;
+  pids.insert(replica1->pid());
+  pids.insert(replica2->pid());
+  pids.insert(replica3->pid());
+
+  Shared<Network> network(new Network(pids));
+
+  Future<Owned<Replica> > recovering1 = recover(2, replica1, network, true);
+  Future<Owned<Replica> > recovering2 = recover(2, replica2, network, true);
+
+  // Verifies that replica1 and replica2 cannot transit into VOTING
+  // status because replica3 is still in EMPTY status. We flush the
+  // event queue before checking.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
+  EXPECT_TRUE(recovering1.isPending());
+  EXPECT_TRUE(recovering2.isPending());
+
+  Future<Owned<Replica> > recovering3 = recover(2, replica3, network, true);
+
+  AWAIT_READY(recovering1);
+  AWAIT_READY(recovering2);
+  AWAIT_READY(recovering3);
+
+  Owned<Replica> shared_ = recovering1.get();
+  Shared<Replica> shared = shared_.share();
+
+  Coordinator coord(2, shared, network);
+
+  {
+    Future<Option<uint64_t> > electing = coord.elect();
+    AWAIT_READY(electing);
+    EXPECT_SOME_EQ(0u, electing.get());
+  }
+
+  {
+    Future<Option<uint64_t> > appending = coord.append("hello world");
+    AWAIT_READY(appending);
+    EXPECT_SOME_EQ(1u, appending.get());
+  }
+
+  {
+    Future<list<Action> > actions = shared->read(1, 1);
+    AWAIT_READY(actions);
+    ASSERT_EQ(1u, actions.get().size());
+    EXPECT_EQ(1u, actions.get().front().position());
+    ASSERT_TRUE(actions.get().front().has_type());
+    ASSERT_EQ(Action::APPEND, actions.get().front().type());
+    EXPECT_EQ("hello world", actions.get().front().append().bytes());
+  }
+}
+
+
+TEST_F(RecoverTest, AutoInitializationRetry)
+{
+  const string path1 = os::getcwd() + "/.log1";
+  const string path2 = os::getcwd() + "/.log2";
+  const string path3 = os::getcwd() + "/.log3";
+
+  Owned<Replica> replica1(new Replica(path1));
+  Owned<Replica> replica2(new Replica(path2));
+  Owned<Replica> replica3(new Replica(path3));
+
+  set<UPID> pids;
+  pids.insert(replica1->pid());
+  pids.insert(replica2->pid());
+  pids.insert(replica3->pid());
+
+  Shared<Network> network(new Network(pids));
+
+  // Simulate the case where replica3 is temporarily removed.
+  DROP_MESSAGE(Eq(RecoverRequest().GetTypeName()), _, Eq(replica3->pid()));
+  DROP_MESSAGE(Eq(RecoverRequest().GetTypeName()), _, Eq(replica3->pid()));
+
+  Clock::pause();
+
+  Future<Owned<Replica> > recovering1 = recover(2, replica1, network, true);
+  Future<Owned<Replica> > recovering2 = recover(2, replica2, network, true);
+
+  // Flush the event queue.
+  Clock::settle();
+
+  EXPECT_TRUE(recovering1.isPending());
+  EXPECT_TRUE(recovering2.isPending());
+
+  Future<Owned<Replica> > recovering3 = recover(2, replica3, network, true);
+
+  // Replica1 and replica2 will retry recovery after 10 seconds.
+  Clock::advance(Seconds(10));
+  Clock::settle();
+
+  Clock::resume();
+
+  AWAIT_READY(recovering1);
+  AWAIT_READY(recovering2);
+  AWAIT_READY(recovering3);
+
+  Owned<Replica> shared_ = recovering1.get();
+  Shared<Replica> shared = shared_.share();
+
+  Coordinator coord(2, shared, network);
+
+  {
+    Future<Option<uint64_t> > electing = coord.elect();
+    AWAIT_READY(electing);
+    EXPECT_SOME_EQ(0u, electing.get());
+  }
+
+  {
+    Future<Option<uint64_t> > appending = coord.append("hello world");
+    AWAIT_READY(appending);
+    EXPECT_SOME_EQ(1u, appending.get());
+  }
+
+  {
+    Future<list<Action> > actions = shared->read(1, 1);
+    AWAIT_READY(actions);
+    ASSERT_EQ(1u, actions.get().size());
+    EXPECT_EQ(1u, actions.get().front().position());
+    ASSERT_TRUE(actions.get().front().has_type());
+    ASSERT_EQ(Action::APPEND, actions.get().front().type());
+    EXPECT_EQ("hello world", actions.get().front().append().bytes());
+  }
+}
+
+
 class LogTest : public TemporaryDirectoryTest
 {
 protected:
@@ -1772,14 +1945,14 @@ protected:
     LOG(INFO) << "Using temporary directory '" << sandbox.get() << "'";
 
     // Run the test out of the temporary directory we created.
-    ASSERT_TRUE(os::chdir(sandbox.get()))
+    ASSERT_SOME(os::chdir(sandbox.get()))
       << "Failed to chdir into '" << sandbox.get() << "'";
   }
 
   virtual void TearDown()
   {
     // Return to previous working directory and cleanup the sandbox.
-    ASSERT_TRUE(os::chdir(cwd));
+    ASSERT_SOME(os::chdir(cwd));
 
     if (sandbox.isSome()) {
       ASSERT_SOME(os::rmdir(sandbox.get()));
@@ -1823,6 +1996,44 @@ TEST_F(LogZooKeeperTest, WriteRead)
   ASSERT_SOME(position.get());
 
   Log::Reader reader(&log2);
+
+  Future<list<Log::Entry> > entries =
+    reader.read(position.get().get(), position.get().get());
+
+  AWAIT_READY(entries);
+
+  ASSERT_EQ(1u, entries.get().size());
+  EXPECT_EQ(position.get().get(), entries.get().front().position);
+  EXPECT_EQ("hello world", entries.get().front().data);
+}
+
+
+TEST_F(LogZooKeeperTest, LostZooKeeper)
+{
+  const string path = os::getcwd() + "/.log";
+  const string servers = server->connectString();
+
+  // We reply on auto-initialization to initialize the log.
+  Log log(1, path, servers, NO_TIMEOUT, "/log/", None(), true);
+
+  Log::Writer writer(&log);
+
+  Future<Option<Log::Position> > start = writer.start();
+
+  AWAIT_READY(start);
+  ASSERT_SOME(start.get());
+
+  // Shutdown ZooKeeper network.
+  server->shutdownNetwork();
+
+  // We should still be able to append as the local replica is in the
+  // base set of the ZooKeeper network.
+  Future<Option<Log::Position> > position = writer.append("hello world");
+
+  AWAIT_READY(position);
+  ASSERT_SOME(position.get());
+
+  Log::Reader reader(&log);
 
   Future<list<Log::Entry> > entries =
     reader.read(position.get().get(), position.get().get());

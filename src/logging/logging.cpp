@@ -28,6 +28,7 @@
 
 #include <stout/error.hpp>
 #include <stout/exit.hpp>
+#include <stout/glog.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
 #include <stout/stringify.hpp>
@@ -65,28 +66,17 @@ namespace logging {
 string argv0;
 
 
-// NOTE: We use RAW_LOG instead of LOG because RAW_LOG doesn't
-// allocate any memory or grab locks. And according to
-// https://code.google.com/p/google-glog/issues/detail?id=161
-// it should work in 'most' cases in signal handlers.
-void handler(int signal)
+google::LogSeverity getLogSeverity(const std::string& logging_level)
 {
-  if (signal == SIGTERM) {
-    RAW_LOG(WARNING, "Received signal SIGTERM; exiting.");
-
-    // Setup the default handler for SIGTERM so that we don't print
-    // a stack trace.
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    sigemptyset(&action.sa_mask);
-    action.sa_handler = SIG_DFL;
-    sigaction(signal, &action, NULL);
-    raise(signal);
-  } else if (signal == SIGPIPE) {
-    RAW_LOG(WARNING, "Received signal SIGPIPE; escalating to SIGABRT");
-    raise(SIGABRT);
+  if (logging_level == "INFO") {
+    return google::INFO;
+  } else if (logging_level == "WARNING") {
+    return google::WARNING;
+  } else if (logging_level == "ERROR") {
+    return google::ERROR;
   } else {
-    RAW_LOG(FATAL, "Unexpected signal in signal handler: %d", signal);
+    // TODO(bmahler): Consider an error here.
+    return google::INFO;
   }
 }
 
@@ -94,7 +84,7 @@ void handler(int signal)
 void initialize(
     const string& _argv0,
     const Flags& flags,
-    bool installFailureSignalHandler)
+    bool _installFailureSignalHandler)
 {
   static Once* initialized = new Once();
 
@@ -104,7 +94,16 @@ void initialize(
 
   argv0 = _argv0;
 
-  // Set glog's parameters through Google Flags variables.
+  if (flags.logging_level != "INFO" &&
+      flags.logging_level != "WARNING" &&
+      flags.logging_level != "ERROR") {
+    EXIT(1) << "'" << flags.logging_level << "' is not a valid logging level."
+               " Possible values for 'logging_level' flag are: "
+               " 'INFO', 'WARNING', 'ERROR'.";
+  }
+
+  FLAGS_minloglevel = getLogSeverity(flags.logging_level);
+
   if (flags.log_dir.isSome()) {
     Try<Nothing> mkdir = os::mkdir(flags.log_dir.get());
     if (mkdir.isError()) {
@@ -124,48 +123,32 @@ void initialize(
   if (flags.quiet) {
     FLAGS_stderrthreshold = 3; // FATAL.
 
-    // FLAGS_stderrthreshold is ignored when logging to stderr instead of log files.
-    // Setting the minimum log level gets around this issue.
+    // FLAGS_stderrthreshold is ignored when logging to stderr instead
+    // of log files. Setting the minimum log level gets around this issue.
     if (FLAGS_logtostderr) {
       FLAGS_minloglevel = 3; // FATAL.
     }
   } else {
-    FLAGS_stderrthreshold = 0; // INFO.
+    FLAGS_stderrthreshold = FLAGS_minloglevel;
   }
 
   FLAGS_logbufsecs = flags.logbufsecs;
 
   google::InitGoogleLogging(argv0.c_str());
+  if (flags.log_dir.isSome()) {
+    // Log this message in order to create the log file; this is because GLOG
+    // creates the log file once the first log message occurs; also recreate
+    // the file if it has been created on a previous run.
+    LOG_AT_LEVEL(FLAGS_minloglevel)
+      << google::GetLogSeverityName(FLAGS_minloglevel)
+      << " level logging started!";
+  }
 
   VLOG(1) << "Logging to " <<
     (flags.log_dir.isSome() ? flags.log_dir.get() : "STDERR");
 
-  if (installFailureSignalHandler) {
-    // Handles SIGSEGV, SIGILL, SIGFPE, SIGABRT, SIGBUS, SIGTERM
-    // by default.
-    google::InstallFailureSignalHandler();
-
-    // Set up our custom signal handlers.
-    struct sigaction action;
-    action.sa_handler = handler;
-
-    // Do not block additional signals while in the handler.
-    sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
-
-    // Set up the SIGPIPE signal handler to escalate to SIGABRT
-    // in order to have the glog handler catch it and print all
-    // of its lovely information.
-    if (sigaction(SIGPIPE, &action, NULL) < 0) {
-      PLOG(FATAL) << "Failed to set sigaction";
-    }
-
-    // We also do not want SIGTERM to dump a stacktrace, as this
-    // can imply that we crashed, when we were in fact terminated
-    // by user request.
-    if (sigaction(SIGTERM, &action, NULL) < 0) {
-      PLOG(FATAL) << "Failed to set sigaction";
-    }
+  if (_installFailureSignalHandler) {
+    installFailureSignalHandler();
   }
 
   initialized->done();

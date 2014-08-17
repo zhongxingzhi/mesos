@@ -19,8 +19,8 @@
 #ifndef __STATE_STATE_HPP__
 #define __STATE_STATE_HPP__
 
+#include <set>
 #include <string>
-#include <vector>
 
 #include <process/deferred.hpp> // TODO(benh): This is required by Clang.
 #include <process/future.hpp>
@@ -84,7 +84,7 @@ public:
 private:
   friend class State; // Creates and manages variables.
 
-  Variable(const Entry& _entry)
+  explicit Variable(const Entry& _entry)
     : entry(_entry)
   {}
 
@@ -95,7 +95,7 @@ private:
 class State
 {
 public:
-  State(Storage* _storage) : storage(_storage) {}
+  explicit State(Storage* _storage) : storage(_storage) {}
   virtual ~State() {}
 
   // Returns a variable from the state, creating a new one if one
@@ -111,7 +111,7 @@ public:
   process::Future<bool> expunge(const Variable& variable);
 
   // Returns the collection of variable names in the state.
-  process::Future<std::vector<std::string> > names();
+  process::Future<std::set<std::string> > names();
 
 private:
   // Helpers to handle future results from fetch and swap. We make
@@ -189,7 +189,7 @@ inline process::Future<bool> State::expunge(const Variable& variable)
 }
 
 
-inline process::Future<std::vector<std::string> > State::names()
+inline process::Future<std::set<std::string> > State::names()
 {
   return storage->names();
 }

@@ -179,12 +179,13 @@ public:
   process::Future<Option<int64_t> > session();
 
   // ZooKeeper events.
-  void connected(bool reconnect);
-  void reconnecting();
-  void expired();
-  void updated(const std::string& path);
-  void created(const std::string& path);
-  void deleted(const std::string& path);
+  // Note that events from previous sessions are dropped.
+  void connected(int64_t sessionId, bool reconnect);
+  void reconnecting(int64_t sessionId);
+  void expired(int64_t sessionId);
+  void updated(int64_t sessionId, const std::string& path);
+  void created(int64_t sessionId, const std::string& path);
+  void deleted(int64_t sessionId, const std::string& path);
 
 private:
   Result<Group::Membership> doJoin(
@@ -275,7 +276,7 @@ private:
 
   struct Cancel
   {
-    Cancel(const Group::Membership& _membership)
+    explicit Cancel(const Group::Membership& _membership)
       : membership(_membership) {}
     Group::Membership membership;
     process::Promise<bool> promise;
@@ -283,7 +284,7 @@ private:
 
   struct Data
   {
-    Data(const Group::Membership& _membership)
+    explicit Data(const Group::Membership& _membership)
       : membership(_membership) {}
     Group::Membership membership;
     process::Promise<std::string> promise;
@@ -291,7 +292,7 @@ private:
 
   struct Watch
   {
-    Watch(const std::set<Group::Membership>& _expected)
+    explicit Watch(const std::set<Group::Membership>& _expected)
       : expected(_expected) {}
     std::set<Group::Membership> expected;
     process::Promise<std::set<Group::Membership> > promise;

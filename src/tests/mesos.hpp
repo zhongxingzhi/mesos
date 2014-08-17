@@ -41,6 +41,8 @@
 #include <stout/try.hpp>
 #include <stout/uuid.hpp>
 
+#include "authorizer/authorizer.hpp"
+
 #include "messages/messages.hpp" // For google::protobuf::Message.
 
 #include "master/allocator.hpp"
@@ -48,11 +50,18 @@
 #include "master/hierarchical_allocator_process.hpp"
 #include "master/master.hpp"
 
-#include "slave/containerizer/containerizer.hpp"
-#include "slave/containerizer/mesos_containerizer.hpp"
 #include "slave/slave.hpp"
 
+#include "slave/containerizer/containerizer.hpp"
+
+#include "slave/containerizer/mesos/containerizer.hpp"
+
 #include "tests/cluster.hpp"
+#include "tests/utils.hpp"
+
+#ifdef MESOS_HAS_JAVA
+#include "tests/zookeeper.hpp"
+#endif // MESOS_HAS_JAVA
 
 namespace mesos {
 namespace internal {
@@ -62,7 +71,7 @@ namespace tests {
 class MockExecutor;
 
 
-class MesosTest : public ::testing::Test
+class MesosTest : public TemporaryDirectoryTest
 {
 protected:
   MesosTest(const Option<zookeeper::URL>& url = None());
@@ -76,25 +85,20 @@ protected:
   virtual slave::Flags CreateSlaveFlags();
 
   // Starts a master with the specified flags.
-  // Waits for the master to detect a leader (could be itself) before
-  // returning if 'wait' is set to true.
-  // TODO(xujyan): Return a future which becomes ready when the
-  // master detects a leader (when wait == true) and have the tests
-  // do AWAIT_READY.
   virtual Try<process::PID<master::Master> > StartMaster(
-      const Option<master::Flags>& flags = None(),
-      bool wait = true);
+      const Option<master::Flags>& flags = None());
 
   // Starts a master with the specified allocator process and flags.
-  // Waits for the master to detect a leader (could be itself) before
-  // returning if 'wait' is set to true.
-  // TODO(xujyan): Return a future which becomes ready when the
-  // master detects a leader (when wait == true) and have the tests
-  // do AWAIT_READY.
   virtual Try<process::PID<master::Master> > StartMaster(
       master::allocator::AllocatorProcess* allocator,
-      const Option<master::Flags>& flags = None(),
-      bool wait = true);
+      const Option<master::Flags>& flags = None());
+
+  // Starts a master with the specified authorizer and flags.
+  // Waits for the master to detect a leader (could be itself) before
+  // returning if 'wait' is set to true.
+  virtual Try<process::PID<master::Master> > StartMaster(
+      Authorizer* authorizer,
+      const Option<master::Flags>& flags = None());
 
   // Starts a slave with the specified flags.
   virtual Try<process::PID<slave::Slave> > StartSlave(
@@ -113,19 +117,19 @@ protected:
   // Starts a slave with the specified containerizer, detector and flags.
   virtual Try<process::PID<slave::Slave> > StartSlave(
       slave::Containerizer* containerizer,
-      process::Owned<MasterDetector> detector,
+      MasterDetector* detector,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified MasterDetector and flags.
   virtual Try<process::PID<slave::Slave> > StartSlave(
-      process::Owned<MasterDetector> detector,
+      MasterDetector* detector,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified mock executor, MasterDetector
   // and flags.
   virtual Try<process::PID<slave::Slave> > StartSlave(
       MockExecutor* executor,
-      process::Owned<MasterDetector> detector,
+      MasterDetector* detector,
       const Option<slave::Flags>& flags = None());
 
   // Stop the specified master.
@@ -184,7 +188,6 @@ private:
 
   // Set of cgroup subsystems used by the cgroups related tests.
   hashset<std::string> subsystems;
-
 };
 #else
 template<>
@@ -194,6 +197,54 @@ protected:
   virtual slave::Flags CreateSlaveFlags();
 };
 #endif // __linux__
+
+
+#ifdef MESOS_HAS_JAVA
+
+class MesosZooKeeperTest : public MesosTest
+{
+public:
+  static void SetUpTestCase()
+  {
+    // Make sure the JVM is created.
+    ZooKeeperTest::SetUpTestCase();
+
+    // Launch the ZooKeeper test server.
+    server = new ZooKeeperTestServer();
+    server->startNetwork();
+
+    Try<zookeeper::URL> parse = zookeeper::URL::parse(
+        "zk://" + server->connectString() + "/znode");
+    ASSERT_SOME(parse);
+
+    url = parse.get();
+  }
+
+  static void TearDownTestCase()
+  {
+    delete server;
+    server = NULL;
+  }
+
+protected:
+  MesosZooKeeperTest() : MesosTest(url) {}
+
+  virtual master::Flags CreateMasterFlags()
+  {
+    master::Flags flags = MesosTest::CreateMasterFlags();
+
+    // NOTE: Since we are using the replicated log with ZooKeeper
+    // (default storage in MesosTest), we need to specify the quorum.
+    flags.quorum = 1;
+
+    return flags;
+  }
+
+  static ZooKeeperTestServer* server;
+  static Option<zookeeper::URL> url;
+};
+
+#endif // MESOS_HAS_JAVA
 
 
 // Macros to get/create (default) ExecutorInfos and FrameworkInfos.
@@ -211,12 +262,6 @@ protected:
         executor; })
 
 
-#define DEFAULT_FRAMEWORK_INFO                                          \
-     ({ FrameworkInfo framework;                                        \
-        framework.set_name("default");                                  \
-        framework; })
-
-
 #define DEFAULT_CREDENTIAL                                             \
      ({ Credential credential;                                         \
         credential.set_principal("test-principal");                    \
@@ -224,12 +269,28 @@ protected:
         credential; })
 
 
+#define DEFAULT_FRAMEWORK_INFO                                          \
+     ({ FrameworkInfo framework;                                        \
+        framework.set_name("default");                                  \
+        framework.set_principal(DEFAULT_CREDENTIAL.principal());        \
+        framework; })
+
+
 #define DEFAULT_EXECUTOR_ID           \
       DEFAULT_EXECUTOR_INFO.executor_id()
 
 
+#define CREATE_COMMAND_INFO(command)                                  \
+  ({ CommandInfo commandInfo;                                         \
+     commandInfo.set_value(command);                                  \
+     commandInfo; })
+
+
+// TODO(bmahler): Refactor this to make the distinction between
+// command tasks and executor tasks clearer.
 inline TaskInfo createTask(
-    const Offer& offer,
+    const SlaveID& slaveId,
+    const Resources& resources,
     const std::string& command,
     const Option<mesos::ExecutorID>& executorId = None(),
     const std::string& name = "test-task",
@@ -238,8 +299,8 @@ inline TaskInfo createTask(
   TaskInfo task;
   task.set_name(name);
   task.mutable_task_id()->set_value(id);
-  task.mutable_slave_id()->CopyFrom(offer.slave_id());
-  task.mutable_resources()->CopyFrom(offer.resources());
+  task.mutable_slave_id()->CopyFrom(slaveId);
+  task.mutable_resources()->CopyFrom(resources);
   if (executorId.isSome()) {
     ExecutorInfo executor;
     executor.mutable_executor_id()->CopyFrom(executorId.get());
@@ -250,6 +311,18 @@ inline TaskInfo createTask(
   }
 
   return task;
+}
+
+
+inline TaskInfo createTask(
+    const Offer& offer,
+    const std::string& command,
+    const Option<mesos::ExecutorID>& executorId = None(),
+    const std::string& name = "test-task",
+    const std::string& id = UUID::random().toString())
+{
+  return createTask(
+      offer.slave_id(), offer.resources(), command, executorId, name, id);
 }
 
 
@@ -334,6 +407,18 @@ ACTION(DeclineOffers)
 }
 
 
+// Like DeclineOffers, but takes a custom filters object.
+ACTION_P(DeclineOffers, filters)
+{
+  SchedulerDriver* driver = arg0;
+  std::vector<Offer> offers = arg1;
+
+  for (size_t i = 0; i < offers.size(); i++) {
+    driver->declineOffer(offers[i].id(), filters);
+  }
+}
+
+
 // Definition of a mock Executor to be used in tests with gmock.
 class MockExecutor : public Executor
 {
@@ -395,6 +480,37 @@ public:
 };
 
 
+// Definition of a MockAuthozier that can be used in tests with gmock.
+class MockAuthorizer : public Authorizer
+{
+public:
+  MockAuthorizer()
+  {
+    using ::testing::An;
+    using ::testing::Return;
+
+    // NOTE: We use 'EXPECT_CALL' and 'WillRepeatedly' here instead of
+    // 'ON_CALL' and 'WillByDefault'. See 'TestContainerizer::SetUp()'
+    // for more details.
+    EXPECT_CALL(*this, authorize(An<const mesos::ACL::RegisterFramework&>()))
+      .WillRepeatedly(Return(true));
+
+    EXPECT_CALL(*this, authorize(An<const mesos::ACL::RunTask&>()))
+      .WillRepeatedly(Return(true));
+
+    EXPECT_CALL(*this, authorize(An<const mesos::ACL::ShutdownFramework&>()))
+      .WillRepeatedly(Return(true));
+  }
+
+  MOCK_METHOD1(
+      authorize, process::Future<bool>(const ACL::RegisterFramework& request));
+  MOCK_METHOD1(
+      authorize, process::Future<bool>(const ACL::RunTask& request));
+  MOCK_METHOD1(
+      authorize, process::Future<bool>(const ACL::ShutdownFramework& request));
+};
+
+
 template <typename T = master::allocator::AllocatorProcess>
 class MockAllocatorProcess : public master::allocator::AllocatorProcess
 {
@@ -427,11 +543,11 @@ public:
     ON_CALL(*this, slaveRemoved(_))
       .WillByDefault(InvokeSlaveRemoved(this));
 
-    ON_CALL(*this, slaveDisconnected(_))
-      .WillByDefault(InvokeSlaveDisconnected(this));
+    ON_CALL(*this, slaveDeactivated(_))
+      .WillByDefault(InvokeSlaveDeactivated(this));
 
-    ON_CALL(*this, slaveReconnected(_))
-      .WillByDefault(InvokeSlaveReconnected(this));
+    ON_CALL(*this, slaveActivated(_))
+      .WillByDefault(InvokeSlaveReactivated(this));
 
     ON_CALL(*this, updateWhitelist(_))
       .WillByDefault(InvokeUpdateWhitelist(this));
@@ -439,10 +555,7 @@ public:
     ON_CALL(*this, resourcesRequested(_, _))
       .WillByDefault(InvokeResourcesRequested(this));
 
-    ON_CALL(*this, resourcesUnused(_, _, _, _))
-      .WillByDefault(InvokeResourcesUnused(this));
-
-    ON_CALL(*this, resourcesRecovered(_, _, _))
+    ON_CALL(*this, resourcesRecovered(_, _, _, _))
       .WillByDefault(InvokeResourcesRecovered(this));
 
     ON_CALL(*this, offersRevived(_))
@@ -469,18 +582,15 @@ public:
                                 const SlaveInfo&,
                                 const hashmap<FrameworkID, Resources>&));
   MOCK_METHOD1(slaveRemoved, void(const SlaveID&));
-  MOCK_METHOD1(slaveDisconnected, void(const SlaveID&));
-  MOCK_METHOD1(slaveReconnected, void(const SlaveID&));
+  MOCK_METHOD1(slaveDeactivated, void(const SlaveID&));
+  MOCK_METHOD1(slaveActivated, void(const SlaveID&));
   MOCK_METHOD1(updateWhitelist, void(const Option<hashset<std::string> >&));
   MOCK_METHOD2(resourcesRequested, void(const FrameworkID&,
                                         const std::vector<Request>&));
-  MOCK_METHOD4(resourcesUnused, void(const FrameworkID&,
-                                     const SlaveID&,
-                                     const Resources&,
-                                     const Option<Filters>& filters));
-  MOCK_METHOD3(resourcesRecovered, void(const FrameworkID&,
+  MOCK_METHOD4(resourcesRecovered, void(const FrameworkID&,
                                         const SlaveID&,
-                                        const Resources&));
+                                        const Resources&,
+                                        const Option<Filters>& filters));
   MOCK_METHOD1(offersRevived, void(const FrameworkID&));
 
   T real;
@@ -566,20 +676,20 @@ ACTION_P(InvokeSlaveRemoved, allocator)
 }
 
 
-ACTION_P(InvokeSlaveDisconnected, allocator)
+ACTION_P(InvokeSlaveDeactivated, allocator)
 {
   process::dispatch(
       allocator->real,
-      &master::allocator::AllocatorProcess::slaveDisconnected,
+      &master::allocator::AllocatorProcess::slaveDeactivated,
       arg0);
 }
 
 
-ACTION_P(InvokeSlaveReconnected, allocator)
+ACTION_P(InvokeSlaveReactivated, allocator)
 {
   process::dispatch(
       allocator->real,
-      &master::allocator::AllocatorProcess::slaveReconnected,
+      &master::allocator::AllocatorProcess::slaveActivated,
       arg0);
 }
 
@@ -603,34 +713,6 @@ ACTION_P(InvokeResourcesRequested, allocator)
 }
 
 
-
-ACTION_P(InvokeResourcesUnused, allocator)
-{
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::resourcesUnused,
-      arg0,
-      arg1,
-      arg2,
-      arg3);
-}
-
-
-ACTION_P2(InvokeUnusedWithFilters, allocator, timeout)
-{
-  Filters filters;
-  filters.set_refuse_seconds(timeout);
-
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::resourcesUnused,
-      arg0,
-      arg1,
-      arg2,
-      filters);
-}
-
-
 ACTION_P(InvokeResourcesRecovered, allocator)
 {
   process::dispatch(
@@ -638,7 +720,23 @@ ACTION_P(InvokeResourcesRecovered, allocator)
       &master::allocator::AllocatorProcess::resourcesRecovered,
       arg0,
       arg1,
-      arg2);
+      arg2,
+      arg3);
+}
+
+
+ACTION_P2(InvokeResourcesRecoveredWithFilters, allocator, timeout)
+{
+  Filters filters;
+  filters.set_refuse_seconds(timeout);
+
+  process::dispatch(
+      allocator->real,
+      &master::allocator::AllocatorProcess::resourcesRecovered,
+      arg0,
+      arg1,
+      arg2,
+      filters);
 }
 
 
@@ -699,7 +797,8 @@ private:
 };
 
 
-inline const ::testing::Matcher<const std::vector<Offer>& > OfferEq(int cpus, int mem)
+inline
+const ::testing::Matcher<const std::vector<Offer>& > OfferEq(int cpus, int mem)
 {
   return MakeMatcher(new OfferEqMatcher(cpus, mem));
 }
@@ -737,6 +836,9 @@ ACTION_P(SendStatusUpdateFromTaskID, state)
   DropProtobufs(message, from, to)
 
 
+#define EXPECT_NO_FUTURE_PROTOBUFS(message, from, to)              \
+  ExpectNoFutureProtobufs(message, from, to)
+
 // Forward declaration.
 template <typename T>
 T _FutureProtobuf(const process::Message& message);
@@ -769,6 +871,16 @@ void DropProtobufs(T t, From from, To to)
   { google::protobuf::Message* m = &t; (void) m; }
 
   process::DropMessages(testing::Eq(t.GetTypeName()), from, to);
+}
+
+
+template <typename T, typename From, typename To>
+void ExpectNoFutureProtobufs(T t, From from, To to)
+{
+  // Help debugging by adding some "type constraints".
+  { google::protobuf::Message* m = &t; (void) m; }
+
+  process::ExpectNoFutureMessages(testing::Eq(t.GetTypeName()), from, to);
 }
 
 } // namespace tests {

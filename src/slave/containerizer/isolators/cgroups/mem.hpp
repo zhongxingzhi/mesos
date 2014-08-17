@@ -38,6 +38,9 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
+// Memory subsystem constants.
+const Bytes MIN_MEMORY = Megabytes(32);
+
 
 class CgroupsMemIsolatorProcess : public IsolatorProcess
 {
@@ -49,11 +52,11 @@ public:
   virtual process::Future<Nothing> recover(
       const std::list<state::RunState>& states);
 
-  virtual process::Future<Nothing> prepare(
+  virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
       const ExecutorInfo& executorInfo);
 
-  virtual process::Future<Option<CommandInfo> > isolate(
+  virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,
       pid_t pid);
 
@@ -71,9 +74,14 @@ public:
       const ContainerID& containerId);
 
 private:
-  CgroupsMemIsolatorProcess(const Flags& flags, const std::string& hierarchy);
+  CgroupsMemIsolatorProcess(
+      const Flags& flags,
+      const std::string& hierarchy,
+      bool limitSwap);
 
-  virtual process::Future<Nothing> _cleanup(const ContainerID& containerId);
+  virtual process::Future<Nothing> _cleanup(
+      const ContainerID& containerId,
+      const process::Future<Nothing>& future);
 
   struct Info
   {
@@ -87,7 +95,7 @@ private:
     process::Promise<Limitation> limitation;
 
     // Used to cancel the OOM listening.
-    process::Future<uint64_t> oomNotifier;
+    process::Future<Nothing> oomNotifier;
   };
 
   // Start listening on OOM events. This function will create an
@@ -98,7 +106,7 @@ private:
   // result.
   void oomWaited(
       const ContainerID& containerId,
-      const process::Future<uint64_t>& future);
+      const process::Future<Nothing>& future);
 
   // This function is invoked when the OOM event happens.
   void oom(const ContainerID& containerId);
@@ -108,6 +116,9 @@ private:
   // The path to the cgroups subsystem hierarchy root.
   const std::string hierarchy;
 
+  const bool limitSwap;
+
+  // TODO(bmahler): Use Owned<Info>.
   hashmap<ContainerID, Info*> infos;
 };
 

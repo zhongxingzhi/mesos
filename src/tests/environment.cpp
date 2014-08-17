@@ -25,6 +25,8 @@
 #include <list>
 #include <string>
 
+#include "docker/docker.hpp"
+
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
 
@@ -38,10 +40,18 @@
 #include "linux/cgroups.hpp"
 #endif
 
+#ifdef WITH_NETWORK_ISOLATOR
+#include "linux/routing/utils.hpp"
+#endif
+
 #include "logging/logging.hpp"
 
 #include "tests/environment.hpp"
 #include "tests/flags.hpp"
+
+#ifdef WITH_NETWORK_ISOLATOR
+using namespace routing;
+#endif
 
 using std::list;
 using std::string;
@@ -62,6 +72,7 @@ Environment* environment;
 //   'CGROUPS_' : Disable test if cgroups support isn't present.
 //   'NOHIERARCHY_' : Disable test if there is already a cgroups
 //       hierarchy mounted.
+//   'DOCKER_': Disable test if Docker is not supported.
 //
 // These flags can be composed in any order, but must come after
 // 'DISABLED_'. In addition, we disable tests that attempt to use the
@@ -76,13 +87,22 @@ static bool enable(const ::testing::TestInfo& test)
   names.push_back(test.test_case_name());
   names.push_back(test.name());
 
+  Result<string> user = os::user();
+  CHECK_SOME(user);
+
   foreach (const string& name, names) {
-    if (strings::contains(name, "ROOT_") && os::user() != "root") {
+    if (strings::contains(name, "ROOT_") && user.get() != "root") {
       return false;
     }
 
-    if (strings::contains(name, "CGROUPS_") && !os::exists("/proc/cgroups")) {
+    if (strings::contains(name, "CGROUPS_")) {
+#ifdef __linux__
+      if (!cgroups::enabled()) {
+        return false;
+      }
+#else
       return false;
+#endif
     }
 
 #ifdef __linux__
@@ -105,20 +125,71 @@ static bool enable(const ::testing::TestInfo& test)
 
     // On Linux non-privileged users are limited to 64k of locked memory so we
     // cannot run the MemIsolatorTest.Usage.
-    if (strings::contains(name, "MemIsolatorTest") && os::user() != "root") {
+    if (strings::contains(name, "MemIsolatorTest") && user.get() != "root") {
       return false;
     }
 #endif
+
+    // Filter out benchmark tests when we run 'make check'.
+    if (strings::contains(name, "BENCHMARK_") && !flags.benchmark) {
+      return false;
+    }
+
+    if (strings::contains(name, "DOCKER_")) {
+#ifdef __linux__
+      Try<Docker> docker = Docker::create(flags.docker);
+      if (docker.isError()) {
+        std::cerr
+          << "-------------------------------------------------------------\n"
+          << "Skipping Docker tests because validation failed\n"
+          << "[Error] " + docker.error() + "\n"
+          << "-------------------------------------------------------------"
+          << std::endl;
+
+        return false;
+      }
+#else
+      return false;
+#endif // __linux__
+    }
+  }
+
+  // Filter out regular tests when we run 'make bench', which
+  // requires us to check both the test case name and the test name
+  // at the same time.
+  if (flags.benchmark &&
+      !strings::contains(test.test_case_name(), "BENCHMARK_") &&
+      !strings::contains(test.name(), "BENCHMARK_")) {
+    return false;
   }
 
   // Now check the type parameter.
   if (test.type_param() != NULL) {
     const string& type = test.type_param();
-    if (strings::contains(type, "Cgroups") &&
-        (os::user() != "root" || !os::exists("/proc/cgroups"))) {
+    if (strings::contains(type, "Cgroups")) {
+#ifdef __linux__
+      if (user.get() != "root" || !cgroups::enabled()) {
+        return false;
+      }
+#else
       return false;
+#endif
     }
   }
+
+#ifdef WITH_NETWORK_ISOLATOR
+  // We can not run network isolator.
+  if (routing::check().isError() &&
+      (strings::contains(test.name(), "PortMappingIsolatorTest") ||
+       strings::contains(test.name(), "PortMappingMesosTest"))) {
+      return false;
+  }
+
+  // Currently, the network isolator does not support multiple slaves.
+  if (strings::contains(test.name(), "MultipleSlaves")) {
+    return false;
+  }
+#endif
 
   return true;
 }
@@ -130,7 +201,7 @@ static bool enable(const ::testing::TestInfo& test)
 // should not effect any other filters that have been put in place
 // either on the command line or via an environment variable.
 // N.B. This MUST be done _before_ invoking RUN_ALL_TESTS.
-Environment::Environment()
+Environment::Environment(const Flags& _flags) : flags(_flags)
 {
   // First we split the current filter into enabled and disabled tests
   // (which are separated by a '-').
@@ -238,6 +309,8 @@ void Environment::TearDown()
   directories.clear();
 
   // Make sure we haven't left any child processes lying around.
+  // TODO(benh): Look for processes in the same group or session that
+  // might have been reparented.
   Try<os::ProcessTree> pstree = os::pstree(0);
 
   if (pstree.isSome() && !pstree.get().children.empty()) {
@@ -284,4 +357,3 @@ Try<string> Environment::mkdtemp()
 } // namespace tests {
 } // namespace internal {
 } // namespace mesos {
-

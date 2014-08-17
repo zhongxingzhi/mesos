@@ -11,11 +11,13 @@
 #include <cstdlib> // For rand.
 #include <list>
 #include <set>
+#include <sstream>
 #include <string>
 
 #include <stout/duration.hpp>
 #include <stout/foreach.hpp>
 #include <stout/gtest.hpp>
+#include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
 #include <stout/numify.hpp>
 #include <stout/os.hpp>
@@ -28,6 +30,8 @@
 #include <stout/os/sysctl.hpp>
 #endif
 
+#include <stout/tests/utils.hpp>
+
 using os::Exec;
 using os::Fork;
 using os::Process;
@@ -36,40 +40,52 @@ using os::ProcessTree;
 using std::list;
 using std::set;
 using std::string;
+using std::vector;
 
 
 static hashset<string> listfiles(const string& directory)
 {
   hashset<string> fileset;
-  foreach (const string& file, os::ls(directory)) {
-    fileset.insert(file);
+  Try<std::list<std::string> > entries = os::ls(directory);
+  if (entries.isSome()) {
+    foreach (const string& entry, entries.get()) {
+      fileset.insert(entry);
+    }
   }
   return fileset;
 }
 
 
-class OsTest : public ::testing::Test
+class OsTest : public TemporaryDirectoryTest {};
+
+
+TEST_F(OsTest, environment)
 {
-protected:
-  virtual void SetUp()
-  {
-    const Try<string>& mkdtemp = os::mkdtemp();
-    ASSERT_SOME(mkdtemp);
-    tmpdir = mkdtemp.get();
-  }
+  // Make sure the environment has some entries with '=' in the value.
+  os::setenv("SOME_SPECIAL_FLAG", "--flag=foobar");
 
-  virtual void TearDown()
-  {
-    ASSERT_SOME(os::rmdir(tmpdir));
-  }
+  char** environ = os::environ();
 
-  string tmpdir;
-};
+  hashmap<string, string> environment = os::environment();
+
+  for (size_t index = 0; environ[index] != NULL; index++) {
+    std::string entry(environ[index]);
+    size_t position = entry.find_first_of('=');
+    if (position == std::string::npos) {
+      continue; // Skip malformed environment entries.
+    }
+    const string& key = entry.substr(0, position);
+    const string& value = entry.substr(position + 1);
+    EXPECT_TRUE(environment.contains(key));
+    EXPECT_EQ(value, environment[key]);
+  }
+}
 
 
 TEST_F(OsTest, rmdir)
 {
   const hashset<string> EMPTY;
+  const string& tmpdir = os::getcwd();
 
   hashset<string> expectedListing = EMPTY;
   EXPECT_EQ(expectedListing, listfiles(tmpdir));
@@ -104,6 +120,19 @@ TEST_F(OsTest, rmdir)
 }
 
 
+TEST_F(OsTest, system)
+{
+  EXPECT_EQ(0, os::system("exit 0"));
+  EXPECT_EQ(0, os::system("sleep 0"));
+  EXPECT_NE(0, os::system("exit 1"));
+  EXPECT_NE(0, os::system("invalid.command"));
+
+  // Note that ::system returns 0 for the following two cases as well.
+  EXPECT_EQ(0, os::system(""));
+  EXPECT_EQ(0, os::system(" "));
+}
+
+
 TEST_F(OsTest, nonblock)
 {
   int pipes[2];
@@ -131,7 +160,7 @@ TEST_F(OsTest, nonblock)
 
 TEST_F(OsTest, touch)
 {
-  const string& testfile  = tmpdir + "/" + UUID::random().toString();
+  const string& testfile  = path::join(os::getcwd(), UUID::random().toString());
 
   ASSERT_SOME(os::touch(testfile));
   ASSERT_TRUE(os::exists(testfile));
@@ -140,7 +169,7 @@ TEST_F(OsTest, touch)
 
 TEST_F(OsTest, readWriteString)
 {
-  const string& testfile  = tmpdir + "/" + UUID::random().toString();
+  const string& testfile  = path::join(os::getcwd(), UUID::random().toString());
   const string& teststr = "line1\nline2";
 
   ASSERT_SOME(os::write(testfile, teststr));
@@ -154,7 +183,7 @@ TEST_F(OsTest, readWriteString)
 
 TEST_F(OsTest, find)
 {
-  const string& testdir = tmpdir + "/" + UUID::random().toString();
+  const string& testdir = path::join(os::getcwd(), UUID::random().toString());
   const string& subdir = testdir + "/test1";
   ASSERT_SOME(os::mkdir(subdir)); // Create the directories.
 
@@ -278,7 +307,7 @@ TEST_F(OsTest, sysctl)
   ASSERT_SOME(maxproc);
 
   // Table test.
-  Try<std::vector<kinfo_proc> > processes =
+  Try<vector<kinfo_proc> > processes =
     os::sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL).table(maxproc.get());
 
   ASSERT_SOME(processes);
@@ -611,4 +640,89 @@ TEST_F(OsTest, pstree)
 
   // We have to reap the child for running the tests in repetition.
   ASSERT_EQ(child, waitpid(child, NULL, 0));
+}
+
+
+TEST_F(OsTest, ProcessExists)
+{
+  // Check we exist.
+  EXPECT_TRUE(os::exists(::getpid()));
+
+  // Check init/launchd/systemd exists.
+  // NOTE: This should return true even if we don't have permission to signal
+  // the pid.
+  EXPECT_TRUE(os::exists(1));
+
+  // Check existence of a child process through its lifecycle: running,
+  // zombied, reaped.
+  pid_t pid = ::fork();
+  ASSERT_NE(-1, pid);
+
+  if (pid == 0) {
+    // In child process.
+    while (true) { sleep(1); }
+
+    ABORT("Child should not reach this statement");
+  }
+
+  // In parent.
+  EXPECT_TRUE(os::exists(pid));
+
+  ASSERT_EQ(0, kill(pid, SIGKILL));
+
+  // Wait until the process is a zombie.
+  Duration elapsed = Duration::zero();
+  while (true) {
+    Result<os::Process> process = os::process(pid);
+    ASSERT_SOME(process);
+
+    if (process.get().zombie) {
+      break;
+    }
+
+    ASSERT_LT(elapsed, Milliseconds(100));
+
+    os::sleep(Milliseconds(5));
+    elapsed += Milliseconds(5);
+  };
+
+  // The process should still 'exist', even if it's a zombie.
+  EXPECT_TRUE(os::exists(pid));
+
+  // Reap the zombie and confirm the process no longer exists.
+  int status;
+
+  EXPECT_EQ(pid, ::waitpid(pid, &status, 0));
+  EXPECT_TRUE(WIFSIGNALED(status));
+  EXPECT_EQ(SIGKILL, WTERMSIG(status));
+
+  EXPECT_FALSE(os::exists(pid));
+}
+
+
+TEST_F(OsTest, user)
+{
+  std::ostringstream user_;
+  EXPECT_SOME_EQ(0, os::shell(&user_ , "id -un"));
+
+  Result<string> user = os::user();
+  ASSERT_SOME_EQ(strings::trim(user_.str()), user);
+
+  std::ostringstream uid_;
+  EXPECT_SOME_EQ(0, os::shell(&uid_, "id -u"));
+  Try<uid_t> uid = numify<uid_t>(strings::trim(uid_.str()));
+  ASSERT_SOME(uid);
+  EXPECT_SOME_EQ(uid.get(), os::getuid(user.get()));
+
+  std::ostringstream gid_;
+  EXPECT_SOME_EQ(0, os::shell(&gid_, "id -g"));
+  Try<gid_t> gid = numify<gid_t>(strings::trim(gid_.str()));
+  ASSERT_SOME(gid);
+  EXPECT_SOME_EQ(gid.get(), os::getgid(user.get()));
+
+  EXPECT_NONE(os::getuid(UUID::random().toString()));
+  EXPECT_NONE(os::getgid(UUID::random().toString()));
+
+  EXPECT_SOME(os::su(user.get()));
+  EXPECT_ERROR(os::su(UUID::random().toString()));
 }

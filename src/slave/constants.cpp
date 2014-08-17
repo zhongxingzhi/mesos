@@ -18,6 +18,8 @@
 
 #include <stdint.h>
 
+#include "master/constants.hpp"
+
 #include "slave/constants.hpp"
 
 namespace mesos {
@@ -27,8 +29,11 @@ namespace slave {
 const Duration EXECUTOR_REGISTRATION_TIMEOUT = Minutes(1);
 const Duration EXECUTOR_SHUTDOWN_GRACE_PERIOD = Seconds(5);
 const Duration EXECUTOR_REREGISTER_TIMEOUT = Seconds(2);
+const Duration EXECUTOR_SIGNAL_ESCALATION_TIMEOUT = Seconds(3);
 const Duration STATUS_UPDATE_RETRY_INTERVAL_MIN = Seconds(10);
 const Duration STATUS_UPDATE_RETRY_INTERVAL_MAX = Minutes(10);
+const Duration REGISTRATION_BACKOFF_FACTOR = Seconds(1);
+const Duration REGISTER_RETRY_INTERVAL_MAX = Minutes(1);
 const Duration GC_DELAY = Weeks(1);
 const double GC_DISK_HEADROOM = 0.1;
 const Duration DISK_WATCH_INTERVAL = Minutes(1);
@@ -41,6 +46,14 @@ const double DEFAULT_CPUS = 1;
 const Bytes DEFAULT_MEM = Gigabytes(1);
 const Bytes DEFAULT_DISK = Gigabytes(10);
 const std::string DEFAULT_PORTS = "[31000-32000]";
+#ifdef WITH_NETWORK_ISOLATOR
+const uint16_t DEFAULT_EPHEMERAL_PORTS_PER_CONTAINER = 1024;
+#endif
+
+Duration MASTER_PING_TIMEOUT()
+{
+  return master::SLAVE_PING_TIMEOUT * master::MAX_SLAVE_PING_TIMEOUTS;
+}
 
 } // namespace slave {
 } // namespace internal {

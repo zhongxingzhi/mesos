@@ -31,6 +31,9 @@ using namespace mesos;
 
 using std::string;
 
+const char FILE_URI_PREFIX[] = "file://";
+const char FILE_URI_LOCALHOST[] = "file://localhost";
+
 // Try to extract filename into directory. If filename is recognized as an
 // archive it will be extracted and true returned; if not recognized then false
 // will be returned. An Error is returned if the extraction command fails.
@@ -82,11 +85,14 @@ Try<string> fetch(
     return Error("Illegal characters in URI");
   }
 
-  // Grab the resource from HDFS if its path begins with hdfs:// or
-  // hftp:
+  // Grab the resource using the hadoop client if it's one of the known schemes
+  // TODO(tarnfeld): This isn't very scalable with hadoop's pluggable
+  // filesystem implementations.
   // TODO(matei): Enforce some size limits on files we get from HDFS
   if (strings::startsWith(uri, "hdfs://") ||
-      strings::startsWith(uri, "hftp://")) {
+      strings::startsWith(uri, "hftp://") ||
+      strings::startsWith(uri, "s3://") ||
+      strings::startsWith(uri, "s3n://")) {
     Try<string> base = os::basename(uri);
     if (base.isError()) {
       LOG(ERROR) << "Invalid basename for URI: " << base.error();
@@ -131,6 +137,19 @@ Try<string> fetch(
     return path;
   } else { // Copy the local resource.
     string local = uri;
+    bool fileUri = false;
+    if (strings::startsWith(local, string(FILE_URI_LOCALHOST))) {
+      local = local.substr(sizeof(FILE_URI_LOCALHOST) - 1);
+      fileUri = true;
+    } else if (strings::startsWith(local, string(FILE_URI_PREFIX))) {
+      local = local.substr(sizeof(FILE_URI_PREFIX) - 1);
+      fileUri = true;
+    }
+
+    if(fileUri && !strings::startsWith(local, "/")) {
+      return Error("File URI only supports absolute paths");
+    }
+
     if (local.find_first_of("/") != 0) {
       // We got a non-Hadoop and non-absolute path.
       if (os::hasenv("MESOS_FRAMEWORKS_HOME")) {
@@ -180,14 +199,19 @@ int main(int argc, char* argv[])
   // Construct URIs from the encoded environment string.
   const std::string& uris = os::getenv("MESOS_EXECUTOR_URIS");
   foreach (const std::string& token, strings::tokenize(uris, " ")) {
-    // Delimiter between URI and execute permission.
+    // Delimiter between URI, execute permission and extract options
+    // Expected format: {URI}+[01][XN]
+    //  {URI} - The actual URI for the asset to fetch
+    //  [01]  - 1 if the execute permission should be set else 0
+    //  [XN]  - X if we should extract the URI (if it's compressed) else N
     size_t pos = token.rfind("+");
     CHECK(pos != std::string::npos)
       << "Invalid executor uri token in env " << token;
 
     CommandInfo::URI uri;
     uri.set_value(token.substr(0, pos));
-    uri.set_executable(token.substr(pos + 1) == "1");
+    uri.set_executable(token.substr(pos + 1, 1) == "1");
+    uri.set_extract(token.substr(pos + 2, 1) == "X");
 
     commandInfo.add_uris()->MergeFrom(uri);
   }
@@ -214,12 +238,12 @@ int main(int argc, char* argv[])
     // Chmod the fetched URI if it's executable, else assume it's an archive
     // that should be extracted.
     if (uri.executable()) {
-      bool chmodded = os::chmod(
+      Try<Nothing> chmod = os::chmod(
           fetched.get(), S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-      if (!chmodded) {
-        EXIT(1) << "Failed to chmod: " << fetched.get();
+      if (chmod.isError()) {
+        EXIT(1) << "Failed to chmod " << fetched.get() << ": " << chmod.error();
       }
-    } else {
+    } else if (uri.extract()) {
       //TODO(idownes): Consider removing the archive once extracted.
       // Try to extract the file if it's recognized as an archive.
       Try<bool> extracted = extract(fetched.get(), directory);
@@ -227,6 +251,8 @@ int main(int argc, char* argv[])
         EXIT(1) << "Failed to extract "
                 << fetched.get() << ":" << extracted.error();
       }
+    } else {
+      LOG(INFO) << "Skipped extracting path '" << fetched.get() << "'";
     }
 
     // Recursively chown the directory if a user is provided.

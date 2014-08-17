@@ -5,7 +5,10 @@ ACLOCAL_AMFLAGS = -I m4
 
 AUTOMAKE_OPTIONS = foreign
 
-SUBDIRS = 3rdparty .
+# NOTE: The libprocess headers were moved to the Makefile in "include"
+# subdirectory to make it easy to preserve the directory structure of
+# the header files during installation.
+SUBDIRS = 3rdparty . include
 
 include 3rdparty/versions.am
 
@@ -15,7 +18,6 @@ GLOG = 3rdparty/glog-$(GLOG_VERSION)
 GMOCK = 3rdparty/gmock-$(GMOCK_VERSION)
 GPERFTOOLS = 3rdparty/gperftools-$(GPERFTOOLS_VERSION)
 GTEST = $(GMOCK)/gtest
-RY_HTTP_PARSER = 3rdparty/ry-http-parser-$(RY_HTTP_PARSER_VERSION)
 LIBEV = 3rdparty/libev-$(LIBEV_VERSION)
 PICOJSON = 3rdparty/picojson-$(PICOJSON_VERSION)
 
@@ -34,76 +36,53 @@ libprocess_la_SOURCES =		\
   src/gate.hpp			\
   src/http.cpp			\
   src/latch.cpp			\
+  src/metrics/metrics.cpp	\
   src/pid.cpp			\
   src/process.cpp		\
   src/reap.cpp			\
-  src/statistics.cpp		\
-  src/synchronized.hpp
+  src/subprocess.cpp		\
+  src/synchronized.hpp		\
+  src/timeseries.cpp
 
 libprocess_la_CPPFLAGS =		\
   -I$(srcdir)/include			\
   -I$(srcdir)/$(STOUT)/include		\
   -I$(BOOST)				\
-  -I$(GLOG)/src				\
-  -I$(RY_HTTP_PARSER)			\
   -I$(LIBEV)				\
   -I$(PICOJSON)				\
   $(AM_CPPFLAGS)
 
+if WITH_BUNDLED_GLOG
+  libprocess_la_CPPFLAGS += -I$(GLOG)/src
+  LIBGLOG = $(GLOG)/libglog.la
+else
+  LIBGLOG = -lglog
+endif
+
+if WITH_BUNDLED_HTTP_PARSER
+  RY_HTTP_PARSER = 3rdparty/ry-http-parser-$(RY_HTTP_PARSER_VERSION)
+  libprocess_la_CPPFLAGS += -I$(RY_HTTP_PARSER)
+
+  HTTP_PARSER_LIB = 3rdparty/libry_http_parser.la
+else
+  HTTP_PARSER_LIB = -lhttp_parser
+endif
+
+if WITH_BUNDLED_LIBEV
+  LIBEV_LIB = $(LIBEV)/libev.la
+else
+  LIBEV_LIB = -lev
+endif
+
 libprocess_la_LIBADD =			\
-  $(GLOG)/libglog.la			\
-  3rdparty/libry_http_parser.la	\
-  $(LIBEV)/libev.la
+  $(LIBGLOG)				\
+  $(HTTP_PARSER_LIB)			\
+  $(LIBEV_LIB)
 
 if HAS_GPERFTOOLS
 libprocess_la_CPPFLAGS += -I$(GPERFTOOLS)/src
 libprocess_la_LIBADD += $(GPERFTOOLS)/libprofiler.la
 endif
-
-# Headers.
-libprocess_la_SOURCES +=					\
-  $(top_srcdir)/include/process/async.hpp			\
-  $(top_srcdir)/include/process/check.hpp			\
-  $(top_srcdir)/include/process/clock.hpp			\
-  $(top_srcdir)/include/process/collect.hpp			\
-  $(top_srcdir)/include/process/defer.hpp			\
-  $(top_srcdir)/include/process/deferred.hpp			\
-  $(top_srcdir)/include/process/delay.hpp			\
-  $(top_srcdir)/include/process/dispatch.hpp			\
-  $(top_srcdir)/include/process/event.hpp			\
-  $(top_srcdir)/include/process/executor.hpp			\
-  $(top_srcdir)/include/process/filter.hpp			\
-  $(top_srcdir)/include/process/future.hpp			\
-  $(top_srcdir)/include/process/gc.hpp				\
-  $(top_srcdir)/include/process/gmock.hpp			\
-  $(top_srcdir)/include/process/gtest.hpp			\
-  $(top_srcdir)/include/process/help.hpp			\
-  $(top_srcdir)/include/process/http.hpp			\
-  $(top_srcdir)/include/process/id.hpp				\
-  $(top_srcdir)/include/process/io.hpp				\
-  $(top_srcdir)/include/process/latch.hpp			\
-  $(top_srcdir)/include/process/limiter.hpp			\
-  $(top_srcdir)/include/process/logging.hpp			\
-  $(top_srcdir)/include/process/message.hpp			\
-  $(top_srcdir)/include/process/mime.hpp			\
-  $(top_srcdir)/include/process/once.hpp			\
-  $(top_srcdir)/include/process/owned.hpp			\
-  $(top_srcdir)/include/process/pid.hpp				\
-  $(top_srcdir)/include/process/process.hpp			\
-  $(top_srcdir)/include/process/profiler.hpp			\
-  $(top_srcdir)/include/process/protobuf.hpp			\
-  $(top_srcdir)/include/process/reap.hpp			\
-  $(top_srcdir)/include/process/run.hpp				\
-  $(top_srcdir)/include/process/sequence.hpp			\
-  $(top_srcdir)/include/process/shared.hpp			\
-  $(top_srcdir)/include/process/socket.hpp			\
-  $(top_srcdir)/include/process/statistics.hpp			\
-  $(top_srcdir)/include/process/system.hpp			\
-  $(top_srcdir)/include/process/subprocess.hpp			\
-  $(top_srcdir)/include/process/time.hpp			\
-  $(top_srcdir)/include/process/timeout.hpp			\
-  $(top_srcdir)/include/process/timer.hpp			\
-  $(top_srcdir)/include/process/timeseries.hpp
 
 # Tests.
 check_PROGRAMS = tests
@@ -114,13 +93,17 @@ tests_SOURCES =							\
   src/tests/http_tests.cpp					\
   src/tests/io_tests.cpp					\
   src/tests/main.cpp						\
+  src/tests/mutex_tests.cpp					\
+  src/tests/metrics_tests.cpp					\
   src/tests/owned_tests.cpp					\
   src/tests/process_tests.cpp					\
+  src/tests/queue_tests.cpp					\
   src/tests/reap_tests.cpp					\
   src/tests/sequence_tests.cpp					\
   src/tests/shared_tests.cpp					\
   src/tests/statistics_tests.cpp				\
   src/tests/subprocess_tests.cpp				\
+  src/tests/system_tests.cpp					\
   src/tests/timeseries_tests.cpp				\
   src/tests/time_tests.cpp
 
@@ -130,7 +113,12 @@ tests_CPPFLAGS =			\
   -I$(GMOCK)/include			\
   $(libprocess_la_CPPFLAGS)
 
-tests_LDADD = 3rdparty/libgmock.la libprocess.la
+tests_LDADD =				\
+  3rdparty/libgmock.la			\
+  libprocess.la				\
+  $(LIBGLOG)				\
+  $(HTTP_PARSER_LIB)			\
+  $(LIBEV_LIB)
 
 # We use a check-local target for now to avoid the parallel test
 # runner that ships with newer versions of autotools.

@@ -1,3 +1,411 @@
+Release Notes - Mesos - Version 0.20.0
+--------------------------------------
+
+This release includes a lot of new cool features. The major new features are
+listed below:
+
+* Docker support in Mesos.
+  * Users now can launch executors/tasks within Docker containers.
+  * Mesos now supports running multiple containerizers simultaneously. The slave
+    can dynamically choose a containerizer to launch containers based on the
+    configuration of executors/tasks.
+
+* Container level network monitoring for mesos containerizer.
+  * Network statistics for each active container can be retrieved through the
+    /monitor/statistics.json endpoint on the slave.
+  * Completely transparent to the tasks running on the slave. No need to change
+    the service discovery mechanism for tasks.
+
+* Framework authorization.
+  * Allows frameworks to (re-)register with authorized roles.
+  * Allows frameworks to launch tasks/executors as authorized users.
+  * Allows authorized principals to shutdown framework(s) through HTTP endpoint.
+
+* Framework rate limiting.
+  * In a multi-framework environment, this feature aims to protect the
+    throughput of high-SLA (e.g., production, service) frameworks by having the
+    master throttle messages from other (e.g., development, batch) frameworks.
+
+* Enable building against installed third-party dependencies.
+
+This release also includes several bug fixes and stability improvements.
+
+
+** Sub-task
+    * [MESOS-1292] - [MESOS-1259]:Enrich the Java Docs in the src/java files. -- ZooKeeperState.java
+    * [MESOS-1293] - [MESOS-1259]:Enrich the Java Docs in the src/java files. -- Variable.java
+    * [MESOS-1294] - [MESOS-1259]:Enrich the Java Docs in the src/java files. -- State.java
+
+** Bug
+    * [MESOS-445] - Scheduler driver destructor waits forever
+    * [MESOS-473] - Freezer fails fatally when it is unable to write 'FROZEN' to freezer.state
+    * [MESOS-759] - The cgroups TaskKiller should skip freezing the cgroup if it is already empty.
+    * [MESOS-856] - TasksKiller may run forever because the cgroup cannot be frozen.
+    * [MESOS-878] - Slave should not register with the master when in TERMINATING.
+    * [MESOS-1001] - registrar doesn't build on Linux/Clang
+    * [MESOS-1119] - Allocator should make an allocation decision per slave instead of per framework/role.
+    * [MESOS-1149] - SlaveRecovery.Reboot test doesn't reap executor
+    * [MESOS-1170] - Update system check (glog)
+    * [MESOS-1171] - Update system check (gmock)
+    * [MESOS-1172] - Update system check (libev)
+    * [MESOS-1173] - Update system check (picojson)
+    * [MESOS-1174] - Update system check (protobuf)
+    * [MESOS-1178] - Only enable the oom killer if it's not enabled
+    * [MESOS-1337] - AllocatorZooKeeperTest/0.FrameworkReregistersFirst runs forever
+    * [MESOS-1341] - AllocatorZooKeeperTest/0.FrameworkReregistersFirst is flaky
+    * [MESOS-1348] - The SlaveRecoveryTest.GCExecutor test leaks child processes.
+    * [MESOS-1354] - Resource leak in jvm.cpp
+    * [MESOS-1404] - Glibc 'fork()' is not async signal safe
+    * [MESOS-1417] - Slave should not send terminal status update before containerizer update is finished
+    * [MESOS-1422] - AllocatorTest/0.SchedulerFailover test is flaky
+    * [MESOS-1428] - Failed to update 'registry': Failed to perform store within 5secs (caused flaky MasterTest.StatusUpdateAcknowledgementsThroughMaster)
+    * [MESOS-1435] - RegistrarZooKeeperTest.TaskRunning is flaky, sometimes runs forever.
+    * [MESOS-1436] - AllocatorZooKeeperTest/0.SlaveReregistersFirst flaky and can run forever
+    * [MESOS-1437] - SlaveRecoveryTest/0.RestartBeforeContainerizerLaunch is flaky
+    * [MESOS-1439] - SchedulerTest.MetricsEndpoint is flaky
+    * [MESOS-1454] - Command executor should have nonzero resources
+    * [MESOS-1467] - commit msg was changed after run ./support/post-reviews.py
+    * [MESOS-1477] - Deadlock when terminating ZooKeeperProcess
+    * [MESOS-1479] - Cgroups cpu isolator should only report cfs stats if cfs is enabled
+    * [MESOS-1492] - Add support for optionally throttling the frameworks not specified in RateLimits config
+    * [MESOS-1504] - mesos.pb.h header include is problematic.
+    * [MESOS-1513] - FaultToleranceTest.SlaveReregisterTerminatedExecutor is flaky
+    * [MESOS-1526] - Regression in 'make distclean': files left around.
+    * [MESOS-1529] - Handle a network partition between Master and Slave
+    * [MESOS-1532] - AllocatorZooKeeperTest/0.SlaveReregistersFirst and AllocatorZooKeeperTest/0.FrameworkReregistersFirst are flaky
+    * [MESOS-1533] - HealthCheck tests are flaky
+    * [MESOS-1536] - AllocatorZooKeeperTest/0.FrameworkReregistersFirst
+    * [MESOS-1540] - Fix a typo in src/Makefile.am to include java test cases
+    * [MESOS-1543] - MasterTest.OrphanTasks is flaky
+    * [MESOS-1544] - DRFAllocatorTest.SameShareAllocations is flaky
+    * [MESOS-1549] - The configure script should check for libnl headers as well
+    * [MESOS-1555] - ExecutorInfo validity check is broken in Master
+    * [MESOS-1578] - Improve framework rate limiting by imposing the max number of outstanding messages per framework principal
+    * [MESOS-1604] - LowLevelSchedulerLibprocess did not receive offers from Master
+    * [MESOS-1610] - Mesos containerizer should not call isolate if the child process already died.
+    * [MESOS-1617] - Linux kernel generates duplicated tc u32 filter handles
+    * [MESOS-1624] - Apache Jenkins build fails due to -lsnappy is set when building leveldb
+    * [MESOS-1627] - Installed protobuf header files include wrong path to mesos header file
+    * [MESOS-1629] - GLOG Initialized twice if the Framework Scheduler also uses GLOG
+    * [MESOS-1632] - Seg fault due to infinite recursion "<< RepeatedPtrField<Resource>"
+    * [MESOS-1633] - Create a static mesos library
+    * [MESOS-1635] - zk flag fails when specifying a file and the replicated logs
+    * [MESOS-1639] - Master OOMs when throttling traffic from LoadGeneratorFramework
+    * [MESOS-1649] - Network isolator should tolerate slave crashes while doing isolate/cleanup.
+    * [MESOS-1653] - HealthCheckTest.GracePeriod is flaky.
+    * [MESOS-1655] - ZooKeeperTest.LeaderDetectorTimeoutHandling is flaky
+    * [MESOS-1658] - Implementation of process::io::poll can lead to broken pipes.
+    * [MESOS-1670] - Build Failure on Mac OSX with undefined link
+    * [MESOS-1673] - The value of MASTER_PING_TIMEOUT is non-deterministic
+    * [MESOS-1677] - AllocatorTest.FrameworkReregistersFirst is flaky.
+    * [MESOS-1692] - Build error on gcc-4.4.
+    * [MESOS-1693] - Enable builds for ARM
+    * [MESOS-1700] - ThreadLocal does not release pthread keys or log properly.
+    * [MESOS-1704] - Mac OS X build breaks in DockerContainerizerProcess::fetch
+    * [MESOS-1705] - SubprocessTest.Status sometimes flakes out
+    * [MESOS-1710] - Compilation against master fails on make check
+
+** Documentation
+    * [MESOS-1480] - Write Documentation for Authorization
+    * [MESOS-1702] - Add document for network monitoring.
+
+** Epic
+    * [MESOS-1071] - Enable building against installed third-party dependencies.
+    * [MESOS-1228] - Container level network monitoring
+    * [MESOS-1342] - Add authorization support.
+
+** Improvement
+    * [MESOS-292] - Remove unnecessary includes of headers to improve compile times
+    * [MESOS-320] - Add instrumentation into libprocess.
+    * [MESOS-857] - restructure mesos python namespace
+    * [MESOS-921] - Consider simultaneous containerizer support
+    * [MESOS-987] - Wire up a code coverage tool
+    * [MESOS-1188] - Rename slaves/frameworks.activated/deactivated
+    * [MESOS-1236] - stout's os module uses a mix of Try<Nothing> and bool returns
+    * [MESOS-1237] - stout's os::ls should return a Try<>
+    * [MESOS-1259] - Enrich the Java Docs in the src/java files.
+    * [MESOS-1312] - Show active tasks orphaned by a framework disconnect
+    * [MESOS-1324] - Create a network isolator based on port mapping
+    * [MESOS-1339] - Add "per-framework-principal" counters for all messages from a scheduler on Master
+    * [MESOS-1379] - Provide a reconciliation mechanism for tasks unknown to the framework.
+    * [MESOS-1390] - Add an authenticated '/shutdown' endpoint for shutting down a running framework
+    * [MESOS-1446] - Create an abstraction for launching an operation in a subprocess.
+    * [MESOS-1450] - Add setns utilities to stout
+    * [MESOS-1453] - Update reconciliation semantics send statuses for each task.
+    * [MESOS-1499] - Add flags parse support for specific protobufs
+    * [MESOS-1501] - Add flags parse support for RateLimits protobuf
+    * [MESOS-1511] - Simplify 'Operation' semantics to only handle logics in the subprocess side
+    * [MESOS-1519] - Expose constructors of types used in java APIs
+    * [MESOS-1523] - ZooKeeper timeout should be longer
+    * [MESOS-1525] - Don't require slave id for reconciliation requests.
+    * [MESOS-1528] - Refactor Subprocess to support execve style launch and customized clone function
+    * [MESOS-1557] - Allow the network isolator to handle those tasks that are not isolated by the network isolator
+    * [MESOS-1559] - Allow jenkins build machine to dump stack traces of all threads when timeout
+    * [MESOS-1590] - Allow LoadGeneratorFramework to read password from a file
+    * [MESOS-1591] - Do not install LoadGeneratorFramework
+    * [MESOS-1608] - Add support for installing stout headers
+    * [MESOS-1616] - ReregisterCompletedFrameworks test does not use real JSON parser
+    * [MESOS-1620] - Reconciliation does not send back tasks pending validation / authorization.
+    * [MESOS-1652] - Stream Docker logs into sandbox logs
+
+** Story
+    * [MESOS-1350] - Initial implementation of framework API rate limiter, taking the config via master flag
+    * [MESOS-1595] - Provide a way to install libprocess
+
+** Task
+    * [MESOS-1307] - Authorize offer allocations
+    * [MESOS-1325] - Create a linux routing library abstraction based on libnl
+    * [MESOS-1343] - Authorize "/shutdown" HTTP endpoint through ACLs.
+    * [MESOS-1374] - Verify static libprocess scheduler port works with Mesos Master
+    * [MESOS-1409] - Send status update acknowledgments through the Master.
+    * [MESOS-1443] - Create a protobuf for framework rate limit configuration and load it as JSON through master flags
+    * [MESOS-1444] - Integrate rate limiter into the master
+    * [MESOS-1445] - Add new tests for framework rate limiting
+    * [MESOS-1451] - Remove 'offer_id' field from LaunchTasksMessage.
+    * [MESOS-1505] - Add a test to verify that frameworks with same share get equal number of allocations
+    * [MESOS-1530] - Create LoadGeneratorScheduler to test Framework Rate Limiting
+    * [MESOS-1568] - Support ENTRYPOINT style containers
+    * [MESOS-1580] - Accept --isolation=external through a deprecation cycle.
+    * [MESOS-1593] - Add DockerInfo Configuration
+    * [MESOS-1600] - IP classifiers in routing lib should ignore IP packets with IP options
+    * [MESOS-1601] - Add metrics for port mapping network isolator
+    * [MESOS-1671] - Expose executor metrics for slave.
+    * [MESOS-1672] - Add filter to allocator resourcesRecovered method
+    * [MESOS-1674] - Kill private_resources and treat 'ephemeral_ports' as a resource.
+    * [MESOS-1683] - Create user doc for framework rate limiting feature
+
+
+Release Notes - Mesos - Version 0.19.1
+--------------------------------------
+* This is a bug fix release.
+
+** Bug
+    * [MESOS-1448] - Mesos Fetcher doesn't support URLs that have 30X redirects.
+    * [MESOS-1534] - Scheduler process is not explicitly terminated in the destructor of MesosSchedulerDriver.
+    * [MESOS-1538] - A container destruction in the middle of a launch leads to CHECK failure.
+    * [MESOS-1539] - No longer able to spin up Mesos master in local mode.
+    * [MESOS-1550] - MesosSchedulerDriver should never, ever, call 'stop'.
+    * [MESOS-1551] - Master does not create work directory when missing.
+
+
+Release Notes - Mesos - Version 0.19.0
+--------------------------------------
+* The primary feature of this release is the "Registrar". This is the addition
+  of replicated state in the master to ensure the set of slaves in the cluster
+  remains consistent in the presence of master failovers.
+  * This feature is currently used in a write-only manner by default to allow
+    smooth upgrades. 0.20.0 by default will be write *and* read.
+  * Operators must now specify the 'work_dir' for the master, along with the
+    'quorum' size of the ensemble of masters.
+  * This means adding or removing masters must be done carefully! The best
+    practice is to only ever add or remove a single master at a time and to
+    allow a small amount of time for the replicated log to catch up on the new
+    master.
+
+* Authentication support has been added for slaves.
+
+* Metrics reporting has been overhauled and is now exposed on /metrics/snapshot.
+
+* Support for external containerization strategies has been added to support
+  custom container needs as well as experimentation; this is an alpha release!
+
+* There are also several bug fixes and stability improvements.
+
+
+** Sub-task
+    * [MESOS-562] - Update 'Getting Started' Documentation Page
+    * [MESOS-783] - Master::killTask must not answer with TASK_LOST when the task is unknown.
+    * [MESOS-841] - Enforce only leading master can write to the Registrar.
+    * [MESOS-880] - introduce observe endpoint to master
+    * [MESOS-957] - introduce RepairCoordinator stub into master
+    * [MESOS-1226] - Add flags for replicated log backed registry.
+    * [MESOS-1338] - Add global counters for each message type on Master
+
+** Bug
+    * [MESOS-361] - Restrict the character space of user provided TaskIDs.
+    * [MESOS-577] - bootstrap fails with automake 1.14
+    * [MESOS-578] - configure fails on OSX 10.8.4
+    * [MESOS-682] - Master should properly consolidate "slaves" and "deactivated" maps
+    * [MESOS-743] - ReservationAllocatorTest.ResourcesReturned test is flaky
+    * [MESOS-767] - Slave should re-register with completed frameworks/executors
+    * [MESOS-779] - mesos python examples use 2 space indent
+    * [MESOS-873] - Crash in os::killtree on Mavericks
+    * [MESOS-931] - post-review is deprecated.
+    * [MESOS-1000] - Clang build broken on 0.18.0 master
+    * [MESOS-1019] - AllocatorZooKeeperTest/0.SlaveReregistersFirst is flaky.
+    * [MESOS-1020] - AllocatorZooKeeperTest/0.SlaveReregistersFirst is flaky
+    * [MESOS-1025] - json_tests fails build
+    * [MESOS-1042] - Fix bad CGROUPS_ROOT_Write test
+    * [MESOS-1048] - LimitedCpuIsolatorTest.CgroupsCfs is broken when run as non-root
+    * [MESOS-1053] - tar: You must specify one of the `-Acdtrux' or `--test-label'  options
+    * [MESOS-1054] - Java extension build is broken if libsnappy is installed
+    * [MESOS-1058] - Master CHECK failure: hierarchical_allocator_process.hpp:421 Check failed: !slaves.contains(slaveId)
+    * [MESOS-1062] - CpuIsolatorTest/0.SystemCpuUsage is flaky
+    * [MESOS-1067] - Specifying minimum logging level doesn't work
+    * [MESOS-1072] - Update system check (python boto)
+    * [MESOS-1077] - Registrar tests are flaky.
+    * [MESOS-1080] - cpplint.py doesn't analyze hpp files
+    * [MESOS-1082] - Make fails on AWS Ubuntu 12.04 and 13.10
+    * [MESOS-1083] - Error in CgroupsTest::SetUpTestCase() and TearDownTestCase()
+    * [MESOS-1088] - ZooKeeperMasterContenderDetectorTest.MasterDetectorExpireSlaveZKSessionNewMaster is flaky
+    * [MESOS-1092] - [Doc] "bin/mesos-master --help" to "mesos-master --help"
+    * [MESOS-1099] - Log health checks in mesos
+    * [MESOS-1100] - Drop "OOM notifier is triggered" log message
+    * [MESOS-1124] - Mesos EC2 scripts: Cannot find any cluster
+    * [MESOS-1126] - Change linkage around libjvm to use dlopen.
+    * [MESOS-1152] - ProcTest.MultipleThreads is flaky
+    * [MESOS-1157] - make dist fail
+    * [MESOS-1158] - make distcheck fail
+    * [MESOS-1161] - Inconsistent completed frameworks state between slave and master
+    * [MESOS-1164] - URL encoded urls do not work in slave
+    * [MESOS-1165] - Retry required when recovering an empty log
+    * [MESOS-1167] - Update system check (boost)
+    * [MESOS-1168] - Update system check (zookeeper)
+    * [MESOS-1175] - Update system check (http-parser)
+    * [MESOS-1191] - ProcTest unit tests flaky
+    * [MESOS-1202] - Make it easy to apply GitHub pull requests
+    * [MESOS-1210] - OsTest.children test is flaky
+    * [MESOS-1211] - MesosContainerizer should  recover isolators after the launcher recovers
+    * [MESOS-1214] - CHECK failure in Group
+    * [MESOS-1230] - Compiler warning in libprocess statistics
+    * [MESOS-1231] - CHECK failed in log coordinator
+    * [MESOS-1235] - Metrics.Snapshot* tests fail
+    * [MESOS-1239] - Group CHECK failure
+    * [MESOS-1264] - Slave authentication retries can trigger TASK_LOST for non-checkpointing frameworks.
+    * [MESOS-1265] - Group should not process enqueued events from previous ZooKeeper instance (and ZK session)
+    * [MESOS-1268] - distclean break during maven clean up
+    * [MESOS-1271] - CHECK failure in replica.
+    * [MESOS-1273] - SlaveRecoveryTest/0.RestartBeforeContainerizerLaunch is flaky
+    * [MESOS-1275] - FaultToleranceTest.SlaveReregisterOnZKExpiration is flaky
+    * [MESOS-1276] - Make the delay between master detection and registration configurable
+    * [MESOS-1310] - Queuing up slave (re-)registration during authentication causes reply() to fail
+    * [MESOS-1318] - ProcessWatcher triggers seg fault
+    * [MESOS-1331] - SlaveRecoveryTest/0.NonCheckpointingFramework is flaky.
+    * [MESOS-1333] - Runtime error when invoking post-reviews.py with rbt 0.6
+    * [MESOS-1347] - GarbageCollectorIntegrationTest.DiskUsage is flaky.
+    * [MESOS-1348] - The SlaveRecoveryTest.GCExecutor test leaks child processes.
+    * [MESOS-1361] - Flaky test: SlaveRecoveryTest/0.RecoverCompletedExecutor
+    * [MESOS-1362] - Flaky test: SlaveRecoveryTest/0.RemoveNonCheckpointingFramework
+    * [MESOS-1365] - SlaveRecoveryTest/0.MultipleFrameworks is flaky
+    * [MESOS-1368] - Credentials file permissions check is broken
+    * [MESOS-1370] - SlaveRecoveryTest/0.RemoveNonCheckpointingFramework is flaky
+    * [MESOS-1372] - Compiler warning from stout flags
+    * [MESOS-1376] - CHECK failure in the Registrar
+    * [MESOS-1400] - Master doesn't recover resources for invalid offers
+    * [MESOS-1406] - Master stats.json using boolean instead of integral value for 'elected'.
+    * [MESOS-1408] - Unnecessary queuing of status update acknowledgments in the scheduler driver.
+    * [MESOS-1413] - MesosContainerizerExecuteTest.IoRedirection  fails on OSX
+    * [MESOS-1415] - Web UI master redirect message doesn't show up
+    * [MESOS-1418] - Master should remove/rescind offers for disconnected slave.
+    * [MESOS-1419] - Properly rescind offers
+    * [MESOS-1449] - Isolator::recover will attempt to remove slave cgroup when using --slave_subsystems
+    * [MESOS-1455] - Segfault in libprocess during Process linking.
+
+** Documentation
+    * [MESOS-1002] - Add "make check" instruction to getting started doc
+    * [MESOS-1377] - Update configuration documentation to reflect 0.19.0 master flags.
+
+** Epic
+    * [MESOS-764] - Implement Master persistence using the Registrar.
+
+** Improvement
+    * [MESOS-135] - Improve javadoc (use @param, @return, etc)
+    * [MESOS-269] - Better JSON Support
+    * [MESOS-295] - Allow new masters to have better understanding of cluster state
+    * [MESOS-581] - Expose cpu and memory usage statistics for master and slave
+    * [MESOS-610] - Split slave specific tests out of master_tests
+    * [MESOS-922] - Containerizer to support launching tasks by TaskInfo
+    * [MESOS-945] - Show framework host name in the WebUI
+    * [MESOS-956] - Add an "Sequence" abstraction to serialize callbacks.
+    * [MESOS-980] - Revisit Future discard semantics to enforce that transitions occur through a Promise.
+    * [MESOS-982] - Relax slave (re-)registration retries and add a backoff mechanism.
+    * [MESOS-983] - Expose log coordinator demotion.
+    * [MESOS-984] - Implement "auto-initialization" of the Replicated Log.
+    * [MESOS-995] - Extend Subprocess to support environment variables, changing user and working directory
+    * [MESOS-1015] - Some header files have 'using' statements
+    * [MESOS-1026] - Pull std::tuple / boost::tuples::tuple into tuples namespace of stout
+    * [MESOS-1036] - Implement a library for exposing statistical metrics.
+    * [MESOS-1041] - fatal() should use abort rather than exit(1) to get stacktraces
+    * [MESOS-1052] - Add a script that can run via CI to verify the reviews.
+    * [MESOS-1055] - Add explicit to single argument constructors
+    * [MESOS-1057] - libprocess: Add explicit to single argument constructors
+    * [MESOS-1068] - No --version command line parameter
+    * [MESOS-1087] - Display warning for credentials file permissions
+    * [MESOS-1105] - TODO(benh): choose a better scheme to set mem in slave/containerizer/containerizer.cpp
+    * [MESOS-1112] - Refactor the Registrar to push the operations to the caller to simplify the interface
+    * [MESOS-1151] - Make review bot check for style issues
+    * [MESOS-1155] - Improve the performance of Registrar
+    * [MESOS-1160] - Support flattening from Try into Future.
+    * [MESOS-1182] - Implement an output stream operator overload for Master::Slave
+    * [MESOS-1224] - Add dynamic loadable library abstraction to stout.
+    * [MESOS-1234] - Mesos ReviewBot should look at old reviews first
+    * [MESOS-1252] - Support ENV MAVEN_HOME to establish the path of the `mvn` executable.
+    * [MESOS-1255] - Master UI should show Mesos version
+    * [MESOS-1270] - Reconcile logging messages in master
+    * [MESOS-1274] - Disallow further operations in the Registrar when a failure occurs.
+    * [MESOS-1287] - metrics collection should not wait indefinitely
+    * [MESOS-1332] - Improve Master and Slave metric names
+    * [MESOS-1344] - Add flags support for JSON
+    * [MESOS-1349] - Mesos style checker should only check for updated files
+    * [MESOS-1358] - Show when the leading master was elected in the webui
+    * [MESOS-1382] - Include the error message in routing::socket().
+    * [MESOS-1405] - Mesos fetcher does not support S3(n)
+
+** Story
+    * [MESOS-804] - Add authentication support for slaves
+    * [MESOS-838] - Consider exporting queue size as a metric from the master
+
+** Task
+    * [MESOS-911] - Add pluggable authorization interface
+    * [MESOS-974] - Add a unit test for java api of replicated log
+    * [MESOS-981] - Implement Storage on the Replicated Log.
+    * [MESOS-1116] - Create library to track statistics of metrics
+    * [MESOS-1123] - Implement tests for stout/cache.hpp
+    * [MESOS-1132] - Port master stats.json over to new metrics library
+    * [MESOS-1133] - Port slave stats.json over to new metrics library
+    * [MESOS-1146] - Port system process stats over to new metrics library
+    * [MESOS-1197] - Adding signal safe os::system
+    * [MESOS-1217] - Add Timer metric to Metrics library
+    * [MESOS-1284] - metrics Timer should use Clock
+    * [MESOS-1304] - Create framework rate limiting design document and gather feedback
+    * [MESOS-1305] - Export frameworks QPS through metrics endpoint
+    * [MESOS-1314] - Update default registry to "replicated_log".
+    * [MESOS-1317] - Add integration tests to enforce the semantics of a "strict" registry.
+    * [MESOS-1319] - Add recovery integration tests for a "strict" registry.
+    * [MESOS-1320] - Add reconciliation integration tests for a "strict" registry.
+    * [MESOS-1321] - Add killTask integration tests for a "strict" registry.
+    * [MESOS-1322] - Add failover integration tests for a "strict" registry.
+    * [MESOS-1371] - Expose libprocess queue length from scheduler driver to metrics endpoint
+    * [MESOS-1373] - Keep track of the principals for authenticated pids in Master.
+    * [MESOS-1380] - mesos-local should set default work_dir
+    * [MESOS-1383] - Expose the authenticated principal through Authenticator::authenticate() result
+    * [MESOS-1387] - Integrate Authorizer into Master
+    * [MESOS-1411] - Update Master and Slave to handle status update acknowledgments going through the master.
+
+
+Release Notes - Mesos - Version 0.18.2
+--------------------------------------
+* This is a bug fix release.
+
+** Bug
+    * [MESOS-1313] - The executor bit is now essentially ignored with the 0.18.1 fetcher implementation
+
+
+Release Notes - Mesos - Version 0.18.1
+--------------------------------------
+* This is a bug fix release.
+
+** Bug
+    * [MESOS-979] - Master segfault when tasks.json endpoint is hit
+    * [MESOS-1045] - Unrecognized file extension in CommandInfo.URI causes executor to exit
+    * [MESOS-1078] - JNI calls hasNext on ArrayList instead of iterator
+    * [MESOS-1221] - Slave should update the containerizers with executor resources after recovery
+    * [MESOS-1241] - Unable to disable the auto-extraction of URIs (mesos-fetcher)
+
+** Improvement
+    * [MESOS-1212] - Use maven to compile and package Mesos' Java files
+
+
 Release Notes - Mesos - Version 0.18.0
 --------------------------------------
 * The primary feature of this release is a refactor of the isolation
@@ -18,6 +426,7 @@ Release Notes - Mesos - Version 0.18.0
     * [MESOS-952] - Clock::resume should adjust timeouts that were created in a paused/advanced Clock context.
     * [MESOS-954] - The /__processes__ endpoint in libprocess is missing a needed lock acquisition.
     * [MESOS-958] - Group should not ignore the ZNOAUTH error in creating the parent path for the group
+    * [MESOS-963] - Compile fails on 10.9
     * [MESOS-965] - GroupTest.GroupWatchWithSessionExpiration is flaky
     * [MESOS-966] - symbolize.cc:235:58: error: invalid suffix on literal; C++11 requires a space between literal and identifier
     * [MESOS-967] - configure: error: cannot find libsasl2
@@ -25,11 +434,22 @@ Release Notes - Mesos - Version 0.18.0
     * [MESOS-985] - FaultToleranceTest.IgnoreKillTaskFromUnregisteredFramework is flaky
     * [MESOS-989] - Flaky whitelist tests
     * [MESOS-991] - hashmap.hpp error: control reaches end of non-void function
+    * [MESOS-1009] - src/demangle.cc:170:13: error: comparison between pointer and integer ('const char *' and 'int')
+    * [MESOS-1029] - lib stout compile errors on Ubuntu 13.10 with Clang 3.5
+    * [MESOS-1030] - Mesos compile errors on Ubuntu 13.10 with Clang 3.5: const & ..., header guard
     * [MESOS-1038] - Log coordinator should demote itself after a write is discarded.
     * [MESOS-1045] - Unrecognized file extension in CommandInfo.URI causes executor to exit
     * [MESOS-1049] - Cpu Isolator incorrectly writes double values when writing cpu.cfs_quota_us.
     * [MESOS-1050] - Containerizer broke getting hadoop binary from $HADOOP_HOME and $PATH
+    * [MESOS-1051] - tar command used in fetcher not portable to OS X
     * [MESOS-1063] - Containerizer fails when fetching more than one URL
+    * [MESOS-1079] - Mesos python egg build failure on OS X Mavericks (Xcode 5.1)
+    * [MESOS-1086] - DRF allocator should take into account past allocations when determining an ordering so frameworks are not starved.
+    * [MESOS-1095] - Build failure on OSX when using gcc-4.7
+    * [MESOS-1121] - /usr/include/c++/4.7/type_traits:1834:9: error: no match for call to '(std::_Bind<process::Future<process::http::Response> (*(std::_Placeholder<1>))(const std::basic_string<char>&)>) ()'
+    * [MESOS-1128] - ':' colon in executor work directories is unusual
+    * [MESOS-1135] - A re-registering framework that authenticates with Master might not get any offers
+    * [MESOS-1176] - make distcheck fails when enabling c++11
 
 ** Documentation
     * [MESOS-926] - Document change to separate cgroup mounts

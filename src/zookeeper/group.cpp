@@ -5,6 +5,7 @@
 
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
+#include <process/id.hpp>
 #include <process/process.hpp>
 
 #include <stout/check.hpp>
@@ -73,7 +74,8 @@ GroupProcess::GroupProcess(
     const Duration& _timeout,
     const string& _znode,
     const Option<Authentication>& _auth)
-  : servers(_servers),
+  : ProcessBase(ID::generate("group")),
+    servers(_servers),
     timeout(_timeout),
     znode(strings::remove(_znode, "/", strings::SUFFIX)),
     auth(_auth),
@@ -92,7 +94,8 @@ GroupProcess::GroupProcess(
 GroupProcess::GroupProcess(
     const URL& url,
     const Duration& _timeout)
-  : servers(url.servers),
+  : ProcessBase(ID::generate("group")),
+    servers(url.servers),
     timeout(_timeout),
     znode(strings::remove(url.path, "/", strings::SUFFIX)),
     auth(url.authentication),
@@ -301,9 +304,9 @@ Future<Option<int64_t> > GroupProcess::session()
 }
 
 
-void GroupProcess::connected(bool reconnect)
+void GroupProcess::connected(int64_t sessionId, bool reconnect)
 {
-  if (error.isSome()) {
+  if (error.isSome() || sessionId != zk->getSessionId()) {
     return;
   }
 
@@ -406,9 +409,9 @@ Try<bool> GroupProcess::create()
 }
 
 
-void GroupProcess::reconnecting()
+void GroupProcess::reconnecting(int64_t sessionId)
 {
-  if (error.isSome()) {
+  if (error.isSome() || sessionId != zk->getSessionId()) {
     return;
   }
 
@@ -455,14 +458,14 @@ void GroupProcess::timedout(int64_t sessionId)
                  << "(sessionId=" << std::hex << sessionId << ") expiration";
 
     // Locally determine that the current session has expired.
-    expired();
+    expired(zk->getSessionId());
   }
 }
 
 
-void GroupProcess::expired()
+void GroupProcess::expired(int64_t sessionId)
 {
-  if (error.isSome()) {
+  if (error.isSome() || sessionId != zk->getSessionId()) {
     return;
   }
 
@@ -517,9 +520,9 @@ void GroupProcess::expired()
 }
 
 
-void GroupProcess::updated(const string& path)
+void GroupProcess::updated(int64_t sessionId, const string& path)
 {
-  if (error.isSome()) {
+  if (error.isSome() || sessionId != zk->getSessionId()) {
     return;
   }
 
@@ -543,13 +546,13 @@ void GroupProcess::updated(const string& path)
 }
 
 
-void GroupProcess::created(const string& path)
+void GroupProcess::created(int64_t sessionId, const string& path)
 {
   LOG(FATAL) << "Unexpected ZooKeeper event";
 }
 
 
-void GroupProcess::deleted(const string& path)
+void GroupProcess::deleted(int64_t sessionId, const string& path)
 {
   LOG(FATAL) << "Unexpected ZooKeeper event";
 }
@@ -703,9 +706,13 @@ Try<bool> GroupProcess::cache()
     Try<int32_t> sequence = numify<int32_t>(tokens.back());
 
     // Skip it if it couldn't be converted to a number.
+    // NOTE: This is currently possible when using a replicated log
+    // based registry because the log replicas register under
+    // "/log_replicas" at the same path as the masters' ephemeral
+    // znodes.
     if (sequence.isError()) {
-      LOG(WARNING) << "Found non-sequence node '" << result
-                   << "' at '" << znode << "' in ZooKeeper";
+      VLOG(1) << "Found non-sequence node '" << result
+              << "' at '" << znode << "' in ZooKeeper";
       continue;
     }
 
@@ -728,7 +735,9 @@ Try<bool> GroupProcess::cache()
     }
   }
 
-  foreachpair (int32_t sequence, Promise<bool>* cancelled, utils::copy(unowned)) {
+  foreachpair (int32_t sequence,
+               Promise<bool>* cancelled,
+               utils::copy(unowned)) {
     if (!sequences.contains(sequence)) {
       cancelled->set(false);
       unowned.erase(sequence); // Okay since iterating over a copy.
@@ -878,7 +887,9 @@ void GroupProcess::retry(const Duration& duration)
   // session expires so 'retrying' should be false in the condition
   // check above.
   CHECK(error.isNone());
-  CHECK(state == CONNECTED || state == CONNECTING || state == READY)
+
+  // In order to be retrying, we should be at least CONNECTED.
+  CHECK(state == CONNECTED || state == AUTHENTICATED || state == READY)
     << state;
 
   // Will reset it to true if another retry is necessary.

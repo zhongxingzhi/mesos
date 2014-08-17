@@ -32,18 +32,16 @@
 #include "slave/slave.hpp"
 
 #ifdef __linux__
-#include "slave/containerizer/cgroups_launcher.hpp"
+#include "slave/containerizer/linux_launcher.hpp"
 #endif // __linux__
+#include "slave/containerizer/composing.hpp"
 #include "slave/containerizer/containerizer.hpp"
+#include "slave/containerizer/docker.hpp"
 #include "slave/containerizer/isolator.hpp"
 #include "slave/containerizer/launcher.hpp"
-#include "slave/containerizer/mesos_containerizer.hpp"
+#include "slave/containerizer/external_containerizer.hpp"
 
-#include "slave/containerizer/isolators/posix.hpp"
-#ifdef __linux__
-#include "slave/containerizer/isolators/cgroups/cpushare.hpp"
-#include "slave/containerizer/isolators/cgroups/mem.hpp"
-#endif // __linux__
+#include "slave/containerizer/mesos/containerizer.hpp"
 
 using std::map;
 using std::string;
@@ -155,66 +153,66 @@ Try<Resources> Containerizer::resources(const Flags& flags)
 }
 
 
-Try<Containerizer*> Containerizer::create(
-    const Flags& flags,
-    bool local)
+Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
 {
-  string isolation;
-  if (flags.isolation == "process") {
-    LOG(WARNING) << "The 'process' isolation flag is deprecated, "
+  if (flags.isolation == "external") {
+    LOG(WARNING) << "The 'external' isolation flag is deprecated, "
                  << "please update your flags to"
-                 << " '--isolation=posix/cpu,posix/mem'.";
-    isolation = "posix/cpu,posix/mem";
-  } else if (flags.isolation == "cgroups") {
-    LOG(WARNING) << "The 'cgroups' isolation flag is deprecated, "
-                 << "please update your flags to"
-                 << " '--isolation=cgroups/cpu,cgroups/mem'.";
-    isolation = "cgroups/cpu,cgroups/mem";
-  } else {
-    isolation = flags.isolation;
+                 << " '--containerizers=external'.";
+    return ExternalContainerizer::create(flags, local);
   }
 
-  LOG(INFO) << "Using isolation: " << isolation;
+  // TODO(benh): We need to store which containerizer or
+  // containerizers were being used. See MESOS-1663.
 
-  // Create a MesosContainerizerProcess using isolators and a launcher.
-  hashmap<std::string, Try<Isolator*> (*)(const Flags&)> creators;
+  // Create containerizer(s).
+  vector<Containerizer*> containerizers;
 
-  creators["posix/cpu"]   = &PosixCpuIsolatorProcess::create;
-  creators["posix/mem"]   = &PosixMemIsolatorProcess::create;
-#ifdef __linux__
-  creators["cgroups/cpu"] = &CgroupsCpushareIsolatorProcess::create;
-  creators["cgroups/mem"] = &CgroupsMemIsolatorProcess::create;
-#endif // __linux__
-
-  vector<Owned<Isolator> > isolators;
-
-  foreach (const string& type, strings::split(isolation, ",")) {
-    if (creators.contains(type)) {
-      Try<Isolator*> isolator = creators[type](flags);
-      if (isolator.isError()) {
-        return Error(
-            "Could not create isolator " + type + ": " + isolator.error());
+  foreach (const string& type, strings::split(flags.containerizers, ",")) {
+    if (type == "mesos") {
+      Try<MesosContainerizer*> containerizer =
+        MesosContainerizer::create(flags, local);
+      if (containerizer.isError()) {
+        return Error("Could not create MesosContainerizer: " +
+                     containerizer.error());
       } else {
-        isolators.push_back(Owned<Isolator>(isolator.get()));
+        containerizers.push_back(containerizer.get());
+      }
+    } else if (type == "docker") {
+      Try<DockerContainerizer*> containerizer =
+        DockerContainerizer::create(flags);
+      if (containerizer.isError()) {
+        return Error("Could not create DockerContainerizer: " +
+                     containerizer.error());
+      } else {
+        containerizers.push_back(containerizer.get());
+      }
+    } else if (type == "external") {
+      Try<Containerizer*> containerizer =
+        ExternalContainerizer::create(flags, local);
+      if (containerizer.isError()) {
+        return Error("Could not create ExternalContainerizer: " +
+                     containerizer.error());
+      } else {
+        containerizers.push_back(containerizer.get());
       }
     } else {
-      return Error("Unknown or unsupported isolator: " + type);
+      return Error("Unknown or unsupported containerizer: " + type);
     }
   }
 
-#ifdef __linux__
-  // Use cgroups on Linux if any cgroups isolators are used.
-  Try<Launcher*> launcher = strings::contains(isolation, "cgroups")
-    ? CgroupsLauncher::create(flags) : PosixLauncher::create(flags);
-#else
-  Try<Launcher*> launcher = PosixLauncher::create(flags);
-#endif // __linux__
-  if (launcher.isError()) {
-    return Error("Failed to create launcher: " + launcher.error());
+  if (containerizers.size() == 1) {
+    return containerizers.front();
   }
 
-  return new MesosContainerizer(
-      flags, local, Owned<Launcher>(launcher.get()), isolators);
+  Try<ComposingContainerizer*> containerizer =
+    ComposingContainerizer::create(containerizers);
+
+  if (containerizer.isError()) {
+    return Error(containerizer.error());
+  }
+
+  return containerizer.get();
 }
 
 
@@ -277,6 +275,42 @@ map<string, string> executorEnvironment(
 
   return env;
 }
+
+
+// Helper method to build the environment map used to launch fetcher.
+map<string, string> fetcherEnvironment(
+    const CommandInfo& commandInfo,
+    const std::string& directory,
+    const Option<std::string>& user,
+    const Flags& flags)
+{
+  // Prepare the environment variables to pass to mesos-fetcher.
+  string uris = "";
+  foreach (const CommandInfo::URI& uri, commandInfo.uris()) {
+    uris += uri.value() + "+" +
+    (uri.has_executable() && uri.executable() ? "1" : "0") +
+    (uri.extract() ? "X" : "N");
+    uris += " ";
+  }
+  // Remove extra space at the end.
+  uris = strings::trim(uris);
+
+  map<string, string> environment;
+  environment["MESOS_EXECUTOR_URIS"] = uris;
+  environment["MESOS_WORK_DIRECTORY"] = directory;
+  if (user.isSome()) {
+    environment["MESOS_USER"] = user.get();
+  }
+  if (!flags.frameworks_home.empty()) {
+    environment["MESOS_FRAMEWORKS_HOME"] = flags.frameworks_home;
+  }
+  if (!flags.hadoop_home.empty()) {
+    environment["HADOOP_HOME"] = flags.hadoop_home;
+  }
+
+  return environment;
+}
+
 
 } // namespace slave {
 } // namespace internal {

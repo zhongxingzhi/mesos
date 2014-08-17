@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# This is a wrapper around the 'post-review' tool provided by
+# This is a wrapper around the 'post-review'/'rbt' tool provided by
 # Review Board. This is currently used by Apache Mesos development.
 #
 # What does this do?
@@ -11,8 +11,8 @@
 # to create logical commits which can be reviewed independently.
 #
 # How do I use it?
-# First install 'post-review' from Review Board.
-# http://www.reviewboard.org/docs/manual/dev/users/tools/post-review/
+# First install 'RBTools' from Review Board.
+# http://www.reviewboard.org/downloads/rbtools/
 #
 # $ cd /path/to/mesos
 # $ [ do some work on your branch off of master, make commit(s) ]
@@ -37,11 +37,18 @@ def readline(prompt):
 
 
 def execute(command, ignore_errors=False):
-    process = Popen(command,
-                    stdin=PIPE,
-                    stdout=PIPE,
-                    stderr=STDOUT,
-                    shell=False)
+    process = None
+    try:
+        process = Popen(command,
+                stdin=PIPE,
+                stdout=PIPE,
+                stderr=STDOUT,
+                shell=False)
+    except:
+        if not ignore_errors:
+            raise
+        return None
+
     data = process.stdout.read()
     status = process.wait()
     if status != 0 and not ignore_errors:
@@ -55,6 +62,16 @@ def execute(command, ignore_errors=False):
 
 
 # TODO(benh): Make sure this is a git repository, apologize if not.
+
+# Choose 'post-review' if available, otherwise choose 'rbt'.
+post_review = None
+if execute(['post-review', '--version'], ignore_errors=True):
+  post_review = ['post-review']
+elif execute(['rbt', '--version'], ignore_errors=True):
+  post_review = ['rbt', 'post']
+else:
+  print 'Please install RBTools before proceeding'
+  sys.exit(1)
 
 # Don't do anything if people have uncommitted changes.
 diff_stat = execute(['git', 'diff', '--shortstat']).strip()
@@ -72,6 +89,11 @@ parent_branch = 'master'
 branch_ref = execute(['git', 'symbolic-ref', 'HEAD']).strip()
 branch = branch_ref.replace('refs/heads/', '', 1)
 
+# do not work on master branch
+if branch == "master":
+    print "We're expecting you to be working on another branch from master!"
+    sys.exit(1)
+
 temporary_branch = '_post-reviews_' + branch
 
 # Always delete the temporary branch.
@@ -83,7 +105,7 @@ atexit.register(lambda: execute(['git', 'checkout', branch]))
 merge_base = execute(['git', 'merge-base', parent_branch, branch_ref]).strip()
 
 
-print 'Running post-review across all of ...'
+print 'Running \'%s\' across all of ...' % " ".join(post_review)
 
 call(['git',
       '--no-pager',
@@ -97,6 +119,10 @@ log = execute(['git',
                '--pretty=oneline',
                '--reverse',
                merge_base + '..HEAD']).strip()
+
+if len(log) <= 0:
+    print "No new changes compared with master branch!"
+    sys.exit(1)
 
 shas = []
 
@@ -114,7 +140,7 @@ for i in range(len(shas)):
     message = execute(['git',
 	               '--no-pager',
                        'log',
-                       '--pretty=format:%B',
+                       '--pretty=format:%s%n%b',
                        previous + '..' + sha])
 
     review_request_id = None
@@ -157,17 +183,23 @@ for i in range(len(shas)):
 
     revision_range = previous + ':' + sha
 
-    if review_request_id is None:
-        output = execute(['post-review',
-                          '--repository-url=' + repository,
-                          '--tracking-branch=' + parent_branch,
-                          '--revision-range=' + revision_range] + sys.argv[1:]).strip()
+    # Build the post-review/rbt command up to the point where they are common.
+    command = post_review + ['--repository-url=' + repository,
+                             '--tracking-branch=' + parent_branch]
+    if review_request_id:
+        command = command + ['--review-request-id=' + review_request_id]
+
+    # Determine how to specify the revision range.
+    if 'rbt' in post_review:
+        # rbt revisions are passed in as args.
+        command = command + sys.argv[1:] + [previous, sha]
     else:
-        output = execute(['post-review',
-                          '--review-request-id=' + review_request_id,
-                          '--repository-url=' + repository,
-                          '--tracking-branch=' + parent_branch,
-                          '--revision-range=' + revision_range] + sys.argv[1:]).strip()
+        # post-review revisions are passed in using the revision range option.
+        command = command + \
+            ['--revision-range=' + revision_range] + \
+            sys.argv[1:]
+
+    output = execute(command).strip()
 
     print output
 
@@ -177,7 +209,11 @@ for i in range(len(shas)):
         continue
 
     lines = output.split('\n')
-    url = lines[len(lines) - 1]
+
+    # The last line of output in post-review is the review url.
+    # The second to the last line of output in rbt is the review url.
+    url = lines[len(lines) - 2] if 'rbt' in post_review \
+        else lines[len(lines) - 1]
     url = url.strip('/')
 
     # Construct new commit message.

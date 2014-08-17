@@ -34,6 +34,12 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
+// CPU subsystem constants.
+const uint64_t CPU_SHARES_PER_CPU = 1024;
+const uint64_t MIN_CPU_SHARES = 10;
+const Duration CPU_CFS_PERIOD = Milliseconds(100); // Linux default.
+const Duration MIN_CPU_CFS_QUOTA = Milliseconds(1);
+
 
 // Use the Linux cpu cgroup controller for cpu isolation which uses the
 // Completely Fair Scheduler (CFS).
@@ -49,11 +55,11 @@ public:
   virtual process::Future<Nothing> recover(
       const std::list<state::RunState>& states);
 
-  virtual process::Future<Nothing> prepare(
+  virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
       const ExecutorInfo& executorInfo);
 
-  virtual process::Future<Option<CommandInfo> > isolate(
+  virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,
       pid_t pid);
 
@@ -75,7 +81,9 @@ private:
       const Flags& flags,
       const hashmap<std::string, std::string>& hierarchies);
 
-  virtual process::Future<Nothing> _cleanup(const ContainerID& containerId);
+  virtual process::Future<std::list<Nothing> > _cleanup(
+      const ContainerID& containerId,
+      const process::Future<std::list<Nothing> >& future);
 
   struct Info
   {
@@ -94,6 +102,7 @@ private:
   // Map from subsystem to hierarchy.
   hashmap<std::string, std::string> hierarchies;
 
+  // TODO(bmahler): Use Owned<Info>.
   hashmap<ContainerID, Info*> infos;
 };
 

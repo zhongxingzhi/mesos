@@ -18,11 +18,12 @@
 // TODO(bmahler): Upgrade our http_parser to the latest version.
 namespace process {
 
-// TODO: Make DataDecoder abstract and make RequestDecoder a concrete subclass.
+// TODO(benh): Make DataDecoder abstract and make RequestDecoder a
+// concrete subclass.
 class DataDecoder
 {
 public:
-  DataDecoder(const Socket& _s)
+  explicit DataDecoder(const Socket& _s)
     : s(_s), failure(false), request(NULL)
   {
     settings.on_message_begin = &DataDecoder::on_message_begin;
@@ -105,8 +106,11 @@ private:
     decoder->field.clear();
     decoder->value.clear();
 
-    decoder->request->method = http_method_str((http_method) decoder->parser.method);
+    decoder->request->method =
+      http_method_str((http_method) decoder->parser.method);
+
     decoder->request->keepAlive = http_should_keep_alive(&decoder->parser);
+
     return 0;
   }
 
@@ -193,7 +197,7 @@ private:
 
       if (url.field_set & (1 << UF_QUERY)) {
         decoder->query.append(
-            data + url.field_data[UF_QUERY].off, 
+            data + url.field_data[UF_QUERY].off,
             url.field_data[UF_QUERY].len);
       }
     }
@@ -396,12 +400,13 @@ private:
     return 0;
   }
 
-  static int on_path(http_parser* p, const char* data, size_t length)
+  static int on_url(http_parser* p, const char* data, size_t length)
   {
     return 0;
   }
 
-  static int on_url(http_parser* p, const char* data, size_t length)
+#if !(HTTP_PARSER_VERSION_MAJOR >= 2)
+  static int on_path(http_parser* p, const char* data, size_t length)
   {
     return 0;
   }
@@ -415,6 +420,7 @@ private:
   {
     return 0;
   }
+#endif // !(HTTP_PARSER_VERSION_MAJOR >= 2)
 
   static int on_body(http_parser* p, const char* data, size_t length)
   {

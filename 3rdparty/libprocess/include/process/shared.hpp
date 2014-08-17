@@ -3,9 +3,9 @@
 
 #include <glog/logging.h>
 
-#include <boost/shared_ptr.hpp>
-
 #include <process/future.hpp>
+
+#include <stout/memory.hpp>
 
 namespace process {
 
@@ -46,7 +46,7 @@ public:
 private:
   struct Data
   {
-    Data(T* _t);
+    explicit Data(T* _t);
     ~Data();
 
     T* t;
@@ -54,7 +54,7 @@ private:
     Promise<Owned<T> > promise;
   };
 
-  boost::shared_ptr<Data> data;
+  memory::shared_ptr<Data> data;
 };
 
 

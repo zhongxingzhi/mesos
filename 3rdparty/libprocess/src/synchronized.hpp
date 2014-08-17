@@ -71,7 +71,7 @@ private:
 class Synchronized
 {
 public:
-  Synchronized(Synchronizable *_synchronizable)
+  explicit Synchronized(Synchronizable *_synchronizable)
     : synchronizable(_synchronizable)
   {
     synchronizable->acquire();
@@ -99,6 +99,11 @@ private:
   (__synchronizable_ ## s)
 
 
-#define SYNCHRONIZED_INITIALIZER Synchronizable(PTHREAD_MUTEX_NORMAL)
-#define SYNCHRONIZED_INITIALIZER_DEBUG Synchronizable(PTHREAD_MUTEX_ERRORCHECK)
-#define SYNCHRONIZED_INITIALIZER_RECURSIVE Synchronizable(PTHREAD_MUTEX_RECURSIVE)
+#define SYNCHRONIZED_INITIALIZER                \
+  Synchronizable(PTHREAD_MUTEX_NORMAL)
+
+#define SYNCHRONIZED_INITIALIZER_DEBUG          \
+  Synchronizable(PTHREAD_MUTEX_ERRORCHECK)
+
+#define SYNCHRONIZED_INITIALIZER_RECURSIVE      \
+  Synchronizable(PTHREAD_MUTEX_RECURSIVE)

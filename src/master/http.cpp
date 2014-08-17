@@ -26,14 +26,20 @@
 
 #include <process/help.hpp>
 
+#include <process/metrics/metrics.hpp>
+
+#include <stout/base64.hpp>
 #include <stout/foreach.hpp>
 #include <stout/json.hpp>
+#include <stout/lambda.hpp>
 #include <stout/memory.hpp>
 #include <stout/net.hpp>
 #include <stout/numify.hpp>
 #include <stout/os.hpp>
 #include <stout/result.hpp>
 #include <stout/strings.hpp>
+
+#include "authorizer/authorizer.hpp"
 
 #include "common/attributes.hpp"
 #include "common/build.hpp"
@@ -60,6 +66,9 @@ using process::http::InternalServerError;
 using process::http::NotFound;
 using process::http::OK;
 using process::http::TemporaryRedirect;
+using process::http::Unauthorized;
+
+using process::metrics::internal::MetricsProcess;
 
 using std::map;
 using std::string;
@@ -118,6 +127,12 @@ JSON::Object model(const Framework& framework)
   // Model all of the tasks associated with a framework.
   {
     JSON::Array array;
+
+    foreachvalue (const TaskInfo& task, framework.pendingTasks) {
+      vector<TaskStatus> statuses;
+      array.values.push_back(model(task, framework.id, TASK_STAGING, statuses));
+    }
+
     foreachvalue (Task* task, framework.tasks) {
       array.values.push_back(model(*task));
     }
@@ -166,6 +181,7 @@ JSON::Object model(const Slave& slave)
   object.values["attributes"] = model(slave.info.attributes());
   return object;
 }
+
 
 // Returns a JSON object modeled after a Role.
 JSON::Object model(const Role& role)
@@ -318,7 +334,9 @@ Future<Response> Master::Http::redirect(const Request& request)
   LOG(INFO) << "HTTP request for '" << request.path << "'";
 
   // If there's no leader, redirect to this master's base url.
-  MasterInfo info = master.leader.isSome() ? master.leader.get() : master.info_;
+  MasterInfo info = master->leader.isSome()
+    ? master->leader.get()
+    : master->info_;
 
   Try<string> hostname =
     info.has_hostname() ? info.hostname() : net::getHostname(info.ip());
@@ -332,35 +350,43 @@ Future<Response> Master::Http::redirect(const Request& request)
 }
 
 
+// Declaration of 'stats' continuation.
+static Future<Response> _stats(
+    const Request& request,
+    JSON::Object object,
+    const Response& response);
+
+
+// TODO(alexandra.sava): Add stats for registered and removed slaves.
 Future<Response> Master::Http::stats(const Request& request)
 {
   LOG(INFO) << "HTTP request for '" << request.path << "'";
 
   JSON::Object object;
-  object.values["uptime"] = (Clock::now() - master.startTime).secs();
-  object.values["elected"] = master.elected(); // Note: using int not bool.
-  object.values["total_schedulers"] = master.frameworks.activated.size();
-  object.values["active_schedulers"] = master.getActiveFrameworks().size();
-  object.values["activated_slaves"] = master.slaves.activated.size();
-  object.values["deactivated_slaves"] = master.slaves.deactivated.size();
-  object.values["outstanding_offers"] = master.offers.size();
+  object.values["uptime"] = (Clock::now() - master->startTime).secs();
+  object.values["elected"] = master->elected() ? 1 : 0;
+  object.values["total_schedulers"] = master->frameworks.registered.size();
+  object.values["active_schedulers"] = master->getActiveFrameworks().size();
+  object.values["activated_slaves"] = master->_slaves_active();
+  object.values["deactivated_slaves"] = master->_slaves_inactive();
+  object.values["outstanding_offers"] = master->offers.size();
 
   // NOTE: These are monotonically increasing counters.
-  object.values["staged_tasks"] = master.stats.tasks[TASK_STAGING];
-  object.values["started_tasks"] = master.stats.tasks[TASK_STARTING];
-  object.values["finished_tasks"] = master.stats.tasks[TASK_FINISHED];
-  object.values["killed_tasks"] = master.stats.tasks[TASK_KILLED];
-  object.values["failed_tasks"] = master.stats.tasks[TASK_FAILED];
-  object.values["lost_tasks"] = master.stats.tasks[TASK_LOST];
-  object.values["valid_status_updates"] = master.stats.validStatusUpdates;
-  object.values["invalid_status_updates"] = master.stats.invalidStatusUpdates;
+  object.values["staged_tasks"] = master->stats.tasks[TASK_STAGING];
+  object.values["started_tasks"] = master->stats.tasks[TASK_STARTING];
+  object.values["finished_tasks"] = master->stats.tasks[TASK_FINISHED];
+  object.values["killed_tasks"] = master->stats.tasks[TASK_KILLED];
+  object.values["failed_tasks"] = master->stats.tasks[TASK_FAILED];
+  object.values["lost_tasks"] = master->stats.tasks[TASK_LOST];
+  object.values["valid_status_updates"] = master->stats.validStatusUpdates;
+  object.values["invalid_status_updates"] = master->stats.invalidStatusUpdates;
 
   // Get a count of all active tasks in the cluster i.e., the tasks
   // that are launched (TASK_STAGING, TASK_STARTING, TASK_RUNNING) but
   // haven't reached terminal state yet.
   // NOTE: This is a gauge representing an instantaneous value.
   int active_tasks = 0;
-  foreachvalue (Framework* framework, master.frameworks.activated) {
+  foreachvalue (Framework* framework, master->frameworks.registered) {
     active_tasks += framework->tasks.size();
   }
   object.values["active_tasks_gauge"] = active_tasks;
@@ -369,7 +395,7 @@ Future<Response> Master::Http::stats(const Request& request)
   // compute capacity of scalar resources.
   Resources totalResources;
   Resources usedResources;
-  foreachvalue (Slave* slave, master.slaves.activated) {
+  foreachvalue (Slave* slave, master->slaves.registered) {
     // Instead of accumulating all types of resources (which is
     // not necessary), we only accumulate scalar resources. This
     // helps us bypass a performance problem caused by range
@@ -398,6 +424,39 @@ Future<Response> Master::Http::stats(const Request& request)
     object.values[resource.name() + "_percent"] = percent;
   }
 
+  // Include metrics from libprocess metrics while we sunset this
+  // endpoint in favor of libprocess metrics.
+  // TODO(benh): Remove this after transitioning to libprocess metrics.
+  return process::http::get(MetricsProcess::instance()->self(), "snapshot")
+    .then(lambda::bind(&_stats, request, object, lambda::_1));
+}
+
+
+static Future<Response> _stats(
+    const Request& request,
+    JSON::Object object,
+    const Response& response)
+{
+  if (response.status != process::http::statuses[200]) {
+    return InternalServerError("Failed to get metrics: " + response.status);
+  }
+
+  Option<string> type = response.headers.get("Content-Type");
+
+  if (type.isNone() || type.get() != "application/json") {
+    return InternalServerError("Failed to get metrics: expecting JSON");
+  }
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.body);
+
+  if (parse.isError()) {
+    return InternalServerError("Failed to parse metrics: " + parse.error());
+  }
+
+  // Now add all the values from metrics.
+  // TODO(benh): Make sure we're not overwriting any values.
+  object.values.insert(parse.get().values.begin(), parse.get().values.end());
+
   return OK(object, request.query.get("jsonp"));
 }
 
@@ -424,34 +483,39 @@ Future<Response> Master::Http::state(const Request& request)
   object.values["build_date"] = build::DATE;
   object.values["build_time"] = build::TIME;
   object.values["build_user"] = build::USER;
-  object.values["start_time"] = master.startTime.secs();
-  object.values["id"] = master.info().id();
-  object.values["pid"] = string(master.self());
-  object.values["hostname"] = master.info().hostname();
-  object.values["activated_slaves"] = master.slaves.activated.size();
-  object.values["deactivated_slaves"] = master.slaves.deactivated.size();
-  object.values["staged_tasks"] = master.stats.tasks[TASK_STAGING];
-  object.values["started_tasks"] = master.stats.tasks[TASK_STARTING];
-  object.values["finished_tasks"] = master.stats.tasks[TASK_FINISHED];
-  object.values["killed_tasks"] = master.stats.tasks[TASK_KILLED];
-  object.values["failed_tasks"] = master.stats.tasks[TASK_FAILED];
-  object.values["lost_tasks"] = master.stats.tasks[TASK_LOST];
+  object.values["start_time"] = master->startTime.secs();
 
-  if (master.flags.cluster.isSome()) {
-    object.values["cluster"] = master.flags.cluster.get();
+  if (master->electedTime.isSome()) {
+    object.values["elected_time"] = master->electedTime.get().secs();
   }
 
-  if (master.leader.isSome()) {
-    object.values["leader"] = master.leader.get().pid();
+  object.values["id"] = master->info().id();
+  object.values["pid"] = string(master->self());
+  object.values["hostname"] = master->info().hostname();
+  object.values["activated_slaves"] = master->_slaves_active();
+  object.values["deactivated_slaves"] = master->_slaves_inactive();
+  object.values["staged_tasks"] = master->stats.tasks[TASK_STAGING];
+  object.values["started_tasks"] = master->stats.tasks[TASK_STARTING];
+  object.values["finished_tasks"] = master->stats.tasks[TASK_FINISHED];
+  object.values["killed_tasks"] = master->stats.tasks[TASK_KILLED];
+  object.values["failed_tasks"] = master->stats.tasks[TASK_FAILED];
+  object.values["lost_tasks"] = master->stats.tasks[TASK_LOST];
+
+  if (master->flags.cluster.isSome()) {
+    object.values["cluster"] = master->flags.cluster.get();
   }
 
-  if (master.flags.log_dir.isSome()) {
-    object.values["log_dir"] = master.flags.log_dir.get();
+  if (master->leader.isSome()) {
+    object.values["leader"] = master->leader.get().pid();
+  }
+
+  if (master->flags.log_dir.isSome()) {
+    object.values["log_dir"] = master->flags.log_dir.get();
   }
 
   JSON::Object flags;
-  foreachpair (const string& name, const flags::Flag& flag, master.flags) {
-    Option<string> value = flag.stringify(master.flags);
+  foreachpair (const string& name, const flags::Flag& flag, master->flags) {
+    Option<string> value = flag.stringify(master->flags);
     if (value.isSome()) {
       flags.values[name] = value.get();
     }
@@ -461,7 +525,7 @@ Future<Response> Master::Http::state(const Request& request)
   // Model all of the slaves.
   {
     JSON::Array array;
-    foreachvalue (Slave* slave, master.slaves.activated) {
+    foreachvalue (Slave* slave, master->slaves.registered) {
       array.values.push_back(model(*slave));
     }
 
@@ -471,7 +535,7 @@ Future<Response> Master::Http::state(const Request& request)
   // Model all of the frameworks.
   {
     JSON::Array array;
-    foreachvalue (Framework* framework, master.frameworks.activated) {
+    foreachvalue (Framework* framework, master->frameworks.registered) {
       array.values.push_back(model(*framework));
     }
 
@@ -483,11 +547,49 @@ Future<Response> Master::Http::state(const Request& request)
     JSON::Array array;
 
     foreach (const memory::shared_ptr<Framework>& framework,
-             master.frameworks.completed) {
+             master->frameworks.completed) {
       array.values.push_back(model(*framework));
     }
 
     object.values["completed_frameworks"] = array;
+  }
+
+  // Model all of the orphan tasks.
+  {
+    JSON::Array array;
+
+    // Find those orphan tasks.
+    foreachvalue (const Slave* slave, master->slaves.registered) {
+      typedef hashmap<TaskID, Task*> TaskMap;
+      foreachvalue (const TaskMap& tasks, slave->tasks) {
+        foreachvalue (const Task* task, tasks) {
+          CHECK_NOTNULL(task);
+          if (!master->frameworks.registered.contains(task->framework_id())) {
+            array.values.push_back(model(*task));
+          }
+        }
+      }
+    }
+
+    object.values["orphan_tasks"] = array;
+  }
+
+  // Model all currently unregistered frameworks.
+  // This could happen when the framework has yet to re-register
+  // after master failover.
+  {
+    JSON::Array array;
+
+    // Find unregistered frameworks.
+    foreachvalue (const Slave* slave, master->slaves.registered) {
+      foreachkey (const FrameworkID& frameworkId, slave->tasks) {
+        if (!master->frameworks.registered.contains(frameworkId)) {
+          array.values.push_back(frameworkId.value());
+        }
+      }
+    }
+
+    object.values["unregistered_frameworks"] = array;
   }
 
   return OK(object, request.query.get("jsonp"));
@@ -503,7 +605,7 @@ Future<Response> Master::Http::roles(const Request& request)
   // Model all of the roles.
   {
     JSON::Array array;
-    foreachvalue (Role* role, master.roles) {
+    foreachvalue (Role* role, master->roles) {
       array.values.push_back(model(*role));
     }
 
@@ -511,6 +613,96 @@ Future<Response> Master::Http::roles(const Request& request)
   }
 
   return OK(object, request.query.get("jsonp"));
+}
+
+
+const string Master::Http::SHUTDOWN_HELP = HELP(
+    TLDR(
+        "Shuts down a running framework."),
+    USAGE(
+        "/master/shutdown"),
+    DESCRIPTION(
+        "Please provide a \"frameworkId\" value designating the ",
+        "running framework to shut down.",
+        "Returns 200 OK if the framework was correctly shutdown."));
+
+
+Future<Response> Master::Http::shutdown(const Request& request)
+{
+  if (request.method != "POST") {
+    return BadRequest("Expecting POST");
+  }
+
+  // Parse the query string in the request body (since this is a POST)
+  // in order to determine the framework ID to shutdown.
+  hashmap<string, string> values =
+    process::http::query::parse(request.body);
+
+  if (values.get("frameworkId").isNone()) {
+    return BadRequest("Missing 'frameworkId' query parameter");
+  }
+
+  FrameworkID id;
+  id.set_value(values.get("frameworkId").get());
+
+  Framework* framework = master->getFramework(id);
+
+  if (framework == NULL) {
+    return BadRequest("No framework found with specified ID");
+  }
+
+  Result<Credential> credential = authenticate(request);
+
+  if (credential.isError()) {
+    return Unauthorized("Mesos master", credential.error());
+  }
+
+  // Skip authorization if no ACLs were provided to the master.
+  if (master->authorizer.isNone()) {
+    return _shutdown(id);
+  }
+
+  mesos::ACL::ShutdownFramework shutdown;
+
+  if (credential.isSome()) {
+    shutdown.mutable_principals()->add_values(credential.get().principal());
+  } else {
+    shutdown.mutable_principals()->set_type(ACL::Entity::ANY);
+  }
+
+  if (framework->info.has_principal()) {
+    shutdown.mutable_framework_principals()->add_values(
+        framework->info.principal());
+  } else {
+    shutdown.mutable_framework_principals()->set_type(ACL::Entity::ANY);
+  }
+
+  lambda::function<Future<Response>(bool)> _shutdown =
+    lambda::bind(&Master::Http::_shutdown, this, id, lambda::_1);
+
+  return master->authorizer.get()->authorize(shutdown)
+    .then(defer(master->self(), _shutdown));
+}
+
+
+Future<Response> Master::Http::_shutdown(
+    const FrameworkID& id,
+    bool authorized)
+{
+  if (!authorized) {
+    return Unauthorized("Mesos master");
+  }
+
+  Framework* framework = master->getFramework(id);
+
+  if (framework == NULL) {
+    return BadRequest("No framework found with ID " + stringify(id));
+  }
+
+  // TODO(ijimenez): Do 'removeFramework' asynchronously.
+  master->removeFramework(framework);
+
+  return OK();
 }
 
 
@@ -592,11 +784,11 @@ Future<Response> Master::Http::tasks(const Request& request)
 
   // Construct framework list with both active and completed framwworks.
   vector<const Framework*> frameworks;
-  foreachvalue (Framework* framework, master.frameworks.activated) {
+  foreachvalue (Framework* framework, master->frameworks.registered) {
     frameworks.push_back(framework);
   }
   foreach (const memory::shared_ptr<Framework>& framework,
-           master.frameworks.completed) {
+           master->frameworks.completed) {
     frameworks.push_back(framework.get());
   }
 
@@ -632,6 +824,44 @@ Future<Response> Master::Http::tasks(const Request& request)
   object.values["tasks"] = array;
 
   return OK(object, request.query.get("jsonp"));
+}
+
+
+Result<Credential> Master::Http::authenticate(const Request& request)
+{
+  // By default, assume everyone is authenticated if no credentials
+  // were provided.
+  if (master->credentials.isNone()) {
+    return None();
+  }
+
+  Option<string> authorization = request.headers.get("Authorization");
+
+  if (authorization.isNone()) {
+    return Error("Missing 'Authorization' request header");
+  }
+
+  const string& decoded =
+    base64::decode(strings::split(authorization.get(), " ", 2)[1]);
+
+  const vector<string>& pairs = strings::split(decoded, ":", 2);
+
+  if (pairs.size() != 2) {
+    return Error("Malformed 'Authorization' request header");
+  }
+
+  const string& username = pairs[0];
+  const string& password = pairs[1];
+
+  foreach (const Credential& credential,
+          master->credentials.get().credentials()) {
+    if (credential.principal() == username &&
+        credential.secret() == password) {
+      return credential;
+    }
+  }
+
+  return Error("Could not authenticate '" + username + "'");
 }
 
 

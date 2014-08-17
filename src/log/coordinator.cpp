@@ -83,7 +83,8 @@ private:
   Future<PromiseResponse> runPromisePhase();
   Future<Option<uint64_t> > checkPromisePhase(const PromiseResponse& response);
   Future<IntervalSet<uint64_t> > getMissingPositions();
-  Future<Nothing> catchupMissingPositions(const IntervalSet<uint64_t>& positions);
+  Future<Nothing> catchupMissingPositions(
+      const IntervalSet<uint64_t>& positions);
   Future<Option<uint64_t> > updateIndexAfterElected();
   void electingFinished(const Option<uint64_t>& position);
   void electingFailed();
@@ -213,7 +214,7 @@ Future<Option<uint64_t> > CoordinatorProcess::checkPromisePhase(
     return getMissingPositions()
       .then(defer(self(), &Self::catchupMissingPositions, lambda::_1))
       .then(defer(self(), &Self::updateIndexAfterElected));
-   }
+  }
 }
 
 
@@ -228,7 +229,15 @@ Future<Nothing> CoordinatorProcess::catchupMissingPositions(
 {
   LOG(INFO) << "Coordinator attemping to fill missing position";
 
-  return log::catchup(quorum, replica, network, proposal, positions);
+  // Notice that here we use "proposal + 1" as the proposal number for
+  // fill operations in order to avoid unnecessary retries for those
+  // log positions that were just implicitly promised to this
+  // coordinator. This is safe because log::catchup would increment
+  // the proposal number automatically after failing to fill
+  // implicitly promised positions and this just shortcuts that
+  // process. See more details in MESOS-1165. We don't update the
+  // class member 'proposal' here as it's for implicit promises.
+  return log::catchup(quorum, replica, network, proposal + 1, positions);
 }
 
 

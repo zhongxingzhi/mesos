@@ -4,74 +4,18 @@ ACLOCAL_AMFLAGS = -I m4
 
 AUTOMAKE_OPTIONS = foreign
 
+# NOTE: The stout headers were moved to the Makefile in "include"
+# subdirectory to make it easy to preserve the directory structure of
+# the header files during installation.
+SUBDIRS = . include
+
+# Tests.
 EXTRA_DIST =					\
-  include/stout/abort.hpp			\
-  include/stout/bytes.hpp			\
-  include/stout/cache.hpp			\
-  include/stout/check.hpp			\
-  include/stout/duration.hpp			\
-  include/stout/error.hpp			\
-  include/stout/exit.hpp			\
-  include/stout/fatal.hpp			\
-  include/stout/flags.hpp			\
-  include/stout/flags/flag.hpp			\
-  include/stout/flags/flags.hpp			\
-  include/stout/flags/loader.hpp		\
-  include/stout/flags/parse.hpp			\
-  include/stout/flags/stringifier.hpp		\
-  include/stout/foreach.hpp			\
-  include/stout/format.hpp			\
-  include/stout/fs.hpp				\
-  include/stout/gtest.hpp			\
-  include/stout/gzip.hpp			\
-  include/stout/hashmap.hpp			\
-  include/stout/hashset.hpp			\
-  include/stout/interval.hpp			\
-  include/stout/json.hpp			\
-  include/stout/lambda.hpp			\
-  include/stout/linkedhashmap.hpp		\
-  include/stout/list.hpp			\
-  include/stout/memory.hpp			\
-  include/stout/multihashmap.hpp		\
-  include/stout/multimap.hpp			\
-  include/stout/net.hpp				\
-  include/stout/none.hpp			\
-  include/stout/nothing.hpp			\
-  include/stout/numify.hpp			\
-  include/stout/option.hpp			\
-  include/stout/os.hpp				\
-  include/stout/os/exists.hpp			\
-  include/stout/os/fork.hpp			\
-  include/stout/os/killtree.hpp			\
-  include/stout/os/linux.hpp			\
-  include/stout/os/ls.hpp			\
-  include/stout/os/osx.hpp			\
-  include/stout/os/process.hpp			\
-  include/stout/os/read.hpp			\
-  include/stout/os/sendfile.hpp			\
-  include/stout/os/shell.hpp			\
-  include/stout/os/signals.hpp			\
-  include/stout/os/permissions.hpp		\
-  include/stout/os/pstree.hpp			\
-  include/stout/os/sysctl.hpp			\
-  include/stout/path.hpp			\
-  include/stout/preprocessor.hpp		\
-  include/stout/proc.hpp			\
-  include/stout/protobuf.hpp			\
-  include/stout/result.hpp			\
-  include/stout/set.hpp				\
-  include/stout/some.hpp			\
-  include/stout/stopwatch.hpp			\
-  include/stout/stringify.hpp			\
-  include/stout/strings.hpp			\
-  include/stout/thread.hpp			\
-  include/stout/try.hpp				\
-  include/stout/tuple.hpp			\
-  include/stout/unreachable.hpp			\
-  include/stout/utils.hpp			\
-  include/stout/uuid.hpp			\
+  tests/base64_tests.cpp			\
   tests/bytes_tests.cpp				\
+  tests/cache_tests.cpp				\
   tests/duration_tests.cpp			\
+  tests/dynamiclibrary_tests.cpp		\
   tests/error_tests.cpp				\
   tests/flags_tests.cpp				\
   tests/gzip_tests.cpp				\
@@ -82,10 +26,12 @@ EXTRA_DIST =					\
   tests/linkedhashmap_tests.cpp			\
   tests/main.cpp				\
   tests/multimap_tests.cpp			\
+  tests/net_tests.cpp				\
   tests/none_tests.cpp				\
   tests/option_tests.cpp			\
   tests/os_tests.cpp				\
   tests/os/sendfile_tests.cpp			\
+  tests/os/setns_tests.cpp			\
   tests/os/signals_tests.cpp			\
   tests/proc_tests.cpp				\
   tests/protobuf_tests.cpp			\
@@ -95,5 +41,6 @@ EXTRA_DIST =					\
   tests/set_tests.cpp				\
   tests/some_tests.cpp				\
   tests/strings_tests.cpp			\
+  tests/subcommand_tests.cpp			\
   tests/thread_tests.cpp			\
   tests/uuid_tests.cpp

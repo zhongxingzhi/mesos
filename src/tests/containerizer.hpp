@@ -58,14 +58,26 @@ public:
 
   TestContainerizer(const ExecutorID& executorId, Executor* executor);
 
-  TestContainerizer(MockExecutor* executor);
+  explicit TestContainerizer(MockExecutor* executor);
 
   TestContainerizer();
 
   virtual ~TestContainerizer();
 
-  virtual process::Future<Nothing> launch(
+  MOCK_METHOD7(
+      launch,
+      process::Future<bool>(
+          const ContainerID&,
+          const ExecutorInfo&,
+          const std::string&,
+          const Option<std::string>&,
+          const SlaveID&,
+          const process::PID<slave::Slave>&,
+          bool checkpoint));
+
+  virtual process::Future<bool> launch(
       const ContainerID& containerId,
+      const TaskInfo& taskInfo,
       const ExecutorInfo& executorInfo,
       const std::string& directory,
       const Option<std::string>& user,
@@ -73,14 +85,13 @@ public:
       const process::PID<slave::Slave>& slavePid,
       bool checkpoint);
 
-  virtual process::Future<slave::Containerizer::Termination> wait(
-      const ContainerID& containerId);
-
   // Additional destroy method for testing because we won't know the
   // ContainerID created for each container.
   void destroy(const FrameworkID& frameworkId, const ExecutorID& executorId);
 
   virtual void destroy(const ContainerID& containerId);
+
+  virtual process::Future<hashset<ContainerID> > containers();
 
   MOCK_METHOD1(
       recover,
@@ -94,15 +105,32 @@ public:
       usage,
       process::Future<ResourceStatistics>(const ContainerID&));
 
+  MOCK_METHOD1(
+      wait,
+      process::Future<containerizer::Termination>(const ContainerID&));
+
 private:
   void setup();
 
+  // Default 'launch' implementation.
+  process::Future<bool> _launch(
+      const ContainerID& containerId,
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user,
+      const SlaveID& slaveId,
+      const process::PID<slave::Slave>& slavePid,
+      bool checkpoint);
+
+  process::Future<containerizer::Termination> _wait(
+      const ContainerID& containerId);
+
   hashmap<ExecutorID, Executor*> executors;
 
-  hashmap<std::pair<FrameworkID, ExecutorID>, ContainerID> containers;
+  hashmap<std::pair<FrameworkID, ExecutorID>, ContainerID> containers_;
   hashmap<ContainerID, process::Owned<MesosExecutorDriver> > drivers;
   hashmap<ContainerID,
-          process::Owned<process::Promise<slave::Containerizer::Termination> > > promises;
+      process::Owned<process::Promise<containerizer::Termination> > > promises;
 };
 
 } // namespace tests {

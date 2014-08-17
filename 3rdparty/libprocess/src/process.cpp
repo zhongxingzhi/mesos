@@ -64,6 +64,8 @@
 #include <process/time.hpp>
 #include <process/timer.hpp>
 
+#include <process/metrics/metrics.hpp>
+
 #include <stout/duration.hpp>
 #include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
@@ -81,8 +83,11 @@
 #include "gate.hpp"
 #include "synchronized.hpp"
 
+using namespace process::metrics::internal;
+
 using process::wait; // Necessary on some OS's to disambiguate.
 
+using process::http::Accepted;
 using process::http::BadRequest;
 using process::http::InternalServerError;
 using process::http::NotFound;
@@ -202,7 +207,7 @@ public:
 private:
   friend class ProcessManager; // For ProcessManager::use.
 
-  ProcessReference(ProcessBase* _process)
+  explicit ProcessReference(ProcessBase* _process)
     : process(_process)
   {
     if (process != NULL) {
@@ -246,7 +251,7 @@ private:
 class HttpProxy : public Process<HttpProxy>
 {
 public:
-  HttpProxy(const Socket& _socket);
+  explicit HttpProxy(const Socket& _socket);
   virtual ~HttpProxy();
 
   // Enqueues the response to be sent once all previously enqueued
@@ -421,7 +426,7 @@ private:
 class ProcessManager
 {
 public:
-  ProcessManager(const string& delegate);
+  explicit ProcessManager(const string& delegate);
   ~ProcessManager();
 
   ProcessReference use(const UPID& pid);
@@ -555,9 +560,17 @@ static ev_timer timeouts_watcher;
 // Server watcher for accepting connections.
 static ev_io server_watcher;
 
-// Queue of I/O watchers.
+// Queue of I/O watchers to be asynchronously added to the event loop
+// (protected by 'watchers' below).
+// TODO(benh): Replace this queue with functions that we put in
+// 'functions' below that perform the ev_io_start themselves.
 static queue<ev_io*>* watchers = new queue<ev_io*>();
 static synchronizable(watchers) = SYNCHRONIZED_INITIALIZER;
+
+// Queue of functions to be invoked asynchronously within the vent
+// loop (protected by 'watchers' below).
+static queue<lambda::function<void(void)> >* functions =
+  new queue<lambda::function<void(void)> >();
 
 // We store the timers in a map of lists indexed by the timeout of the
 // timer so that we can have two timers that have the same timeout. We
@@ -594,7 +607,8 @@ ThreadLocal<ProcessBase>* _process_ = new ThreadLocal<ProcessBase>();
 // Per thread executor pointer.
 ThreadLocal<Executor>* _executor_ = new ThreadLocal<Executor>();
 
-const Duration LIBPROCESS_STATISTICS_WINDOW = Days(1);
+// TODO(dhamon): Reintroduce this when it is plumbed through to Statistics.
+// const Duration LIBPROCESS_STATISTICS_WINDOW = Days(1);
 
 
 // We namespace the clock related variables to keep them well
@@ -807,9 +821,12 @@ static void transport(Message* message, ProcessBase* sender = NULL)
 
 static bool libprocess(Request* request)
 {
-  return request->method == "POST" &&
-    request->headers.count("User-Agent") > 0 &&
-    request->headers["User-Agent"].find("libprocess/") == 0;
+  return
+    (request->method == "POST" &&
+     request->headers.contains("User-Agent") &&
+     request->headers["User-Agent"].find("libprocess/") == 0) ||
+    (request->method == "POST" &&
+     request->headers.contains("Libprocess-From"));
 }
 
 
@@ -817,35 +834,88 @@ static Message* parse(Request* request)
 {
   // TODO(benh): Do better error handling (to deal with a malformed
   // libprocess message, malicious or otherwise).
-  const string& agent = request->headers["User-Agent"];
-  const string& identifier = "libprocess/";
-  size_t index = agent.find(identifier);
-  if (index != string::npos) {
-    // Okay, now determine 'from'.
-    const UPID from(agent.substr(index + identifier.size(), agent.size()));
 
-    // Now determine 'to'.
-    index = request->path.find('/', 1);
-    index = index != string::npos ? index - 1 : string::npos;
-    const UPID to(request->path.substr(1, index), __ip__, __port__);
+  // First try and determine 'from'.
+  Option<UPID> from = None();
 
-    // And now determine 'name'.
-    index = index != string::npos ? index + 2: request->path.size();
-    const string& name = request->path.substr(index);
-
-    VLOG(2) << "Parsed message name '" << name
-            << "' for " << to << " from " << from;
-
-    Message* message = new Message();
-    message->name = name;
-    message->from = from;
-    message->to = to;
-    message->body = request->body;
-
-    return message;
+  if (request->headers.contains("Libprocess-From")) {
+    from = UPID(strings::trim(request->headers["Libprocess-From"]));
+  } else {
+    // Try and get 'from' from the User-Agent.
+    const string& agent = request->headers["User-Agent"];
+    const string& identifier = "libprocess/";
+    size_t index = agent.find(identifier);
+    if (index != string::npos) {
+      from = UPID(agent.substr(index + identifier.size(), agent.size()));
+    }
   }
 
-  return NULL;
+  if (from.isNone()) {
+    return NULL;
+  }
+
+  // Now determine 'to'.
+  size_t index = request->path.find('/', 1);
+  index = index != string::npos ? index - 1 : string::npos;
+
+  // Decode possible percent-encoded 'to'.
+  Try<string> decode = http::decode(request->path.substr(1, index));
+
+  if (decode.isError()) {
+    VLOG(2) << "Failed to decode URL path: " << decode.get();
+    return NULL;
+  }
+
+  const UPID to(decode.get(), __ip__, __port__);
+
+  // And now determine 'name'.
+  index = index != string::npos ? index + 2: request->path.size();
+  const string& name = request->path.substr(index);
+
+  VLOG(2) << "Parsed message name '" << name
+          << "' for " << to << " from " << from.get();
+
+  Message* message = new Message();
+  message->name = name;
+  message->from = from.get();
+  message->to = to;
+  message->body = request->body;
+
+  return message;
+}
+
+// Wrapper around function we want to run in the event loop.
+template <typename T>
+void _run_in_event_loop(
+    const lambda::function<Future<T>(void)>& f,
+    const Owned<Promise<T> >& promise)
+{
+  // Don't bother running the function if the future has been discarded.
+  if (promise->future().hasDiscard()) {
+    promise->discard();
+  } else {
+    promise->set(f());
+  }
+}
+
+
+// Helper for running a function in the event loop.
+template <typename T>
+Future<T> run_in_event_loop(const lambda::function<Future<T>(void)>& f)
+{
+  Owned<Promise<T> > promise(new Promise<T>());
+
+  Future<T> future = promise->future();
+
+  // Enqueue the function.
+  synchronized (watchers) {
+    functions->push(lambda::bind(&_run_in_event_loop<T>, f, promise));
+  }
+
+  // Interrupt the loop.
+  ev_async_send(loop, &async_watcher);
+
+  return future;
 }
 
 
@@ -858,13 +928,19 @@ void handle_async(struct ev_loop* loop, ev_async* _, int revents)
       watchers->pop();
       ev_io_start(loop, watcher);
     }
+
+    while (!functions->empty()) {
+      (functions->front())();
+      functions->pop();
+    }
   }
 
   synchronized (timeouts) {
     if (update_timer) {
       if (!timeouts->empty()) {
         // Determine when the next timer should fire.
-        timeouts_watcher.repeat = (timeouts->begin()->first - Clock::now()).secs();
+        timeouts_watcher.repeat =
+          (timeouts->begin()->first - Clock::now()).secs();
 
         if (timeouts_watcher.repeat <= 0) {
           // Feed the event now!
@@ -1005,7 +1081,7 @@ void recv_data(struct ev_loop* loop, ev_io* watcher, int revents)
         const char* error = strerror(errno);
         VLOG(1) << "Socket error while receiving: " << error;
       } else {
-        VLOG(1) << "Socket closed while receiving";
+        VLOG(2) << "Socket closed while receiving";
       }
       socket_manager->close(s);
       delete decoder;
@@ -1030,6 +1106,52 @@ void recv_data(struct ev_loop* loop, ev_io* watcher, int revents)
         delete watcher;
         break;
       }
+    }
+  }
+}
+
+
+// A variant of 'recv_data' that doesn't do anything with the
+// data. Used by sockets created via SocketManager::link as well as
+// SocketManager::send(Message) where we don't care about the data
+// received we mostly just want to know when the socket has been
+// closed.
+void ignore_data(struct ev_loop* loop, ev_io* watcher, int revents)
+{
+  Socket* socket = (Socket*) watcher->data;
+
+  int s = watcher->fd;
+
+  while (true) {
+    const ssize_t size = 80 * 1024;
+    ssize_t length = 0;
+
+    char data[size];
+
+    length = recv(s, data, size, 0);
+
+    if (length < 0 && (errno == EINTR)) {
+      // Interrupted, try again now.
+      continue;
+    } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // Might block, try again later.
+      break;
+    } else if (length <= 0) {
+      // Socket error or closed.
+      if (length < 0) {
+        const char* error = strerror(errno);
+        VLOG(1) << "Socket error while receiving: " << error;
+      } else {
+        VLOG(2) << "Socket closed while receiving";
+      }
+      socket_manager->close(s);
+      ev_io_stop(loop, watcher);
+      delete socket;
+      delete watcher;
+      break;
+    } else {
+      VLOG(2) << "Ignoring " << length << " bytes of data received "
+              << "on socket used only for sending";
     }
   }
 }
@@ -1205,14 +1327,14 @@ void receiving_connect(struct ev_loop* loop, ev_io* watcher, int revents)
     // Connect failure.
     VLOG(1) << "Socket error while connecting";
     socket_manager->close(s);
-    DataDecoder* decoder = (DataDecoder*) watcher->data;
-    delete decoder;
+    Socket* socket = (Socket*) watcher->data;
+    delete socket;
     ev_io_stop(loop, watcher);
     delete watcher;
   } else {
     // We're connected! Now let's do some receiving.
     ev_io_stop(loop, watcher);
-    ev_io_init(watcher, recv_data, s, EV_READ);
+    ev_io_init(watcher, ignore_data, s, EV_READ);
     ev_io_start(loop, watcher);
   }
 }
@@ -1269,14 +1391,66 @@ void accept(struct ev_loop* loop, ev_io* watcher, int revents)
 }
 
 
+// Data necessary for polling so we can discard polling and actually
+// stop it in the event loop.
+struct Poll
+{
+  Poll()
+  {
+    // Need to explicitly instantiate the watchers.
+    watcher.io.reset(new ev_io());
+    watcher.async.reset(new ev_async());
+  }
+
+  // An I/O watcher for checking for readability or writeability and
+  // an async watcher for being able to discard the polling.
+  struct {
+    memory::shared_ptr<ev_io> io;
+    memory::shared_ptr<ev_async> async;
+  } watcher;
+
+  Promise<short> promise;
+};
+
+
+// Event loop callback when I/O is ready on polling file descriptor.
 void polled(struct ev_loop* loop, ev_io* watcher, int revents)
 {
-  Promise<short>* promise = (Promise<short>*) watcher->data;
-  promise->set(revents);
-  delete promise;
+  Poll* poll = (Poll*) watcher->data;
 
-  ev_io_stop(loop, watcher);
-  delete watcher;
+  ev_io_stop(loop, poll->watcher.io.get());
+
+  // Stop the async watcher (also clears if pending so 'discard_poll'
+  // will not get invoked and we can delete 'poll' here).
+  ev_async_stop(loop, poll->watcher.async.get());
+
+  poll->promise.set(revents);
+
+  delete poll;
+}
+
+
+// Event loop callback when future associated with polling file
+// descriptor has been discarded.
+void discard_poll(struct ev_loop* loop, ev_async* watcher, int revents)
+{
+  Poll* poll = (Poll*) watcher->data;
+
+  // Check and see if we have a pending 'polled' callback and if so
+  // let it "win".
+  if (ev_is_pending(poll->watcher.io.get())) {
+    return;
+  }
+
+  ev_async_stop(loop, poll->watcher.async.get());
+
+  // Stop the I/O watcher (but note we check if pending above) so it
+  // won't get invoked and we can delete 'poll' here.
+  ev_io_stop(loop, poll->watcher.io.get());
+
+  poll->promise.discard();
+
+  delete poll;
 }
 
 
@@ -1554,20 +1728,27 @@ void initialize(const string& delegate)
   spawn(new System(), true);
 
   // Create the global statistics.
-  value = getenv("LIBPROCESS_STATISTICS_WINDOW");
-  if (value != NULL) {
-    Try<Duration> window = Duration::parse(string(value));
-    if (window.isError()) {
-      LOG(FATAL) << "LIBPROCESS_STATISTICS_WINDOW=" << value
-                 << " is not a valid duration: " << window.error();
-    }
-    statistics = new Statistics(window.get());
-  } else {
-    // TODO(bmahler): Investigate memory implications of this window
-    // size. We may also want to provide a maximum memory size rather than
-    // time window. Or, offload older data to disk, etc.
-    statistics = new Statistics(LIBPROCESS_STATISTICS_WINDOW);
-  }
+  // TODO(dhamon): Plumb this through to metrics.
+  // value = getenv("LIBPROCESS_STATISTICS_WINDOW");
+  // if (value != NULL) {
+  //   Try<Duration> window = Duration::parse(string(value));
+  //   if (window.isError()) {
+  //     LOG(FATAL) << "LIBPROCESS_STATISTICS_WINDOW=" << value
+  //                << " is not a valid duration: " << window.error();
+  //   }
+  //   statistics = new Statistics(window.get());
+  // } else {
+  //   // TODO(bmahler): Investigate memory implications of this window
+  //   // size. We may also want to provide a maximum memory size rather than
+  //   // time window. Or, offload older data to disk, etc.
+  //   statistics = new Statistics(LIBPROCESS_STATISTICS_WINDOW);
+  // }
+
+  // Ensure metrics process is running.
+  // TODO(bmahler): Consider initializing this consistently with
+  // the other global Processes.
+  MetricsProcess* metricsProcess = MetricsProcess::instance();
+  CHECK_NOTNULL(metricsProcess);
 
   // Initialize the mime types.
   mime::initialize();
@@ -1909,13 +2090,13 @@ void SocketManager::link(ProcessBase* process, const UPID& to)
 
       persists[node] = s;
 
-      // Allocate and initialize the decoder and watcher (we really
-      // only "receive" on this socket so that we can react when it
-      // gets closed and generate appropriate lost events).
-      DataDecoder* decoder = new DataDecoder(sockets[s]);
-
+      // Allocate and initialize a watcher for reading data from this
+      // socket. Note that we don't expect to receive anything other
+      // than HTTP '202 Accepted' responses which we anyway ignore.
+      // We do, however, want to react when it gets closed so we can
+      // generate appropriate lost events (since this is a 'link').
       ev_io* watcher = new ev_io();
-      watcher->data = decoder;
+      watcher->data = new Socket(sockets[s]);
 
       // Try and connect to the node using this socket.
       sockaddr_in addr;
@@ -1932,7 +2113,7 @@ void SocketManager::link(ProcessBase* process, const UPID& to)
         // Wait for socket to be connected.
         ev_io_init(watcher, receiving_connect, s, EV_WRITE);
       } else {
-        ev_io_init(watcher, recv_data, s, EV_READ);
+        ev_io_init(watcher, ignore_data, s, EV_READ);
       }
 
       // Enqueue the watcher.
@@ -2081,8 +2262,21 @@ void SocketManager::send(Message* message)
       // Initialize the outgoing queue.
       outgoing[s];
 
-      // Allocate and initialize the watcher.
+      // Allocate and initialize a watcher for reading data from this
+      // socket. Note that we don't expect to receive anything other
+      // than HTTP '202 Accepted' responses which we anyway ignore.
       ev_io* watcher = new ev_io();
+      watcher->data = new Socket(sockets[s]);
+
+      ev_io_init(watcher, ignore_data, s, EV_READ);
+
+      // Enqueue the watcher.
+      synchronized (watchers) {
+        watchers->push(watcher);
+      }
+
+      // Allocate and initialize a watcher for sending the message.
+      watcher = new ev_io();
       watcher->data = new MessageEncoder(sockets[s], message);
 
       // Try and connect to the node using this socket.
@@ -2228,6 +2422,16 @@ void SocketManager::close(int s)
         proxies.erase(s);
       }
 
+      // We need to stop any 'ignore_data' readers as they may have
+      // the last Socket reference so we shutdown reads but don't do a
+      // full close (since that will be taken care of by ~Socket, see
+      // comment below). Calling 'shutdown' will trigger 'ignore_data'
+      // which will get back a 0 (i.e., EOF) when it tries to read
+      // from the socket. Note we need to do this before we call
+      // 'sockets.erase(s)' to avoid the potential race with the last
+      // reference being in 'sockets'.
+      shutdown(s, SHUT_RD);
+
       dispose.erase(s);
       sockets.erase(s);
     }
@@ -2253,6 +2457,9 @@ void SocketManager::close(int s)
   // on the last reference of our Socket object to close the
   // socket. Note, however, that since socket is no longer in
   // 'sockets' any attempt to send with it will just get ignored.
+  // TODO(benh): Always do a 'shutdown(s, SHUT_RDWR)' since that
+  // should keep the file descriptor valid until the last Socket
+  // reference does a close but force all libev watchers to stop?
 }
 
 
@@ -2358,13 +2565,37 @@ bool ProcessManager::handle(
   if (libprocess(request)) {
     Message* message = parse(request);
     if (message != NULL) {
+      // TODO(benh): Use the sender PID when delivering in order to
+      // capture happens-before timing relationships for testing.
+      bool accepted = deliver(message->to, new MessageEvent(message));
+
+      // Get the HttpProxy pid for this socket.
+      PID<HttpProxy> proxy = socket_manager->proxy(socket);
+
+      // Only send back an HTTP response if this isn't from libprocess
+      // (which we determine by looking at the User-Agent). This is
+      // necessary because older versions of libprocess would try and
+      // read the data and parse it as an HTTP request which would
+      // fail thus causing the socket to get closed (but now
+      // libprocess will ignore responses, see ignore_data).
+      Option<string> agent = request->headers.get("User-Agent");
+      if (agent.get("").find("libprocess/") == string::npos) {
+        if (accepted) {
+          VLOG(2) << "Accepted libprocess message to " << request->path;
+          dispatch(proxy, &HttpProxy::enqueue, Accepted(), *request);
+        } else {
+          VLOG(1) << "Failed to handle libprocess message to "
+                  << request->path << ": not found";
+          dispatch(proxy, &HttpProxy::enqueue, NotFound(), *request);
+        }
+      }
+
       delete request;
-      // TODO(benh): Use the sender PID in order to capture
-      // happens-before timing relationships for testing.
-      return deliver(message->to, new MessageEvent(message));
+
+      return accepted;
     }
 
-    VLOG(1) << "Failed to handle libprocess request: "
+    VLOG(1) << "Failed to handle libprocess message: "
             << request->method << " " << request->path
             << " (User-Agent: " << request->headers["User-Agent"] << ")";
 
@@ -2416,7 +2647,13 @@ bool ProcessManager::handle(
     request->path = "/" + delegate;
     receiver = use(UPID(delegate, __ip__, __port__));
   } else if (tokens.size() > 0) {
-    receiver = use(UPID(tokens[0], __ip__, __port__));
+    // Decode possible percent-encoded path.
+    Try<string> decode = http::decode(tokens[0]);
+    if (!decode.isError()) {
+      receiver = use(UPID(decode.get(), __ip__, __port__));
+    } else {
+      VLOG(1) << "Failed to decode URL path: " << decode.error();
+    }
   }
 
   if (!receiver && delegate != "") {
@@ -2569,7 +2806,7 @@ void ProcessManager::resume(ProcessBase* process)
           bool filter = false;
           struct FilterVisitor : EventVisitor
           {
-            FilterVisitor(bool* _filter) : filter(_filter) {}
+            explicit FilterVisitor(bool* _filter) : filter(_filter) {}
 
             virtual void visit(const MessageEvent& event)
             {
@@ -2673,7 +2910,9 @@ void ProcessManager::cleanup(ProcessBase* process)
   synchronized (processes) {
     // Wait for all process references to get cleaned up.
     while (process->refs > 0) {
+#if defined(__i386__) || defined(__x86_64__)
       asm ("pause");
+#endif
       __sync_synchronize();
     }
 
@@ -2682,7 +2921,7 @@ void ProcessManager::cleanup(ProcessBase* process)
       CHECK(process->events.empty());
 
       processes.erase(process->pid.id);
- 
+
       // Lookup gate to wake up waiting threads.
       map<ProcessBase*, Gate*>::iterator it = gates.find(process);
       if (it != gates.end()) {
@@ -2871,7 +3110,7 @@ void ProcessManager::enqueue(ProcessBase* process)
     CHECK(find(runq.begin(), runq.end(), process) == runq.end());
     runq.push_back(process);
   }
-    
+
   // Wake up the processing thread if necessary.
   gate->open();
 }
@@ -2947,7 +3186,7 @@ Future<Response> ProcessManager::__processes__(const Request&)
 
       struct JSONVisitor : EventVisitor
       {
-        JSONVisitor(JSON::Array* _events) : events(_events) {}
+        explicit JSONVisitor(JSON::Array* _events) : events(_events) {}
 
         virtual void visit(const MessageEvent& event)
         {
@@ -3140,7 +3379,11 @@ void ProcessBase::enqueue(Event* event, bool inject)
 }
 
 
-void ProcessBase::inject(const UPID& from, const string& name, const char* data, size_t length)
+void ProcessBase::inject(
+    const UPID& from,
+    const string& name,
+    const char* data,
+    size_t length)
 {
   if (!from)
     return;
@@ -3151,7 +3394,11 @@ void ProcessBase::inject(const UPID& from, const string& name, const char* data,
 }
 
 
-void ProcessBase::send(const UPID& to, const string& name, const char* data, size_t length)
+void ProcessBase::send(
+    const UPID& to,
+    const string& name,
+    const char* data,
+    size_t length)
 {
   if (!to) {
     return;
@@ -3194,7 +3441,7 @@ void ProcessBase::visit(const HttpEvent& event)
   // Split the path by '/'.
   vector<string> tokens = strings::tokenize(event.request->path, "/");
   CHECK(tokens.size() >= 1);
-  CHECK(tokens[0] == pid.id);
+  CHECK_EQ(pid.id, http::decode(tokens[0]).get());
 
   const string& name = tokens.size() > 1 ? tokens[1] : "";
 
@@ -3440,6 +3687,44 @@ namespace io {
 
 namespace internal {
 
+// Helper/continuation of 'poll' on future discard.
+void _poll(const memory::shared_ptr<ev_async>& async)
+{
+  ev_async_send(loop, async.get());
+}
+
+
+Future<short> poll(int fd, short events)
+{
+  Poll* poll = new Poll();
+
+  // Have the watchers data point back to the struct.
+  poll->watcher.async->data = poll;
+  poll->watcher.io->data = poll;
+
+  // Get a copy of the future to avoid any races with the event loop.
+  Future<short> future = poll->promise.future();
+
+  // Initialize and start the async watcher.
+  ev_async_init(poll->watcher.async.get(), discard_poll);
+  ev_async_start(loop, poll->watcher.async.get());
+
+  // Make sure we stop polling if a discard occurs on our future.
+  // Note that it's possible that we'll invoke '_poll' when someone
+  // does a discard even after the polling has already completed, but
+  // in this case while we will interrupt the event loop since the
+  // async watcher has already been stopped we won't cause
+  // 'discard_poll' to get invoked.
+  future.onDiscard(lambda::bind(&_poll, poll->watcher.async));
+
+  // Initialize and start the I/O watcher.
+  ev_io_init(poll->watcher.io.get(), polled, fd, events);
+  ev_io_start(loop, poll->watcher.io.get());
+
+  return future;
+}
+
+
 void read(
     int fd,
     void* data,
@@ -3449,6 +3734,7 @@ void read(
 {
   // Ignore this function if the read operation has been discarded.
   if (promise->future().hasDiscard()) {
+    CHECK(!future.isPending());
     promise->discard();
     return;
   }
@@ -3468,7 +3754,7 @@ void read(
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
         // Restart the read operation.
         Future<short> future =
-          poll(fd, process::io::READ).onAny(
+          io::poll(fd, process::io::READ).onAny(
               lambda::bind(&internal::read,
                            fd,
                            data,
@@ -3559,7 +3845,7 @@ void write(
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
         // Restart the write operation.
         Future<short> future =
-          poll(fd, process::io::WRITE).onAny(
+          io::poll(fd, process::io::WRITE).onAny(
               lambda::bind(&internal::write,
                            fd,
                            data,
@@ -3591,37 +3877,7 @@ Future<short> poll(int fd, short events)
 
   // TODO(benh): Check if the file descriptor is non-blocking?
 
-  Promise<short>* promise = new Promise<short>();
-
-  // Get a copy of the future to avoid any races with the event loop.
-  Future<short> future = promise->future();
-
-  // Make sure we stop polling if a discard occurs on our future.
-  // TODO(benh): This is actually insuffient in as much as we need to
-  // interrupt the libev event loop and stop and remove the
-  // watcher. This has been left as a TODO since (a) it's a
-  // non-trivial change (i.e., updating 'handle_async' to also remove
-  // watchers) and (b) it's most likely that the file descriptor being
-  // polled will be closed after the promise is discarded which will
-  // invoke 'polled' which will then cause the watcher to be stopped
-  // and deleted. Note that we needed to make Promise<T>::discard a
-  // 'friend' which should be removed once we clean this up.
-  future.onDiscard(lambda::bind(&process::internal::discarded<short>, future));
-
-  ev_io* watcher = new ev_io();
-  watcher->data = promise;
-
-  ev_io_init(watcher, polled, fd, events);
-
-  // Enqueue the watcher.
-  synchronized (watchers) {
-    watchers->push(watcher);
-  }
-
-  // Interrupt the loop.
-  ev_async_send(loop, &async_watcher);
-
-  return future;
+  return run_in_event_loop<short>(lambda::bind(&internal::poll, fd, events));
 }
 
 
@@ -3882,7 +4138,8 @@ void _splice(
                    WeakFuture<size_t>(read)));
 
   read
-    .onReady(lambda::bind(&__splice, from, to, chunk, data, promise, lambda::_1))
+    .onReady(
+        lambda::bind(&__splice, from, to, chunk, data, promise, lambda::_1))
     .onFailed(lambda::bind(&___splice, promise, lambda::_1))
     .onDiscarded(lambda::bind(&____splice, promise));
 }
@@ -3926,29 +4183,6 @@ void ____splice(
 }
 #endif // __cplusplus >= 201103L
 
-} // namespace internal
-
-
-Future<string> read(int fd)
-{
-  process::initialize();
-
-  // TODO(benh): Wrap up this data as a struct, use 'Owner'.
-  // TODO(bmahler): For efficiency, use a rope for the buffer.
-  memory::shared_ptr<string> buffer(new string());
-  boost::shared_array<char> data(new char[BUFFERED_READ_SIZE]);
-
-  return internal::_read(fd, buffer, data, BUFFERED_READ_SIZE);
-}
-
-
-Future<Nothing> write(int fd, const std::string& data)
-{
-  process::initialize();
-
-  return internal::_write(fd, Owned<string>(new string(data)), 0);
-}
-
 
 Future<Nothing> splice(int from, int to, size_t chunk)
 {
@@ -3962,12 +4196,185 @@ Future<Nothing> splice(int from, int to, size_t chunk)
 
   Future<Nothing> future = promise->future();
 
-  internal::_splice(from, to, chunk, data, promise);
+  _splice(from, to, chunk, data, promise);
 
   return future;
 }
 
+} // namespace internal {
+
+
+Future<string> read(int fd)
+{
+  process::initialize();
+
+  // Get our own copy of the file descriptor so that we're in control
+  // of the lifetime and don't crash if/when someone by accidently
+  // closes the file descriptor before discarding this future. We can
+  // also make sure it's non-blocking and will close-on-exec. Start by
+  // checking we've got a "valid" file descriptor before dup'ing.
+  if (fd < 0) {
+    return Failure(strerror(EBADF));
+  }
+
+  fd = dup(fd);
+  if (fd == -1) {
+    return Failure(ErrnoError("Failed to duplicate file descriptor"));
+  }
+
+  // Set the close-on-exec flag.
+  Try<Nothing> cloexec = os::cloexec(fd);
+  if (cloexec.isError()) {
+    os::close(fd);
+    return Failure(
+        "Failed to set close-on-exec on duplicated file descriptor: " +
+        cloexec.error());
+  }
+
+  // Make the file descriptor is non-blocking.
+  Try<Nothing> nonblock = os::nonblock(fd);
+  if (nonblock.isError()) {
+    os::close(fd);
+    return Failure(
+        "Failed to make duplicated file descriptor non-blocking: " +
+        nonblock.error());
+  }
+
+  // TODO(benh): Wrap up this data as a struct, use 'Owner'.
+  // TODO(bmahler): For efficiency, use a rope for the buffer.
+  memory::shared_ptr<string> buffer(new string());
+  boost::shared_array<char> data(new char[BUFFERED_READ_SIZE]);
+
+  return internal::_read(fd, buffer, data, BUFFERED_READ_SIZE)
+    .onAny(lambda::bind(&os::close, fd));
+}
+
+
+Future<Nothing> write(int fd, const std::string& data)
+{
+  process::initialize();
+
+  // Get our own copy of the file descriptor so that we're in control
+  // of the lifetime and don't crash if/when someone by accidently
+  // closes the file descriptor before discarding this future. We can
+  // also make sure it's non-blocking and will close-on-exec. Start by
+  // checking we've got a "valid" file descriptor before dup'ing.
+  if (fd < 0) {
+    return Failure(strerror(EBADF));
+  }
+
+  fd = dup(fd);
+  if (fd == -1) {
+    return Failure(ErrnoError("Failed to duplicate file descriptor"));
+  }
+
+  // Set the close-on-exec flag.
+  Try<Nothing> cloexec = os::cloexec(fd);
+  if (cloexec.isError()) {
+    os::close(fd);
+    return Failure(
+        "Failed to set close-on-exec on duplicated file descriptor: " +
+        cloexec.error());
+  }
+
+  // Make the file descriptor is non-blocking.
+  Try<Nothing> nonblock = os::nonblock(fd);
+  if (nonblock.isError()) {
+    os::close(fd);
+    return Failure(
+        "Failed to make duplicated file descriptor non-blocking: " +
+        nonblock.error());
+  }
+
+  return internal::_write(fd, Owned<string>(new string(data)), 0)
+    .onAny(lambda::bind(&os::close, fd));
+}
+
+
+Future<Nothing> redirect(int from, Option<int> to, size_t chunk)
+{
+  // Make sure we've got "valid" file descriptors.
+  if (from < 0 || (to.isSome() && to.get() < 0)) {
+    return Failure(strerror(EBADF));
+  }
+
+  if (to.isNone()) {
+    // Open up /dev/null that we can splice into.
+    Try<int> open = os::open("/dev/null", O_WRONLY);
+
+    if (open.isError()) {
+      return Failure("Failed to open /dev/null for writing: " + open.error());
+    }
+
+    to = open.get();
+  } else {
+    // Duplicate 'to' so that we're in control of its lifetime.
+    int fd = dup(to.get());
+    if (fd == -1) {
+      return Failure(ErrnoError("Failed to duplicate 'to' file descriptor"));
+    }
+
+    to = fd;
+  }
+
+  CHECK_SOME(to);
+
+  // Duplicate 'from' so that we're in control of its lifetime.
+  from = dup(from);
+  if (from == -1) {
+    return Failure(ErrnoError("Failed to duplicate 'from' file descriptor"));
+  }
+
+  // Set the close-on-exec flag (no-op if already set).
+  Try<Nothing> cloexec = os::cloexec(from);
+  if (cloexec.isError()) {
+    os::close(from);
+    os::close(to.get());
+    return Failure("Failed to set close-on-exec on 'from': " + cloexec.error());
+  }
+
+  cloexec = os::cloexec(to.get());
+  if (cloexec.isError()) {
+    os::close(from);
+    os::close(to.get());
+    return Failure("Failed to set close-on-exec on 'to': " + cloexec.error());
+  }
+
+  // Make the file descriptors non-blocking (no-op if already set).
+  Try<Nothing> nonblock = os::nonblock(from);
+  if (nonblock.isError()) {
+    os::close(from);
+    os::close(to.get());
+    return Failure("Failed to make 'from' non-blocking: " + nonblock.error());
+  }
+
+  nonblock = os::nonblock(to.get());
+  if (nonblock.isError()) {
+    os::close(from);
+    os::close(to.get());
+    return Failure("Failed to make 'to' non-blocking: " + nonblock.error());
+  }
+
+  return internal::splice(from, to.get(), chunk)
+    .onAny(lambda::bind(&os::close, from))
+    .onAny(lambda::bind(&os::close, to.get()));
+}
+
 } // namespace io {
+
+
+namespace inject {
+
+bool exited(const UPID& from, const UPID& to)
+{
+  process::initialize();
+
+  ExitedEvent* event = new ExitedEvent(from);
+  return process_manager->deliver(to, event, __process__);
+}
+
+} // namespace inject {
+
 
 namespace internal {
 

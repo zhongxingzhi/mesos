@@ -43,6 +43,11 @@ public:
         "Log all severity levels to stderr",
         false);
 
+    add(&Flags::benchmark,
+        "benchmark",
+        "Run the benchmark tests (and skip other tests)",
+        false);
+
     // We determine the defaults for 'source_dir' and 'build_dir' from
     // preprocessor definitions (at the time this comment was written
     // these were set via '-DSOURCE_DIR=...' and '-DBUILD_DIR=...' in
@@ -56,15 +61,23 @@ public:
 
     path = os::realpath(BUILD_DIR);
     CHECK_SOME(path);
+
     add(&Flags::build_dir,
         "build_dir",
         "Where to find the build directory",
         path.get());
+
+    add(&Flags::docker,
+        "docker",
+        "Where to find docker executable",
+        "docker");
   }
 
   bool verbose;
+  bool benchmark;
   std::string source_dir;
   std::string build_dir;
+  std::string docker;
 };
 
 // Global flags for running the tests.

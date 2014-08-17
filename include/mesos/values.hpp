@@ -28,16 +28,20 @@ namespace mesos {
 std::ostream& operator << (std::ostream& stream, const Value::Scalar& scalar);
 bool operator == (const Value::Scalar& left, const Value::Scalar& right);
 bool operator <= (const Value::Scalar& left, const Value::Scalar& right);
-Value::Scalar operator + (const Value::Scalar& left, const Value::Scalar& right);
-Value::Scalar operator - (const Value::Scalar& left, const Value::Scalar& right);
+Value::Scalar operator + (const Value::Scalar& left,
+                          const Value::Scalar& right);
+Value::Scalar operator - (const Value::Scalar& left,
+                          const Value::Scalar& right);
 Value::Scalar& operator += (Value::Scalar& left, const Value::Scalar& right);
 Value::Scalar& operator -= (Value::Scalar& left, const Value::Scalar& right);
 
 std::ostream& operator << (std::ostream& stream, const Value::Ranges& ranges);
 bool operator == (const Value::Ranges& left, const Value::Ranges& right);
 bool operator <= (const Value::Ranges& left, const Value::Ranges& right);
-Value::Ranges operator + (const Value::Ranges& left, const Value::Ranges& right);
-Value::Ranges operator - (const Value::Ranges& left, const Value::Ranges& right);
+Value::Ranges operator + (const Value::Ranges& left,
+                          const Value::Ranges& right);
+Value::Ranges operator - (const Value::Ranges& left,
+                          const Value::Ranges& right);
 Value::Ranges& operator += (Value::Ranges& left, const Value::Ranges& right);
 Value::Ranges& operator -= (Value::Ranges& left, const Value::Ranges& right);
 
@@ -57,9 +61,9 @@ namespace values {
 
 Try<Value> parse(const std::string& text);
 
-} // namespace values
-} // namespace internal
+} // namespace values {
+} // namespace internal {
 
-} // namespace mesos
+} // namespace mesos {
 
 #endif // __VALUES_HPP__

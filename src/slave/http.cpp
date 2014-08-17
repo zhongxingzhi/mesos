@@ -24,8 +24,11 @@
 #include <process/help.hpp>
 #include <process/owned.hpp>
 
+#include <process/metrics/metrics.hpp>
+
 #include <stout/foreach.hpp>
 #include <stout/json.hpp>
+#include <stout/lambda.hpp>
 #include <stout/net.hpp>
 #include <stout/numify.hpp>
 #include <stout/stringify.hpp>
@@ -50,7 +53,10 @@ using process::Owned;
 using process::TLDR;
 using process::USAGE;
 
+using process::http::InternalServerError;
 using process::http::OK;
+
+using process::metrics::internal::MetricsProcess;
 
 using std::map;
 using std::string;
@@ -77,13 +83,26 @@ using process::http::Request;
 JSON::Object model(const CommandInfo& command)
 {
   JSON::Object object;
-  object.values["value"] = command.value();
+
+  if (command.has_shell()) {
+    object.values["shell"] = command.shell();
+  }
+
+  if (command.has_value()) {
+    object.values["value"] = command.value();
+  }
+
+  JSON::Array argv;
+  foreach (const string& arg, command.arguments()) {
+    argv.values.push_back(arg);
+  }
+  object.values["argv"] = argv;
 
   if (command.has_environment()) {
     JSON::Object environment;
     JSON::Array variables;
     foreach(const Environment_Variable& variable,
-        command.environment().variables()) {
+            command.environment().variables()) {
       JSON::Object variableObject;
       variableObject.values["name"] = variable.name();
       variableObject.values["value"] = variable.value();
@@ -148,7 +167,10 @@ JSON::Object model(const Executor& executor)
   object.values["source"] = executor.info.source();
   object.values["container"] = executor.containerId.value();
   object.values["directory"] = executor.directory;
-  object.values["resources"] = model(executor.resources);
+
+  if (executor.resources.isSome()) {
+    object.values["resources"] = model(executor.resources.get());
+  }
 
   JSON::Array tasks;
   foreach (Task* task, executor.launchedTasks.values()) {
@@ -224,25 +246,32 @@ Future<Response> Slave::Http::health(const Request& request)
 }
 
 
+// Declaration of 'stats' continuation.
+static Future<Response> _stats(
+    const Request& request,
+    JSON::Object object,
+    const Response& response);
+
+
 Future<Response> Slave::Http::stats(const Request& request)
 {
   LOG(INFO) << "HTTP request for '" << request.path << "'";
 
   JSON::Object object;
-  object.values["uptime"] = (Clock::now() - slave.startTime).secs();
-  object.values["total_frameworks"] = slave.frameworks.size();
-  object.values["registered"] = slave.master.isSome() ? "1" : "0";
-  object.values["recovery_errors"] = slave.recoveryErrors;
+  object.values["uptime"] = (Clock::now() - slave->startTime).secs();
+  object.values["total_frameworks"] = slave->frameworks.size();
+  object.values["registered"] = slave->master.isSome() ? "1" : "0";
+  object.values["recovery_errors"] = slave->recoveryErrors;
 
   // NOTE: These are monotonically increasing counters.
-  object.values["staged_tasks"] = slave.stats.tasks[TASK_STAGING];
-  object.values["started_tasks"] = slave.stats.tasks[TASK_STARTING];
-  object.values["finished_tasks"] = slave.stats.tasks[TASK_FINISHED];
-  object.values["killed_tasks"] = slave.stats.tasks[TASK_KILLED];
-  object.values["failed_tasks"] = slave.stats.tasks[TASK_FAILED];
-  object.values["lost_tasks"] = slave.stats.tasks[TASK_LOST];
-  object.values["valid_status_updates"] = slave.stats.validStatusUpdates;
-  object.values["invalid_status_updates"] = slave.stats.invalidStatusUpdates;
+  object.values["staged_tasks"] = slave->stats.tasks[TASK_STAGING];
+  object.values["started_tasks"] = slave->stats.tasks[TASK_STARTING];
+  object.values["finished_tasks"] = slave->stats.tasks[TASK_FINISHED];
+  object.values["killed_tasks"] = slave->stats.tasks[TASK_KILLED];
+  object.values["failed_tasks"] = slave->stats.tasks[TASK_FAILED];
+  object.values["lost_tasks"] = slave->stats.tasks[TASK_LOST];
+  object.values["valid_status_updates"] = slave->stats.validStatusUpdates;
+  object.values["invalid_status_updates"] = slave->stats.invalidStatusUpdates;
 
   // NOTE: These are gauges representing instantaneous values.
 
@@ -252,7 +281,7 @@ Future<Response> Slave::Http::stats(const Request& request)
   // Sent to executor (TASK_STAGING, TASK_STARTING, TASK_RUNNING).
   int launched_tasks = 0;
 
-  foreachvalue (Framework* framework, slave.frameworks) {
+  foreachvalue (Framework* framework, slave->frameworks) {
     foreachvalue (Executor* executor, framework->executors) {
       queued_tasks += executor->queuedTasks.size();
       launched_tasks += executor->launchedTasks.size();
@@ -261,6 +290,39 @@ Future<Response> Slave::Http::stats(const Request& request)
 
   object.values["queued_tasks_gauge"] = queued_tasks;
   object.values["launched_tasks_gauge"] = launched_tasks;
+
+  // Include metrics from libprocess metrics while we sunset this
+  // endpoint in favor of libprocess metrics.
+  // TODO(benh): Remove this after transitioning to libprocess metrics.
+  return process::http::get(MetricsProcess::instance()->self(), "snapshot")
+    .then(lambda::bind(&_stats, request, object, lambda::_1));
+}
+
+
+static Future<Response> _stats(
+    const Request& request,
+    JSON::Object object,
+    const Response& response)
+{
+  if (response.status != process::http::statuses[200]) {
+    return InternalServerError("Failed to get metrics: " + response.status);
+  }
+
+  Option<string> type = response.headers.get("Content-Type");
+
+  if (type.isNone() || type.get() != "application/json") {
+    return InternalServerError("Failed to get metrics: expecting JSON");
+  }
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.body);
+
+  if (parse.isError()) {
+    return InternalServerError("Failed to parse metrics: " + parse.error());
+  }
+
+  // Now add all the values from metrics.
+  // TODO(benh): Make sure we're not overwriting any values.
+  object.values.insert(parse.get().values.begin(), parse.get().values.end());
 
   return OK(object, request.query.get("jsonp"));
 }
@@ -288,45 +350,45 @@ Future<Response> Slave::Http::state(const Request& request)
   object.values["build_date"] = build::DATE;
   object.values["build_time"] = build::TIME;
   object.values["build_user"] = build::USER;
-  object.values["start_time"] = slave.startTime.secs();
-  object.values["id"] = slave.info.id().value();
-  object.values["pid"] = string(slave.self());
-  object.values["hostname"] = slave.info.hostname();
-  object.values["resources"] = model(slave.resources);
-  object.values["attributes"] = model(slave.attributes);
-  object.values["staged_tasks"] = slave.stats.tasks[TASK_STAGING];
-  object.values["started_tasks"] = slave.stats.tasks[TASK_STARTING];
-  object.values["finished_tasks"] = slave.stats.tasks[TASK_FINISHED];
-  object.values["killed_tasks"] = slave.stats.tasks[TASK_KILLED];
-  object.values["failed_tasks"] = slave.stats.tasks[TASK_FAILED];
-  object.values["lost_tasks"] = slave.stats.tasks[TASK_LOST];
+  object.values["start_time"] = slave->startTime.secs();
+  object.values["id"] = slave->info.id().value();
+  object.values["pid"] = string(slave->self());
+  object.values["hostname"] = slave->info.hostname();
+  object.values["resources"] = model(slave->resources);
+  object.values["attributes"] = model(slave->attributes);
+  object.values["staged_tasks"] = slave->stats.tasks[TASK_STAGING];
+  object.values["started_tasks"] = slave->stats.tasks[TASK_STARTING];
+  object.values["finished_tasks"] = slave->stats.tasks[TASK_FINISHED];
+  object.values["killed_tasks"] = slave->stats.tasks[TASK_KILLED];
+  object.values["failed_tasks"] = slave->stats.tasks[TASK_FAILED];
+  object.values["lost_tasks"] = slave->stats.tasks[TASK_LOST];
 
-  if (slave.master.isSome()) {
-    Try<string> masterHostname = net::getHostname(slave.master.get().ip);
+  if (slave->master.isSome()) {
+    Try<string> masterHostname = net::getHostname(slave->master.get().ip);
     if (masterHostname.isSome()) {
       object.values["master_hostname"] = masterHostname.get();
     }
   }
 
-  if (slave.flags.log_dir.isSome()) {
-    object.values["log_dir"] = slave.flags.log_dir.get();
+  if (slave->flags.log_dir.isSome()) {
+    object.values["log_dir"] = slave->flags.log_dir.get();
   }
 
   JSON::Array frameworks;
-  foreachvalue (Framework* framework, slave.frameworks) {
+  foreachvalue (Framework* framework, slave->frameworks) {
     frameworks.values.push_back(model(*framework));
   }
   object.values["frameworks"] = frameworks;
 
   JSON::Array completedFrameworks;
-  foreach (const Owned<Framework>& framework, slave.completedFrameworks) {
+  foreach (const Owned<Framework>& framework, slave->completedFrameworks) {
     completedFrameworks.values.push_back(model(*framework));
   }
   object.values["completed_frameworks"] = completedFrameworks;
 
   JSON::Object flags;
-  foreachpair (const string& name, const flags::Flag& flag, slave.flags) {
-    Option<string> value = flag.stringify(slave.flags);
+  foreachpair (const string& name, const flags::Flag& flag, slave->flags) {
+    Option<string> value = flag.stringify(slave->flags);
     if (value.isSome()) {
       flags.values[name] = value.get();
     }

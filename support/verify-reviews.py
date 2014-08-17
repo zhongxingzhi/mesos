@@ -94,8 +94,11 @@ def post_review(review_request, message):
 
 @atexit.register
 def cleanup():
-    shell("git clean -fd")
-    shell("git reset --hard HEAD")
+    try:
+        shell("git clean -fd")
+        shell("git reset --hard HEAD")
+    except subprocess.CalledProcessError as e:
+        print "Failed command: %s\n\nError: %s" % (e.cmd, e.output)
 
 
 def verify_review(review_request):
@@ -105,13 +108,16 @@ def verify_review(review_request):
         applied = []
         apply_reviews(review_request, applied)
 
+        # Make sure the patch is style conformant.
+        # TODO(vinod): Only check files/lines changed by the review.
+        shell("./support/mesos-style.py")
+
         # Make sure build succeeds.
         shell("./bootstrap")
         shell("./configure")
-        shell("make -j3 check GTEST_FILTER='' >/dev/null")
 
 	# Make sure tests pass.
-        shell("make check")
+        shell("make -j3 distcheck")
 
         # Success!
         post_review(
@@ -187,7 +193,7 @@ if __name__=="__main__":
 
     review_requests = api(review_requests_url)
     num_reviews = 0
-    for review_request in review_requests["review_requests"]:
+    for review_request in reversed(review_requests["review_requests"]):
         if (NUM_REVIEWS == -1 or num_reviews < NUM_REVIEWS) and \
             needs_verification(review_request):
             verify_review(review_request)

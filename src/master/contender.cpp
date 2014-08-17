@@ -17,6 +17,7 @@
  */
 
 #include <process/defer.hpp>
+#include <process/id.hpp>
 #include <process/process.hpp>
 
 #include <stout/check.hpp>
@@ -48,8 +49,8 @@ class ZooKeeperMasterContenderProcess
   : public Process<ZooKeeperMasterContenderProcess>
 {
 public:
-  ZooKeeperMasterContenderProcess(const zookeeper::URL& url);
-  ZooKeeperMasterContenderProcess(Owned<zookeeper::Group> group);
+  explicit ZooKeeperMasterContenderProcess(const zookeeper::URL& url);
+  explicit ZooKeeperMasterContenderProcess(Owned<zookeeper::Group> group);
   virtual ~ZooKeeperMasterContenderProcess();
 
   // Explicitely use 'initialize' since we're overloading below.
@@ -175,13 +176,15 @@ Future<Future<Nothing> > ZooKeeperMasterContender::contend()
 
 ZooKeeperMasterContenderProcess::ZooKeeperMasterContenderProcess(
     const URL& url)
-  : group(new Group(url, MASTER_CONTENDER_ZK_SESSION_TIMEOUT)),
+  : ProcessBase(ID::generate("zookeeper-master-contender")),
+    group(new Group(url, MASTER_CONTENDER_ZK_SESSION_TIMEOUT)),
     contender(NULL) {}
 
 
 ZooKeeperMasterContenderProcess::ZooKeeperMasterContenderProcess(
     Owned<Group> _group)
-  : group(_group),
+  : ProcessBase(ID::generate("zookeeper-master-contender")),
+    group(_group),
     contender(NULL) {}
 
 

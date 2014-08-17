@@ -19,21 +19,34 @@ PYTHON=@PYTHON@
 DISTRIBUTE_EGG=`echo ${MESOS_BUILD_DIR}/3rdparty/distribute-*/dist/*.egg`
 
 test ! -e ${DISTRIBUTE_EGG} && \
-  echo "${RED}Failed to find ${DISTRIBUTE_EGG}${NORMAL}" && \
-  exit 1
+  echo "${RED}Failed to find ${DISTRIBUTE_EGG} verify PYTHONPATH${NORMAL}"
 
 PROTOBUF=${MESOS_BUILD_DIR}/3rdparty/libprocess/3rdparty/protobuf-*
 PROTOBUF_EGG=`echo ${PROTOBUF}/python/dist/protobuf*.egg`
 
+# Just warn in the case when build with --disable-bundled.
 test ! -e ${PROTOBUF_EGG} && \
-  echo "${RED}Failed to find ${PROTOBUF_EGG}${NORMAL}" && \
-  exit 1
+  echo "${RED}Failed to find ${PROTOBUF_EGG} check your PYTHONPATH${NORMAL}"
 
-MESOS_EGG=`echo ${MESOS_BUILD_DIR}/src/python/dist/mesos*.egg`
+MESOS_EGGS=""
+for egg in interface native; do
+  base_dir="${MESOS_BUILD_DIR}/src/python/${egg}/dist/"
+  egg_path="${base_dir}mesos.${egg}-@PACKAGE_VERSION@"
 
-test ! -e ${MESOS_EGG} && \
-  echo "${RED}Failed to find ${MESOS_EGG}${NORMAL}" && \
-  exit 1
+  if [[ ${egg} == "native" ]]; then
+    egg_path+="@PYTHON_EGG_POSTFIX@"
+  else
+    egg_path+="@PYTHON_EGG_PUREPY_POSTFIX@"
+  fi
+
+  egg_path+=".egg"
+
+  test ! -e ${egg_path} && \
+    echo "${RED}Failed to find ${egg_path}${NORMAL}" && \
+    exit 1
+
+  MESOS_EGGS+="${egg_path}:"
+done
 
 SCRIPT=${MESOS_SOURCE_DIR}/mpi/mpiexec-mesos.py
 
@@ -41,5 +54,5 @@ test ! -e ${SCRIPT} && \
   echo "${RED}Failed to find ${SCRIPT}${NORMAL}" && \
   exit 1
 
-PYTHONPATH="${DISTRIBUTE_EGG}:${MESOS_EGG}:${PROTOBUF_EGG}" \
+PYTHONPATH="${DISTRIBUTE_EGG}:${PROTOBUF_EGG}:${MESOS_EGGS}" \
   exec ${PYTHON} ${SCRIPT} "${@}"

@@ -19,17 +19,12 @@
 #ifndef __RESOURCES_HPP__
 #define __RESOURCES_HPP__
 
-#include <iterator>
 #include <string>
-#include <utility>
-#include <vector>
 
 #include <mesos/mesos.hpp>
 #include <mesos/values.hpp>
 
 #include <stout/bytes.hpp>
-#include <stout/foreach.hpp>
-#include <stout/none.hpp>
 #include <stout/option.hpp>
 
 
@@ -77,6 +72,7 @@ class Resources
 public:
   Resources() {}
 
+  /*implicit*/
   Resources(const google::protobuf::RepeatedPtrField<Resource>& _resources)
   {
     resources.MergeFrom(_resources);
@@ -100,18 +96,7 @@ public:
   /**
    * Returns a Resources object with only the allocatable resources.
    */
-  Resources allocatable() const
-  {
-    Resources result;
-
-    foreach (const Resource& resource, resources) {
-      if (isAllocatable(resource)) {
-        result.resources.Add()->MergeFrom(resource);
-      }
-    }
-
-    return result;
-  }
+  Resources allocatable() const;
 
   size_t size() const
   {
@@ -127,126 +112,26 @@ public:
     return resources;
   }
 
-  bool operator == (const Resources& that) const
-  {
-    if (size() != that.size()) {
-      return false;
-    }
-
-    foreach (const Resource& resource, resources) {
-      Option<Resource> option = that.get(resource);
-      if (option.isNone()) {
-        return false;
-      } else {
-        if (!(resource == option.get())) {
-          return false;
-        }
-      }
-    }
-
-    return true;
-  }
+  bool operator == (const Resources& that) const;
 
   bool operator != (const Resources& that) const
   {
     return !(*this == that);
   }
 
-  bool operator <= (const Resources& that) const
-  {
-    foreach (const Resource& resource, resources) {
-      Option<Resource> option = that.get(resource);
-      if (option.isNone()) {
-        return false;
-      } else {
-        if (!(resource <= option.get())) {
-          return false;
-        }
-      }
-    }
+  bool operator <= (const Resources& that) const;
 
-    return true;
-  }
+  Resources operator + (const Resources& that) const;
 
-  Resources operator + (const Resources& that) const
-  {
-    Resources result(*this);
+  Resources operator - (const Resources& that) const;
 
-    foreach (const Resource& resource, that.resources) {
-      result += resource;
-    }
+  Resources& operator += (const Resources& that);
 
-    return result;
-  }
+  Resources& operator -= (const Resources& that);
 
-  Resources operator - (const Resources& that) const
-  {
-    Resources result(*this);
+  Resources operator + (const Resource& that) const;
 
-    foreach (const Resource& resource, that.resources) {
-      result -= resource;
-    }
-
-    return result;
-  }
-
-  Resources& operator += (const Resources& that)
-  {
-    foreach (const Resource& resource, that.resources) {
-      *this += resource;
-    }
-
-    return *this;
-  }
-
-  Resources& operator -= (const Resources& that)
-  {
-    foreach (const Resource& resource, that.resources) {
-      *this -= resource;
-    }
-
-    return *this;
-  }
-
-  Resources operator + (const Resource& that) const
-  {
-    Resources result;
-
-    bool added = false;
-
-    foreach (const Resource& resource, resources) {
-      if (matches(resource, that)) {
-        result.resources.Add()->MergeFrom(resource + that);
-        added = true;
-      } else {
-        result.resources.Add()->MergeFrom(resource);
-      }
-    }
-
-    if (!added) {
-      result.resources.Add()->MergeFrom(that);
-    }
-
-    return result;
-  }
-
-  Resources operator - (const Resource& that) const
-  {
-    Resources result;
-
-    foreach (const Resource& resource, resources) {
-      if (matches(resource, that)) {
-        Resource r = resource - that;
-        if (!isZero(r)) {
-          result.resources.Add()->MergeFrom(r);
-        }
-      } else {
-        result.resources.Add()->MergeFrom(resource);
-      }
-    }
-
-    return result;
-  }
+  Resources operator - (const Resource& that) const;
 
   Resources& operator += (const Resource& that)
   {
@@ -303,7 +188,13 @@ public:
   Option<double> cpus() const;
   Option<Bytes> mem() const;
   Option<Bytes> disk() const;
-  Option<Value::Ranges> ports() const; // TODO(vinod): Provide a Ranges abstraction.
+
+  // TODO(vinod): Provide a Ranges abstraction.
+  Option<Value::Ranges> ports() const;
+
+  // TODO(jieyu): Consider returning an EphemeralPorts abstraction
+  // which holds the ephemeral ports allocation logic.
+  Option<Value::Ranges> ephemeral_ports() const;
 
   typedef google::protobuf::RepeatedPtrField<Resource>::iterator
   iterator;
@@ -358,93 +249,7 @@ private:
 };
 
 
-template <>
-inline Value::Scalar Resources::get(
-    const std::string& name,
-    const Value::Scalar& scalar) const
-{
-  Value::Scalar total;
-  bool found = false;
-
-  foreach (const Resource& resource, resources) {
-    if (resource.name() == name &&
-        resource.type() == Value::SCALAR) {
-      total += resource.scalar();
-      found = true;
-    }
-  }
-
-  if (found) {
-    return total;
-  }
-
-  return scalar;
-}
-
-
-template <>
-inline Value::Ranges Resources::get(
-    const std::string& name,
-    const Value::Ranges& ranges) const
-{
-  Value::Ranges total;
-  bool found = false;
-
-  foreach (const Resource& resource, resources) {
-    if (resource.name() == name &&
-        resource.type() == Value::RANGES) {
-      total += resource.ranges();
-      found = true;
-    }
-  }
-
-  if (found) {
-    return total;
-  }
-
-  return ranges;
-}
-
-
-template <>
-inline Value::Set Resources::get(
-    const std::string& name,
-    const Value::Set& set) const
-{
-  Value::Set total;
-  bool found = false;
-
-  foreach (const Resource& resource, resources) {
-    if (resource.name() == name &&
-        resource.type() == Value::SET) {
-      total += resource.set();
-      found = true;
-    }
-  }
-
-  if (found) {
-    return total;
-  }
-
-  return set;
-}
-
-
-inline std::ostream& operator << (
-    std::ostream& stream,
-    const Resources& resources)
-{
-  mesos::Resources::const_iterator it = resources.begin();
-
-  while (it != resources.end()) {
-    stream << *it;
-    if (++it != resources.end()) {
-      stream << "; ";
-    }
-  }
-
-  return stream;
-}
+std::ostream& operator << (std::ostream& stream, const Resources& resources);
 
 
 inline std::ostream& operator << (

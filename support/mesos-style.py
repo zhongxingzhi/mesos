@@ -8,72 +8,21 @@ import re
 import subprocess
 import sys
 
-# Build active rules from list:
-#
-# build/class
-# build/deprecated
-# build/endif_comment
-# build/explicit_make_pair
-# build/forward_decl
-# build/header_guard
-# build/include
-# build/include_alpha
-# build/include_order
-# build/include_what_you_use
-# build/namespaces
-# build/printf_format
-# build/storage_class
-# legal/copyright
-# readability/alt_tokens
-# readability/braces
-# readability/casting
-# readability/check
-# readability/constructors
-# readability/fn_size
-# readability/function
-# readability/multiline_comment
-# readability/multiline_string
-# readability/namespace
-# readability/nolint
-# readability/streams
-# readability/todo
-# readability/utf8
-# runtime/arrays
-# runtime/casting
-# runtime/explicit
-# runtime/int
-# runtime/init
-# runtime/invalid_increment
-# runtime/member_string_references
-# runtime/memset
-# runtime/operator
-# runtime/printf
-# runtime/printf_format
-# runtime/references
-# runtime/rtti
-# runtime/sizeof
-# runtime/string
-# runtime/threadsafe_fn
-# whitespace/blank_line
-# whitespace/braces
-# whitespace/comma
-# whitespace/comments
-# whitespace/empty_loop_body
-# whitespace/end_of_line
-# whitespace/ending_newline
-# whitespace/forcolon
-# whitespace/indent
-# whitespace/labels
-# whitespace/line_length
-# whitespace/newline
-# whitespace/operators
-# whitespace/parens
-# whitespace/semicolon
-# whitespace/tab
-# whitespace/todo
-
-# Currently, only tabs are checked.
-active_rules = '--filter=-,+whitespace/tab'
+# See cpplint.py for full list of rules.
+active_rules = ['build/class',
+                'build/deprecated',
+                'build/endif_comment',
+                'readability/todo',
+                'readability/namespace',
+                'runtime/vlog',
+                'whitespace/blank_line',
+                'whitespace/comma',
+                'whitespace/ending_newline',
+                'whitespace/forcolon',
+                'whitespace/indent',
+                'whitespace/line_length',
+                'whitespace/tab',
+                'whitespace/todo']
 
 # Root source paths (will be traversed recursively).
 source_dirs = ['src',
@@ -100,9 +49,11 @@ def find_candidates(root_dir):
                 yield path
 
 def run_lint(source_paths):
-    print 'Checking ' + str(len(source_paths)) + ' files...'
+    rules_filter = '--filter=-,+' + ',+'.join(active_rules)
+    print 'Checking ' + str(len(source_paths)) + ' files using filter ' \
+        + rules_filter
     p = subprocess.Popen(
-        ['python', 'support/cpplint.py', active_rules] + source_paths,
+        ['python', 'support/cpplint.py', rules_filter] + source_paths,
         stderr=subprocess.PIPE,
         close_fds=True)
 
@@ -112,6 +63,9 @@ def run_lint(source_paths):
     for line in p.stderr:
         if lint_out_regex.search(line) is not None:
             sys.stdout.write(line)
+
+    p.wait()
+    return p.returncode
 
 
 if __name__ == '__main__':
@@ -130,4 +84,22 @@ if __name__ == '__main__':
         for candidate in find_candidates(source_dir):
             candidates.append(candidate)
 
-    run_lint(candidates)
+    if len(sys.argv) == 1:
+        # No file paths specified, run lint on all candidates.
+        sys.exit(run_lint(candidates))
+    else:
+        # File paths specified, run lint on all file paths that are candidates.
+        file_paths = sys.argv[1:]
+
+        # Compute the set intersect of the input file paths and candidates.
+        # This represents the reduced set of candidates to run lint on.
+        candidates_set = set(candidates)
+        clean_file_paths_set = set(map(lambda x: x.rstrip(), file_paths))
+        filtered_candidates_set = clean_file_paths_set.intersection(
+            candidates_set)
+
+        if filtered_candidates_set:
+            sys.exit(run_lint(list(filtered_candidates_set)))
+        else:
+            print "No files to lint\n"
+            sys.exit(0)

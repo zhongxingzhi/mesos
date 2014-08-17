@@ -37,6 +37,7 @@
 #include <stout/none.hpp>
 #include <stout/numify.hpp>
 #include <stout/option.hpp>
+#include <stout/path.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 
@@ -296,10 +297,15 @@ inline Try<std::set<pid_t> > pids()
 {
   std::set<pid_t> pids;
 
-  foreach (const std::string& file, os::ls("/proc")) {
-    Try<pid_t> pid = numify<pid_t>(file);
+  Try<std::list<std::string> > entries = os::ls("/proc");
+  if (entries.isError()) {
+    return Error("Failed to list files in /proc: " + entries.error());
+  }
+
+  foreach (const std::string& entry, entries.get()) {
+    Try<pid_t> pid = numify<pid_t>(entry);
     if (pid.isSome()) {
-      pids.insert(pid.get()); // Ignore files that can't be numified.
+      pids.insert(pid.get()); // Ignore entries that can't be numified.
     }
   }
 
@@ -308,6 +314,33 @@ inline Try<std::set<pid_t> > pids()
   }
 
   return Error("Failed to determine pids from /proc");
+}
+
+
+// Reads from /proc/<pid>/task/* and returns a list of threads ids for pid.
+inline Try<std::set<pid_t> > threads(pid_t pid)
+{
+  const std::string path = path::join("/proc", stringify(pid), "task");
+
+  std::set<pid_t> threads;
+
+  Try<std::list<std::string> > entries = os::ls(path);
+  if (entries.isError()) {
+    return Error("Failed to list files in " + path + ": " + entries.error());
+  }
+
+  foreach (const std::string& entry, entries.get()) {
+    Try<pid_t> thread = numify<pid_t>(entry);
+    if (thread.isSome()) {
+      threads.insert(thread.get());
+    }
+  }
+
+  if (!threads.empty()) {
+    return threads;
+  }
+
+  return Error("Failed to determine thread ids from /proc");
 }
 
 

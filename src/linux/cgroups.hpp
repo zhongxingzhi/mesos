@@ -29,6 +29,7 @@
 #include <sys/types.h>
 
 #include <process/future.hpp>
+#include <process/timeout.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
@@ -39,10 +40,20 @@
 
 namespace cgroups {
 
-// Default number of retry attempts when trying to freeze a cgroup.
-const unsigned int FREEZE_RETRIES = 50;
-const unsigned int EMPTY_WATCHER_RETRIES = 50;
+// Suggested timeout for use with the convenience version of
+// cgroups::destroy(); it is not a default timeout and must be
+// explicitly specified.
+const Duration DESTROY_TIMEOUT = Seconds(60);
 
+
+// Freezing a cgroup may get stuck (see MESOS-1689 for details). To
+// workaround, we may want to thaw the cgroup and retry freezing it.
+// This is the suggested retry interval.
+const Duration FREEZE_RETRY_INTERVAL = Seconds(10);
+
+
+// Default number of assign attempts when moving threads to a cgroup.
+const unsigned int THREAD_ASSIGN_RETRIES = 100;
 
 // We use the following notations throughout the cgroups code. The notations
 // here are derived from the kernel documentation. More details can be found in
@@ -171,14 +182,16 @@ Try<bool> mounted(
 
 
 // Create a cgroup under a given hierarchy. This function will return error if
-// the given hierarchy is not valid. The cgroup will NOT be created recursively.
-// In other words, if the parent cgroup does not exist, this function will just
-// return error.
+// the given hierarchy is not valid.
 // @param   hierarchy   Path to the hierarchy root.
 // @param   cgroup      Path to the cgroup relative to the hierarchy root.
+// @param   recursive   Will create nested cgroups
 // @return  Some if the operation succeeds.
 //          Error if the operation fails.
-Try<Nothing> create(const std::string& hierarchy, const std::string& cgroup);
+Try<Nothing> create(
+    const std::string& hierarchy,
+    const std::string& cgroup,
+    bool recursive = false);
 
 
 // Remove a cgroup under a given hierarchy. This function will return error if
@@ -277,7 +290,18 @@ Try<std::set<pid_t> > processes(
     const std::string& cgroup);
 
 
-// Assign a given process specified by its pid to a given cgroup. This function
+// Return the set of thread IDs in a given cgroup under a given hierarchy. It
+// will return error if the given hierarchy or the given cgroup is not valid.
+// @param   hierarchy   Path to the hierarchy root.
+// @param   cgroup      Path to the cgroup relative to the hierarchy root.
+// @return  The set of thread ids.
+Try<std::set<pid_t> > threads(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+
+// Assign a given process specified by its pid to a given cgroup. All threads
+// in the pid's threadgroup will also be moved to the cgroup. This function
 // will return error if the given hierarchy or the given cgroup is not valid.
 // Also, it will return error if the pid has no process associated with it.
 // @param   hierarchy   Path to the hierarchy root.
@@ -308,48 +332,6 @@ process::Future<uint64_t> listen(
     const Option<std::string>& args = Option<std::string>::none());
 
 
-// Freeze all the processes in a given cgroup. We try to use the freezer
-// subsystem implemented in cgroups. More detail can be found in
-// <kernel-source>/Documentation/cgroups/freezer-subsystem.txt. This function
-// will return a future which will become ready when all the processes have been
-// frozen (FROZEN). The future can be discarded to cancel the operation. The
-// freezer state after the cancellation is not defined. So the users need to
-// read the control file if they need to know the freezer state after the
-// cancellation. This function will return future failure if the freezer
-// subsystem is not available or it is not attached to the given hierarchy, or
-// the given cgroup is not valid, or the given cgroup has already been frozen.
-// @param   hierarchy   Path to the hierarchy root.
-// @param   cgroup      Path to the cgroup relative to the hierarchy root.
-// @param   interval    The time interval between two state check
-//                      requests (default: 0.1 seconds).
-// @param   retries     Number of retry attempts before giving up. None
-//                      indicates infinite retries. (default: 50 attempts).
-// @return  A future which will become true when all processes are frozen, or
-//          false when all retries have occurred unsuccessfully.
-//          Error if something unexpected happens.
-process::Future<bool> freeze(
-    const std::string& hierarchy,
-    const std::string& cgroup,
-    const Duration& interval = Milliseconds(100),
-    const unsigned int retries = FREEZE_RETRIES);
-
-
-// Thaw the given cgroup. This is a revert operation of freezeCgroup. It will
-// return error if the given cgroup is already thawed. Same as
-// freezeCgroup, this function will return a future which can be discarded to
-// allow users to cancel the operation.
-// @param   hierarchy   Path to the hierarchy root.
-// @param   cgroup      Path to the cgroup relative to the hierarchy root.
-// @param   interval    The time interval between two state check
-//                      requests (default: 0.1 seconds).
-// @return  A future which will become ready when all processes are thawed.
-//          Error if something unexpected happens.
-process::Future<bool> thaw(
-    const std::string& hierarchy,
-    const std::string& cgroup,
-    const Duration& interval = Milliseconds(100));
-
-
 // Destroy a cgroup under a given hierarchy. It will also recursively
 // destroy any sub-cgroups. If the freezer subsystem is attached to
 // the hierarchy, we attempt to kill all tasks in a given cgroup,
@@ -363,14 +345,21 @@ process::Future<bool> thaw(
 // is not present.
 // @param   hierarchy Path to the hierarchy root.
 // @param   cgroup      Path to the cgroup relative to the hierarchy root.
-// @param   interval    The time interval between two state check
-//                      requests (default: 0.1 seconds).
 // @return  A future which will become ready when the operation is done.
 //          Error if something unexpected happens.
-process::Future<bool> destroy(
+process::Future<Nothing> destroy(
     const std::string& hierarchy,
-    const std::string& cgroup = "/",
-    const Duration& interval = Milliseconds(100));
+    const std::string& cgroup = "/");
+
+
+// Destroy a cgroup under a given hierarchy. This is a convenience
+// function which wraps the cgroups::destroy() to add a timeout: if
+// the cgroup(s) cannot be destroyed after timeout the operation will
+// be discarded.
+process::Future<Nothing> destroy(
+    const std::string& hierarchy,
+    const std::string& cgroup,
+    const Duration& timeout);
 
 
 // Cleanup the hierarchy, by first destroying all the underlying
@@ -398,11 +387,28 @@ Try<hashmap<std::string, uint64_t> > stat(
 // Cpu controls.
 namespace cpu {
 
+// Returns the cgroup that the specified pid is a member of within the
+// hierarchy that the 'cpu' subsytem is mounted or None if the
+// subsystem is not mounted or the pid is not a member of a cgroup.
+Result<std::string> cgroup(pid_t pid);
+
+
 // Sets the cpu shares using cpu.shares.
 Try<Nothing> shares(
     const std::string& hierarchy,
     const std::string& cgroup,
     uint64_t shares);
+
+// Returns the cpu shares from cpu.shares.
+Try<uint64_t> shares(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+
+// Returns the cpu shares from cpu.shares.
+Try<uint64_t> shares(
+    const std::string& hierarchy,
+    const std::string& cgroup);
 
 
 // Sets the cfs period using cpu.cfs_period_us.
@@ -430,6 +436,12 @@ Try<Nothing> cfs_quota_us(
 // Memory controls.
 namespace memory {
 
+// Returns the cgroup that the specified pid is a member of within the
+// hierarchy that the 'memory' subsytem is mounted or None if the
+// subsystem is not mounted or the pid is not a member of a cgroup.
+Result<std::string> cgroup(pid_t pid);
+
+
 // Returns the memory limit from memory.limit_in_bytes.
 Try<Bytes> limit_in_bytes(
     const std::string& hierarchy,
@@ -438,6 +450,23 @@ Try<Bytes> limit_in_bytes(
 
 // Sets the memory limit using memory.limit_in_bytes.
 Try<Nothing> limit_in_bytes(
+    const std::string& hierarchy,
+    const std::string& cgroup,
+    const Bytes& limit);
+
+
+// Returns the memory limit from memory.memsw.limit_in_bytes. Returns
+// none if memory.memsw.limit_in_bytes is not supported (e.g., when
+// swap is turned off).
+Result<Bytes> memsw_limit_in_bytes(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+
+// Sets the memory limit using memory.memsw.limit_in_bytes. Returns
+// false if memory.memsw.limit_in_bytes is not supported (e.g., when
+// swap is turned off).
+Try<bool> memsw_limit_in_bytes(
     const std::string& hierarchy,
     const std::string& cgroup,
     const Bytes& limit);
@@ -467,7 +496,66 @@ Try<Bytes> max_usage_in_bytes(
     const std::string& hierarchy,
     const std::string& cgroup);
 
+
+// Out-of-memory (OOM) controls.
+namespace oom {
+
+// Listen for an OOM event for the cgroup.
+process::Future<Nothing> listen(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+// OOM killer controls.
+namespace killer {
+
+// Return whether the kernel OOM killer is enabled for the cgroup.
+Try<bool> enabled(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+// Enable the kernel OOM killer for the cgroup. The control file will
+// only be written to if necessary.
+Try<Nothing> enable(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+// Disable the kernel OOM killer. The control file will only be
+// written to if necessary.
+Try<Nothing> disable(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+} // namespace killer {
+
+} // namespace oom {
+
 } // namespace memory {
+
+
+// Freezer controls.
+// The freezer can be in one of three states:
+// 1. THAWED   : No process in the cgroup is frozen.
+// 2. FREEZING : Freezing is in progress but not all processes are frozen.
+// 3. FROZEN   : All processes are frozen.
+namespace freezer {
+
+// Freeze all processes in the given cgroup. The cgroup must be in a freezer
+// hierarchy. This function will return a future which will become ready when
+// all processes have been frozen (cgroup is in the FROZEN state).
+process::Future<Nothing> freeze(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+
+// Thaw all processes in the given cgroup. The cgroup must be in a freezer
+// hierarchy. This is a revert operation of freezer::freeze. This function will
+// return a future which will become ready when all processes have been thawed
+// (cgroup is in the THAWED state).
+process::Future<Nothing> thaw(
+    const std::string& hierarchy,
+    const std::string& cgroup);
+
+} // namespace freezer {
 
 } // namespace cgroups {
 

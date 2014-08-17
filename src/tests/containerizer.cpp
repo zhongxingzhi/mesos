@@ -22,6 +22,10 @@
 using std::map;
 using std::string;
 
+using testing::_;
+using testing::Invoke;
+using testing::Return;
+
 using namespace process;
 
 namespace mesos {
@@ -69,7 +73,7 @@ TestContainerizer::~TestContainerizer()
 }
 
 
-Future<Nothing> TestContainerizer::launch(
+Future<bool> TestContainerizer::_launch(
     const ContainerID& containerId,
     const ExecutorInfo& executorInfo,
     const string& directory,
@@ -92,7 +96,7 @@ Future<Nothing> TestContainerizer::launch(
   // easy destroy from tests.
   std::pair<FrameworkID, ExecutorID> key(executorInfo.framework_id(),
                                          executorInfo.executor_id());
-  containers[key] = containerId;
+  containers_[key] = containerId;
 
   Executor* executor = executors[executorInfo.executor_id()];
   Owned<MesosExecutorDriver> driver(new MesosExecutorDriver(executor));
@@ -129,19 +133,43 @@ Future<Nothing> TestContainerizer::launch(
   }
   os::unsetenv("MESOS_LOCAL");
 
-  Owned<Promise<slave::Containerizer::Termination> > promise(
-      new Promise<slave::Containerizer::Termination>());
+  Owned<Promise<containerizer::Termination> > promise(
+      new Promise<containerizer::Termination>());
   promises[containerId] = promise;
 
-  return Nothing();
+  return true;
 }
 
 
-Future<slave::Containerizer::Termination> TestContainerizer::wait(
+Future<bool> TestContainerizer::launch(
+    const ContainerID& containerId,
+    const TaskInfo& taskInfo,
+    const ExecutorInfo& executorInfo,
+    const string& directory,
+    const Option<string>& user,
+    const SlaveID& slaveId,
+    const PID<slave::Slave>& slavePid,
+    bool checkpoint)
+{
+  return launch(
+      containerId,
+      executorInfo,
+      directory,
+      user,
+      slaveId,
+      slavePid,
+      checkpoint);
+}
+
+
+Future<containerizer::Termination> TestContainerizer::_wait(
     const ContainerID& containerId)
 {
-  CHECK(promises.contains(containerId))
-    << "Container " << containerId << "not started";
+  // An unknown container is possible for tests where we "drop" the
+  // 'launch' in order to verify recovery still works correctly.
+  if (!promises.contains(containerId)) {
+    return Failure("Unknown container: " + stringify(containerId));
+  }
 
   return promises[containerId]->future();
 }
@@ -152,12 +180,12 @@ void TestContainerizer::destroy(
     const ExecutorID& executorId)
 {
   std::pair<FrameworkID, ExecutorID> key(frameworkId, executorId);
-  if (!containers.contains(key)) {
+  if (!containers_.contains(key)) {
     LOG(WARNING) << "Ignoring destroy of unknown container for executor '"
                   << executorId << "' of framework '" << frameworkId << "'";
     return;
   }
-  destroy(containers[key]);
+  destroy(containers_[key]);
 }
 
 
@@ -172,22 +200,45 @@ void TestContainerizer::destroy(const ContainerID& containerId)
   driver->join();
   drivers.erase(containerId);
 
-  promises[containerId]->set(
-      slave::Containerizer::Termination(0, false, "Killed executor"));
+  containerizer::Termination termination;
+  termination.set_killed(false);
+  termination.set_message("Killed executor");
+  termination.set_status(0);
+  promises[containerId]->set(termination);
   promises.erase(containerId);
+}
+
+
+Future<hashset<ContainerID> > TestContainerizer::containers()
+{
+  return promises.keys();
 }
 
 
 void TestContainerizer::setup()
 {
-  EXPECT_CALL(*this, recover(testing::_))
-    .WillRepeatedly(testing::Return(Nothing()));
+  // NOTE: We use 'EXPECT_CALL' and 'WillRepeatedly' here instead of
+  // 'ON_CALL' and 'WillByDefault' because the latter gives the gmock
+  // warning "Uninteresting mock function call" unless each tests puts
+  // the expectations in place which would make the tests much more
+  // verbose.
+  // See groups.google.com/forum/#!topic/googlemock/EX4kLxddlko for a
+  // suggestion for how we might be able to use 'NiceMock' here
+  // instead.
+  EXPECT_CALL(*this, recover(_))
+    .WillRepeatedly(Return(Nothing()));
 
-  EXPECT_CALL(*this, usage(testing::_))
-    .WillRepeatedly(testing::Return(ResourceStatistics()));
+  EXPECT_CALL(*this, usage(_))
+    .WillRepeatedly(Return(ResourceStatistics()));
 
-  EXPECT_CALL(*this, update(testing::_, testing::_))
-    .WillRepeatedly(testing::Return(Nothing()));
+  EXPECT_CALL(*this, update(_, _))
+    .WillRepeatedly(Return(Nothing()));
+
+  EXPECT_CALL(*this, launch(_, _, _, _, _, _, _))
+    .WillRepeatedly(Invoke(this, &TestContainerizer::_launch));
+
+  EXPECT_CALL(*this, wait(_))
+    .WillRepeatedly(Invoke(this, &TestContainerizer::_wait));
 }
 
 } // namespace tests {

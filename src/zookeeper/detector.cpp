@@ -4,6 +4,7 @@
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
+#include <process/id.hpp>
 #include "process/logging.hpp"
 #include <process/process.hpp>
 
@@ -23,7 +24,7 @@ namespace zookeeper {
 class LeaderDetectorProcess : public Process<LeaderDetectorProcess>
 {
 public:
-  LeaderDetectorProcess(Group* group);
+  explicit LeaderDetectorProcess(Group* group);
   virtual ~LeaderDetectorProcess();
   virtual void initialize();
 
@@ -48,7 +49,9 @@ private:
 
 
 LeaderDetectorProcess::LeaderDetectorProcess(Group* _group)
-  : group(_group), leader(None()) {}
+  : ProcessBase(ID::generate("leader-detector")),
+    group(_group),
+    leader(None()) {}
 
 
 LeaderDetectorProcess::~LeaderDetectorProcess()
@@ -97,7 +100,8 @@ void LeaderDetectorProcess::watch(const set<Group::Membership>& expected)
 }
 
 
-void LeaderDetectorProcess::watched(const Future<set<Group::Membership> >& memberships)
+void LeaderDetectorProcess::watched(
+    const Future<set<Group::Membership> >& memberships)
 {
   CHECK(!memberships.isDiscarded());
 

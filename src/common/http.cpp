@@ -1,28 +1,40 @@
-#include "common/http.hpp"
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
-#include <map>
-#include <string>
+#include <vector>
 
-#include <glog/logging.h>
+#include <mesos/resources.hpp>
 
 #include <stout/foreach.hpp>
 #include <stout/stringify.hpp>
 
 #include "common/attributes.hpp"
+#include "common/http.hpp"
 
 #include "messages/messages.hpp"
 
-#include "mesos/mesos.hpp"
-#include "mesos/resources.hpp"
-
-using std::map;
-using std::string;
+using std::vector;
 
 namespace mesos {
 namespace internal {
 
-// TODO(bmahler): Kill these in favor of automatic Proto->JSON Conversion (when
-// it becomes available).
+// TODO(bmahler): Kill these in favor of automatic Proto->JSON
+// Conversion (when it becomes available).
 
 JSON::Object model(const Resources& resources)
 {
@@ -101,7 +113,13 @@ JSON::Object model(const Task& task)
   object.values["id"] = task.task_id().value();
   object.values["name"] = task.name();
   object.values["framework_id"] = task.framework_id().value();
-  object.values["executor_id"] = task.executor_id().value();
+
+  if (task.has_executor_id()) {
+    object.values["executor_id"] = task.executor_id().value();
+  } else {
+    object.values["executor_id"] = "";
+  }
+
   object.values["slave_id"] = task.slave_id().value();
   object.values["state"] = TaskState_Name(task.state());
   object.values["resources"] = model(task.resources());
@@ -114,6 +132,39 @@ JSON::Object model(const Task& task)
 
   return object;
 }
+
+
+// TODO(bmahler): Expose the executor name / source.
+JSON::Object model(
+    const TaskInfo& task,
+    const FrameworkID& frameworkId,
+    const TaskState& state,
+    const vector<TaskStatus>& statuses)
+{
+  JSON::Object object;
+  object.values["id"] = task.task_id().value();
+  object.values["name"] = task.name();
+  object.values["framework_id"] = frameworkId.value();
+
+  if (task.has_executor()) {
+    object.values["executor_id"] = task.executor().executor_id().value();
+  } else {
+    object.values["executor_id"] = "";
+  }
+
+  object.values["slave_id"] = task.slave_id().value();
+  object.values["state"] = TaskState_Name(state);
+  object.values["resources"] = model(task.resources());
+
+  JSON::Array array;
+  foreach (const TaskStatus& status, statuses) {
+    array.values.push_back(model(status));
+  }
+  object.values["statuses"] = array;
+
+  return object;
+}
+
 
 }  // namespace internal {
 }  // namespace mesos {

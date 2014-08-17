@@ -1,4 +1,3 @@
-#include <jni.h>
 #include <stdarg.h>
 
 #include <glog/logging.h>
@@ -9,17 +8,17 @@
 #include <sstream>
 #include <vector>
 
+#include <stout/dynamiclibrary.hpp>
 #include <stout/exit.hpp>
 #include <stout/foreach.hpp>
+#include <stout/os.hpp>
 
+#include "common/build.hpp"
 #include "jvm/jvm.hpp"
-
 #include "jvm/java/lang.hpp"
-
 
 // Static storage and initialization.
 Jvm* Jvm::instance = NULL;
-
 
 Try<Jvm*> Jvm::create(
     const std::vector<std::string>& _options,
@@ -58,10 +57,36 @@ Try<Jvm*> Jvm::create(
 
   JavaVM* jvm = NULL;
   JNIEnv* env = NULL;
+  std::string libJvmPath = os::getenv("JAVA_JVM_LIBRARY", false);
 
-  int result = JNI_CreateJavaVM(&jvm, JNIENV_CAST(&env), &vmArgs);
+  if (libJvmPath.empty()) {
+    libJvmPath = mesos::internal::build::JAVA_JVM_LIBRARY;
+  }
 
-  if (result == JNI_ERR) {
+  static DynamicLibrary* libJvm = new DynamicLibrary();
+  Try<Nothing> openResult = libJvm->open(libJvmPath);
+
+  if (openResult.isError()) {
+    return Error(openResult.error());
+  }
+
+  Try<void*> symbol = libJvm->loadSymbol("JNI_CreateJavaVM");
+
+  if (symbol.isError()) {
+    libJvm->close();
+    return Error(symbol.error());
+  }
+
+  // typedef function pointer to JNI.
+  typedef jint (*fnptr_JNI_CreateJavaVM)(JavaVM**, void**, void*);
+
+  fnptr_JNI_CreateJavaVM fn_JNI_CreateJavaVM =
+    (fnptr_JNI_CreateJavaVM)symbol.get();
+
+  int createResult = fn_JNI_CreateJavaVM(&jvm, JNIENV_CAST(&env), &vmArgs);
+
+  if (createResult == JNI_ERR) {
+    libJvm->close();
     return Error("Failed to create JVM!");
   }
 

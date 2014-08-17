@@ -22,6 +22,8 @@
 #include <list>
 #include <string>
 
+#include <mesos/resources.hpp>
+
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
 #include <process/owned.hpp>
@@ -61,24 +63,24 @@ struct Limitation
 class Isolator
 {
 public:
-  Isolator(process::Owned<IsolatorProcess> process);
+  explicit Isolator(process::Owned<IsolatorProcess> process);
   ~Isolator();
 
   // Recover containers from the run states.
   process::Future<Nothing> recover(
       const std::list<state::RunState>& states);
 
-  // Prepare for isolation of the executor.
-  process::Future<Nothing> prepare(
+  // Prepare for isolation of the executor. Any steps that require execution in
+  // the containerized context (e.g. inside a network namespace) can be
+  // returned in the optional CommandInfo and they will be run by the Launcher.
+  // TODO(idownes): Any URIs or Environment in the CommandInfo will be ignored;
+  // only the command value is used.
+  process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
       const ExecutorInfo& executorInfo);
 
-  // Isolate the executor. Any steps that require execution in the
-  // containerized context (e.g. inside a network namespace) can be returned in
-  // the optional CommandInfo and they will be run by the Launcher.  This could
-  // be a simple command or a URI (including a local file) that will be fetched
-  // and executed.
-  process::Future<Option<CommandInfo> > isolate(
+  // Isolate the executor.
+  process::Future<Nothing> isolate(
       const ContainerID& containerId,
       pid_t pid);
 
@@ -115,11 +117,11 @@ public:
   virtual process::Future<Nothing> recover(
       const std::list<state::RunState>& state) = 0;
 
-  virtual process::Future<Nothing> prepare(
+  virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
       const ExecutorInfo& executorInfo) = 0;
 
-  virtual process::Future<Option<CommandInfo> > isolate(
+  virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,
       pid_t pid) = 0;
 

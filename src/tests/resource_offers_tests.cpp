@@ -63,7 +63,9 @@ TEST_F(ResourceOffersTest, ResourceOfferWithMultipleSlaves)
   // Start 10 slaves.
   for (int i = 0; i < 10; i++) {
     slave::Flags flags = CreateSlaveFlags();
+
     flags.resources = Option<std::string>("cpus:2;mem:1024");
+
     Try<PID<Slave> > slave = StartSlave(flags);
     ASSERT_SOME(slave);
   }
@@ -512,8 +514,9 @@ TEST_F(ResourceOffersTest, Request)
 
 class MultipleExecutorsTest : public MesosTest {};
 
-
-TEST_F(MultipleExecutorsTest, TasksExecutorInfoDiffers)
+// This test verifies that two tasks launched on the same slave with
+// the same executor id but different executor info are rejected.
+TEST_F(MultipleExecutorsTest, ExecutorInfoDiffersOnSameSlave)
 {
   Try<PID<Master> > master = StartMaster();
   ASSERT_SOME(master);
@@ -521,7 +524,7 @@ TEST_F(MultipleExecutorsTest, TasksExecutorInfoDiffers)
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
 
   Try<PID<Slave> > slave = StartSlave(&exec);
-  ASSERT_SOME(master);
+  ASSERT_SOME(slave);
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -548,7 +551,8 @@ TEST_F(MultipleExecutorsTest, TasksExecutorInfoDiffers)
   task1.set_name("");
   task1.mutable_task_id()->set_value("1");
   task1.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task1.mutable_resources()->MergeFrom(Resources::parse("cpus:1;mem:512").get());
+  task1.mutable_resources()->MergeFrom(
+      Resources::parse("cpus:1;mem:512").get());
   task1.mutable_executor()->MergeFrom(executor);
 
   executor.mutable_command()->set_value("exit 2");
@@ -557,7 +561,8 @@ TEST_F(MultipleExecutorsTest, TasksExecutorInfoDiffers)
   task2.set_name("");
   task2.mutable_task_id()->set_value("2");
   task2.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task2.mutable_resources()->MergeFrom(Resources::parse("cpus:1;mem:512").get());
+  task2.mutable_resources()->MergeFrom(
+      Resources::parse("cpus:1;mem:512").get());
   task2.mutable_executor()->MergeFrom(executor);
 
   vector<TaskInfo> tasks;
@@ -589,6 +594,119 @@ TEST_F(MultipleExecutorsTest, TasksExecutorInfoDiffers)
       status.get().message(), "Task has invalid ExecutorInfo"));
 
   EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// This test verifies that two tasks each launched on a different
+// slave with same executor id but different executor info are
+// allowed.
+TEST_F(MultipleExecutorsTest, ExecutorInfoDiffersOnDifferentSlaves)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  driver.start();
+
+  AWAIT_READY(registered);
+
+  Future<vector<Offer> > offers1;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers1));
+
+  // Start the first slave.
+  MockExecutor exec1(DEFAULT_EXECUTOR_ID);
+
+  Try<PID<Slave> > slave1 = StartSlave(&exec1);
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(offers1);
+  EXPECT_NE(0u, offers1.get().size());
+
+  // Launch the first task with the default executor id.
+  ExecutorInfo executor1;
+  executor1 = DEFAULT_EXECUTOR_INFO;
+  executor1.mutable_command()->set_value("exit 1");
+
+  TaskInfo task1 = createTask(
+      offers1.get()[0], executor1.command().value(), executor1.executor_id());
+
+  vector<TaskInfo> tasks1;
+  tasks1.push_back(task1);
+
+  EXPECT_CALL(exec1, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec1, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status1;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status1));
+
+  driver.launchTasks(offers1.get()[0].id(), tasks1);
+
+  AWAIT_READY(status1);
+  ASSERT_EQ(TASK_RUNNING, status1.get().state());
+
+  Future<vector<Offer> > offers2;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // Now start the second slave.
+  MockExecutor exec2(DEFAULT_EXECUTOR_ID);
+
+  Try<PID<Slave> > slave2 = StartSlave(&exec2);
+  ASSERT_SOME(slave2);
+
+  AWAIT_READY(offers2);
+  EXPECT_NE(0u, offers2.get().size());
+
+  // Now launch the second task with the same executor id but
+  // a different executor command.
+  ExecutorInfo executor2;
+  executor2 = executor1;
+  executor2.mutable_command()->set_value("exit 2");
+
+  TaskInfo task2 = createTask(
+      offers2.get()[0], executor2.command().value(), executor2.executor_id());
+
+  vector<TaskInfo> tasks2;
+  tasks2.push_back(task2);
+
+  EXPECT_CALL(exec2, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec2, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status2;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status2));
+
+  driver.launchTasks(offers2.get()[0].id(), tasks2);
+
+  AWAIT_READY(status2);
+  ASSERT_EQ(TASK_RUNNING, status2.get().state());
+
+  EXPECT_CALL(exec1, shutdown(_))
+    .Times(AtMost(1));
+
+  EXPECT_CALL(exec2, shutdown(_))
     .Times(AtMost(1));
 
   driver.stop();

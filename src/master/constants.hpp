@@ -23,6 +23,7 @@
 
 #include <string>
 
+#include <stout/bytes.hpp>
 #include <stout/duration.hpp>
 
 namespace mesos {
@@ -38,6 +39,12 @@ namespace master {
 // So we've moved these to have external linkage but perhaps in the future
 // we can revert this.
 
+// TODO(vinod): Move constants that are only used in flags to
+// 'master/flags.hpp'.
+
+// TODO(jieyu): Use static functions for all the constants. See more
+// details in MESOS-1023.
+
 // Maximum number of slot offers to have outstanding for each framework.
 extern const int MAX_OFFERS_PER_FRAMEWORK;
 
@@ -48,10 +55,34 @@ extern const double MIN_CPUS;
 extern const Bytes MIN_MEM;
 
 // Amount of time within which a slave PING should be received.
+// NOTE: The slave uses these PING constants to determine when
+// the master has stopped sending pings. If these are made
+// configurable, then we'll need to rely on upper/lower bounds
+// to ensure that the slave is not unnecessarily triggering
+// re-registrations.
 extern const Duration SLAVE_PING_TIMEOUT;
 
 // Maximum number of ping timeouts until slave is considered failed.
 extern const uint32_t MAX_SLAVE_PING_TIMEOUTS;
+
+// The minimum timeout that can be used by a newly elected leader to
+// allow re-registration of slaves. Any slaves that do not re-register
+// within this timeout will be shutdown.
+extern const Duration MIN_SLAVE_REREGISTER_TIMEOUT;
+
+// Default limit on the percentage of slaves that will be removed
+// after recovering if no re-registration attempts were made.
+// TODO(bmahler): There's no value here that works for all setups.
+// Currently the default is 100% which is favorable to those running
+// small clusters or experimenting with Mesos. However, it's important
+// that we also prevent the catastrophic 100% removal case for
+// production clusters. This TODO is to provide a --production flag
+// which would allow flag defaults that are more appropriate for
+// production use-cases.
+extern const double RECOVERY_SLAVE_REMOVAL_PERCENT_LIMIT;
+
+// Maximum number of removed slaves to store in the cache.
+extern const size_t MAX_REMOVED_SLAVES;
 
 // Maximum number of completed frameworks to store in the cache.
 // TODO(thomasm): Make configurable.
@@ -70,8 +101,12 @@ extern const uint32_t TASK_LIMIT;
 // Label used by the Leader Contender and Detector.
 extern const std::string MASTER_INFO_LABEL;
 
-} // namespace mesos {
-} // namespace internal {
+// Timeout used for ZooKeeper related operations.
+// TODO(vinod): Master detector/contender should use this timeout.
+extern const Duration ZOOKEEPER_SESSION_TIMEOUT;
+
 } // namespace master {
+} // namespace internal {
+} // namespace mesos {
 
 #endif // __MASTER_CONSTANTS_HPP__

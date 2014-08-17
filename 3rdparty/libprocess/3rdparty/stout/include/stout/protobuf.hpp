@@ -47,12 +47,13 @@ namespace protobuf {
 inline Try<Nothing> write(int fd, const google::protobuf::Message& message)
 {
   if (!message.IsInitialized()) {
-    return Error("Uninitialized protocol buffer");
+    return Error(message.InitializationErrorString() +
+                 " is required but not initialized");
   }
 
   // First write the size of the protobuf.
   uint32_t size = message.ByteSize();
-  std::string bytes = std::string((char*) &size, sizeof(size));
+  std::string bytes((char*) &size, sizeof(size));
 
   Try<Nothing> result = os::write(fd, bytes);
   if (result.isError()) {
@@ -96,22 +97,45 @@ inline Try<Nothing> write(
 // the "size" followed by the contents (as written by 'write' above).
 // If 'ignorePartial' is true, None() is returned when we unexpectedly
 // hit EOF while reading the protobuf (e.g., partial write).
+// If 'undoFailed' is true, failed read attempts will restore the file
+// read/write file offset towards the initial callup position.
 template <typename T>
-inline Result<T> read(int fd, bool ignorePartial = false)
+inline Result<T> read(
+    int fd,
+    bool ignorePartial = false,
+    bool undoFailed = false)
 {
-  // Save the offset so we can re-adjust if something goes wrong.
-  off_t offset = lseek(fd, 0, SEEK_CUR);
-  if (offset == -1) {
-    return ErrnoError("Failed to lseek to SEEK_CUR");
+  off_t offset = 0;
+
+  if (undoFailed) {
+    // Save the offset so we can re-adjust if something goes wrong.
+    offset = lseek(fd, 0, SEEK_CUR);
+    if (offset == -1) {
+      return ErrnoError("Failed to lseek to SEEK_CUR");
+    }
   }
 
   uint32_t size;
   Result<std::string> result = os::read(fd, sizeof(size));
 
-  if (result.isNone()) {
-    return None(); // No more protobufs to read.
-  } else if (result.isError()) {
+  if (result.isError()) {
+    if (undoFailed) {
+      lseek(fd, offset, SEEK_SET);
+    }
     return Error("Failed to read size: " + result.error());
+  } else if (result.isNone()) {
+    return None(); // No more protobufs to read.
+  } else if (result.get().size() < sizeof(size)) {
+    // Hit EOF unexpectedly.
+    if (undoFailed) {
+      // Restore the offset to before the size read.
+      lseek(fd, offset, SEEK_SET);
+    }
+    if (ignorePartial) {
+      return None();
+    }
+    return Error(
+        "Failed to read size: hit EOF unexpectedly, possible corruption");
   }
 
   // Parse the size from the bytes.
@@ -122,18 +146,23 @@ inline Result<T> read(int fd, bool ignorePartial = false)
   // corruption.
   result = os::read(fd, size);
 
-  if (result.isNone()) {
-    // Hit EOF unexpectedly. Restore the offset to before the size read.
-    lseek(fd, offset, SEEK_SET);
+  if (result.isError()) {
+    if (undoFailed) {
+      // Restore the offset to before the size read.
+      lseek(fd, offset, SEEK_SET);
+    }
+    return Error("Failed to read message: " + result.error());
+  } else if (result.isNone() || result.get().size() < size) {
+    // Hit EOF unexpectedly.
+    if (undoFailed) {
+      // Restore the offset to before the size read.
+      lseek(fd, offset, SEEK_SET);
+    }
     if (ignorePartial) {
       return None();
     }
     return Error("Failed to read message of size " + stringify(size) +
                  " bytes: hit EOF unexpectedly, possible corruption");
-  } else if (result.isError()) {
-    // Restore the offset to before the size read.
-    lseek(fd, offset, SEEK_SET);
-    return Error("Failed to read message: " + result.error());
   }
 
   // Parse the protobuf from the string.
@@ -142,12 +171,13 @@ inline Result<T> read(int fd, bool ignorePartial = false)
   const std::string& data = result.get();
 
   T message;
-  google::protobuf::io::ArrayInputStream stream(
-      data.data(), data.size());
+  google::protobuf::io::ArrayInputStream stream(data.data(), data.size());
 
   if (!message.ParseFromZeroCopyStream(&stream)) {
-    // Restore the offset to before the size read.
-    lseek(fd, offset, SEEK_SET);
+    if (undoFailed) {
+      // Restore the offset to before the size read.
+      lseek(fd, offset, SEEK_SET);
+    }
     return Error("Failed to deserialize message");
   }
 
@@ -222,21 +252,21 @@ struct Parser : boost::static_visitor<Try<Nothing> >
           reflection->SetString(message, field, string.value);
         }
         break;
-      case google::protobuf::FieldDescriptor::TYPE_ENUM:
+      case google::protobuf::FieldDescriptor::TYPE_ENUM: {
+        const google::protobuf::EnumValueDescriptor* descriptor =
+          field->enum_type()->FindValueByName(string.value);
+
+        if (descriptor == NULL) {
+          return Error("Failed to find enum for '" + string.value + "'");
+        }
+
         if (field->is_repeated()) {
-          reflection->AddEnum(
-              message,
-              field,
-              field->enum_type()->FindValueByName(
-                  strings::upper(string.value)));
+          reflection->AddEnum(message, field, descriptor);
         } else {
-          reflection->SetEnum(
-              message,
-              field,
-              field->enum_type()->FindValueByName(
-                  strings::upper(string.value)));
+          reflection->SetEnum(message, field, descriptor);
         }
         break;
+      }
       default:
         return Error("Not expecting a JSON string for field '" +
                      field->name() + "'");
@@ -443,9 +473,27 @@ struct Protobuf
   // fields but we may want to revisit this decision.
   Protobuf(const google::protobuf::Message& message)
   {
+    const google::protobuf::Descriptor* descriptor = message.GetDescriptor();
     const google::protobuf::Reflection* reflection = message.GetReflection();
+
+    // We first look through all the possible fields to determine both
+    // the set fields _and_ the optional fields with a default that
+    // are not set. Reflection::ListFields() alone will only include
+    // set fields and is therefore insufficient.
     std::vector<const google::protobuf::FieldDescriptor*> fields;
-    reflection->ListFields(message, &fields);
+    for (int i = 0; i < descriptor->field_count(); i++) {
+      const google::protobuf::FieldDescriptor* field = descriptor->field(i);
+      if (field->is_repeated()) {
+        if (reflection->FieldSize(message, descriptor->field(i)) > 0) {
+          // Has repeated field with members, output as JSON.
+          fields.push_back(field);
+        }
+      } else if (reflection->HasField(message, field) ||
+                 field->has_default_value()) {
+        // Field is set or has default, output as JSON.
+        fields.push_back(field);
+      }
+    }
 
     foreach (const google::protobuf::FieldDescriptor* field, fields) {
       if (field->is_repeated()) {

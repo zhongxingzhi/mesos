@@ -16,6 +16,7 @@
 #define __STOUT_INTERVAL_HPP__
 
 #include <functional> // For std::less.
+#include <iostream>
 
 #include <boost/icl/interval.hpp>
 #include <boost/icl/interval_set.hpp>
@@ -24,6 +25,10 @@
 // Forward declarations.
 template <typename T>
 class Interval;
+
+
+template <typename T>
+class IntervalSet;
 
 
 // Represents a bound (left or right) for an interval. A bound can
@@ -81,8 +86,29 @@ public:
   // Returns the exclusive upper bound of this interval.
   T upper() const { return data.upper(); }
 
+  // Checks if this interval intersects with another interval.
+  bool intersects(const Interval<T>& interval) const;
+
+  // Checks if this interval intersects with an interval set.
+  bool intersects(const IntervalSet<T>& set) const;
+
+  bool operator == (const Interval<T>& that) const
+  {
+    return data == that.data;
+  }
+
+  bool operator != (const Interval<T>& that) const
+  {
+    return !operator == (that);
+  }
+
 private:
   friend class Bound<T>;
+
+  template <typename X>
+  friend std::ostream& operator << (
+      std::ostream& stream,
+      const Interval<X>& interval);
 
   Interval(const boost::icl::right_open_interval<T, std::less>& _data)
     : data(_data) {}
@@ -92,6 +118,13 @@ private:
   // prevent Interval from being passed to bare boost icl containers.
   boost::icl::right_open_interval<T, std::less> data;
 };
+
+
+template <typename T>
+std::ostream& operator << (std::ostream& stream, const Interval<T>& interval)
+{
+  return stream << interval.data;
+}
 
 
 template <typename T>
@@ -160,10 +193,42 @@ public:
     Base::add((lower, upper));
   }
 
-  // Checks if the specified value is in this set.
+  // Checks if an element is in this set.
   bool contains(const T& value) const
   {
     return boost::icl::contains(static_cast<const Base&>(*this), value);
+  }
+
+  // Checks if an interval is in this set.
+  bool contains(const Interval<T>& interval) const
+  {
+    // TODO(jieyu): Boost has an issue regarding unqualified lookup in
+    // template (http://clang.llvm.org/compatibility.html#dep_lookup),
+    // and gcc-4.8 complains about it. We use a workaround here by
+    // delegating this call to the IntervalSet version below.
+    return contains(IntervalSet<T>(interval));
+  }
+
+  // Checks if an interval set is a subset of this set.
+  bool contains(const IntervalSet<T>& set) const
+  {
+    return boost::icl::contains(
+        static_cast<const Base&>(*this),
+        static_cast<const Base&>(set));
+  }
+
+  // Checks if this set intersects with an interval.
+  bool intersects(const Interval<T>& interval) const
+  {
+    return boost::icl::intersects(static_cast<const Base&>(*this), interval);
+  }
+
+  // Checks if this set intersects with another interval set.
+  bool intersects(const IntervalSet<T>& set) const
+  {
+    return boost::icl::intersects(
+        static_cast<const Base&>(*this),
+        static_cast<const Base&>(set));
   }
 
   // Returns the number of intervals in this set.
@@ -173,38 +238,61 @@ public:
   }
 
   // Overloaded operators.
-  template <typename X>
-  IntervalSet<T>& operator += (const X& x)
+  bool operator == (const IntervalSet<T>& that) const
   {
-    static_cast<Base&>(*this) += x;
+    return static_cast<const Base&>(*this) == static_cast<const Base&>(that);
+  }
+
+  bool operator != (const IntervalSet<T>& that) const
+  {
+    return !operator == (that);
+  }
+
+  IntervalSet<T>& operator += (const T& value)
+  {
+    static_cast<Base&>(*this) += value;
     return *this;
   }
 
-  template <typename X>
-  IntervalSet<T>& operator -= (const X& x)
+  IntervalSet<T>& operator += (const Interval<T>& interval)
   {
-    static_cast<Base&>(*this) -= x;
+    static_cast<Base&>(*this) += interval;
     return *this;
   }
 
-  template <typename X>
-  IntervalSet<T>& operator &= (const X& x)
-  {
-    static_cast<Base&>(*this) &= x;
-    return *this;
-  }
-
-  // Special overloads for IntervalSet. According to C++ standard,
-  // a non-template function always wins an ambiguous overload.
   IntervalSet<T>& operator += (const IntervalSet<T>& set)
   {
     static_cast<Base&>(*this) += static_cast<const Base&>(set);
     return *this;
   }
 
+  IntervalSet<T>& operator -= (const T& value)
+  {
+    static_cast<Base&>(*this) -= value;
+    return *this;
+  }
+
+  IntervalSet<T>& operator -= (const Interval<T>& interval)
+  {
+    static_cast<Base&>(*this) -= interval;
+    return *this;
+  }
+
   IntervalSet<T>& operator -= (const IntervalSet<T>& set)
   {
     static_cast<Base&>(*this) -= static_cast<const Base&>(set);
+    return *this;
+  }
+
+  IntervalSet<T>& operator &= (const T& value)
+  {
+    static_cast<Base&>(*this) &= value;
+    return *this;
+  }
+
+  IntervalSet<T>& operator &= (const Interval<T>& interval)
+  {
+    static_cast<Base&>(*this) &= interval;
     return *this;
   }
 
@@ -215,9 +303,53 @@ public:
   }
 
 private:
+  template <typename X>
+  friend std::ostream& operator << (
+      std::ostream& stream,
+      const IntervalSet<X>& set);
+
   // We use typedef here to make the code less verbose.
   typedef boost::icl::interval_set<T, std::less, Interval<T> > Base;
 };
+
+
+template <typename T>
+std::ostream& operator << (std::ostream& stream, const IntervalSet<T>& set)
+{
+  return stream << static_cast<const typename IntervalSet<T>::Base&>(set);
+}
+
+
+template <typename T>
+bool Interval<T>::intersects(const Interval<T>& interval) const
+{
+  return IntervalSet<T>(*this).intersects(interval);
+}
+
+
+template <typename T>
+bool Interval<T>::intersects(const IntervalSet<T>& set) const
+{
+  return set.intersects(*this);
+}
+
+
+template <typename T, typename X>
+IntervalSet<T> operator + (const IntervalSet<T>& set, const X& x)
+{
+  IntervalSet<T> result(set);
+  result += x;
+  return result;
+}
+
+
+template <typename T, typename X>
+IntervalSet<T> operator - (const IntervalSet<T>& set, const X& x)
+{
+  IntervalSet<T> result(set);
+  result -= x;
+  return result;
+}
 
 
 // Defines type traits for the custom Interval above. These type
