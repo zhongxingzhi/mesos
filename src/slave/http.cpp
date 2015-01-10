@@ -167,10 +167,7 @@ JSON::Object model(const Executor& executor)
   object.values["source"] = executor.info.source();
   object.values["container"] = executor.containerId.value();
   object.values["directory"] = executor.directory;
-
-  if (executor.resources.isSome()) {
-    object.values["resources"] = model(executor.resources.get());
-  }
+  object.values["resources"] = model(executor.resources);
 
   JSON::Array tasks;
   foreach (Task* task, executor.launchedTasks.values()) {
@@ -260,7 +257,7 @@ Future<Response> Slave::Http::stats(const Request& request)
   JSON::Object object;
   object.values["uptime"] = (Clock::now() - slave->startTime).secs();
   object.values["total_frameworks"] = slave->frameworks.size();
-  object.values["registered"] = slave->master.isSome() ? "1" : "0";
+  object.values["registered"] = slave->master.isSome() ? 1 : 0;
   object.values["recovery_errors"] = slave->recoveryErrors;
 
   // NOTE: These are monotonically increasing counters.
@@ -354,8 +351,8 @@ Future<Response> Slave::Http::state(const Request& request)
   object.values["id"] = slave->info.id().value();
   object.values["pid"] = string(slave->self());
   object.values["hostname"] = slave->info.hostname();
-  object.values["resources"] = model(slave->resources);
-  object.values["attributes"] = model(slave->attributes);
+  object.values["resources"] = model(slave->info.resources());
+  object.values["attributes"] = model(slave->info.attributes());
   object.values["staged_tasks"] = slave->stats.tasks[TASK_STAGING];
   object.values["started_tasks"] = slave->stats.tasks[TASK_STARTING];
   object.values["finished_tasks"] = slave->stats.tasks[TASK_FINISHED];
@@ -364,7 +361,7 @@ Future<Response> Slave::Http::state(const Request& request)
   object.values["lost_tasks"] = slave->stats.tasks[TASK_LOST];
 
   if (slave->master.isSome()) {
-    Try<string> masterHostname = net::getHostname(slave->master.get().ip);
+    Try<string> masterHostname = net::getHostname(slave->master.get().node.ip);
     if (masterHostname.isSome()) {
       object.values["master_hostname"] = masterHostname.get();
     }

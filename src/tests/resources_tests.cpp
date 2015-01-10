@@ -26,9 +26,12 @@
 
 #include "master/master.hpp"
 
+#include "tests/mesos.hpp"
+
 using namespace mesos;
 using namespace mesos::internal;
 using namespace mesos::internal::master;
+using namespace mesos::internal::tests;
 
 using std::ostringstream;
 using std::pair;
@@ -38,24 +41,24 @@ using std::string;
 TEST(ResourcesTest, Parsing)
 {
   Resource cpus = Resources::parse("cpus", "45.55", "*").get();
+
   ASSERT_EQ(Value::SCALAR, cpus.type());
   EXPECT_EQ(45.55, cpus.scalar().value());
 
-  Resource ports = Resources::parse("ports",
-                                    "[10000-20000, 30000-50000]",
-                                    "*").get();
+  Resource ports = Resources::parse(
+      "ports", "[10000-20000, 30000-50000]", "*").get();
 
   ASSERT_EQ(Value::RANGES, ports.type());
   EXPECT_EQ(2, ports.ranges().range_size());
 
   Resource disks = Resources::parse("disks", "{sda1}", "*").get();
+
   ASSERT_EQ(Value::SET, disks.type());
   ASSERT_EQ(1, disks.set().item_size());
   EXPECT_EQ("sda1", disks.set().item(0));
 
-  Resources r1 = Resources::parse("cpus:45.55;"
-                                  "ports:[10000-20000, 30000-50000];"
-                                  "disks:{sda1}").get();
+  Resources r1 = Resources::parse(
+      "cpus:45.55;ports:[10000-20000, 30000-50000];disks:{sda1}").get();
 
   Resources r2;
   r2 += cpus;
@@ -87,11 +90,10 @@ TEST(ResourcesTest, ParsingWithRoles)
   resources1 += mem;
 
   EXPECT_EQ(parse1, resources1);
-
   EXPECT_EQ(resources1, Resources::parse(stringify(resources1)).get());
 
-  Resources parse2 =
-    Resources::parse("cpus(role1):2.5;ports(role2):[0-100]").get();
+  Resources parse2 = Resources::parse(
+      "cpus(role1):2.5;ports(role2):[0-100]").get();
 
   Resource cpus2;
   cpus2.set_name("cpus");
@@ -112,11 +114,10 @@ TEST(ResourcesTest, ParsingWithRoles)
   resources2 += cpus2;
 
   EXPECT_EQ(parse2, resources2);
-
   EXPECT_EQ(resources2, Resources::parse(stringify(resources2)).get());
 
-  Resources parse3 =
-    Resources::parse("cpus:2.5;ports(role2):[0-100]", "role1").get();
+  Resources parse3 = Resources::parse(
+      "cpus:2.5;ports(role2):[0-100]", "role1").get();
 
   EXPECT_EQ(parse2, parse3);
 }
@@ -129,29 +130,28 @@ TEST(ResourcesTest, ParseError)
 
   // Mismatched parentheses.
   EXPECT_ERROR(Resources::parse("cpus(role1:1"));
-
   EXPECT_ERROR(Resources::parse("cpus)(role1:1"));
 }
 
 
 TEST(ResourcesTest, Resources)
 {
-  Resources r = Resources::parse("cpus:45.55;"
-                                 "mem:1024;"
-                                 "ports:[10000-20000, 30000-50000];"
-                                 "disk:512").get();
+  Resources r = Resources::parse(
+      "cpus:45.55;mem:1024;ports:[10000-20000, 30000-50000];disk:512").get();
 
   EXPECT_SOME_EQ(45.55, r.cpus());
   EXPECT_SOME_EQ(Megabytes(1024), r.mem());
   EXPECT_SOME_EQ(Megabytes(512), r.disk());
 
-  EXPECT_SOME(r.ports());
+  ASSERT_SOME(r.ports());
+
   ostringstream ports;
   ports << r.ports().get();
 
   EXPECT_EQ("[10000-20000, 30000-50000]", ports.str());
 
   r = Resources::parse("cpus:45.55;disk:512").get();
+
   EXPECT_SOME_EQ(45.55, r.cpus());
   EXPECT_SOME_EQ(Megabytes(512), r.disk());
   EXPECT_TRUE(r.mem().isNone());
@@ -161,9 +161,8 @@ TEST(ResourcesTest, Resources)
 
 TEST(ResourcesTest, Printing)
 {
-  Resources r = Resources::parse("cpus:45.55;"
-                                 "ports:[10000-20000, 30000-50000];"
-                                 "disks:{sda1}").get();
+  Resources r = Resources::parse(
+      "cpus:45.55;ports:[10000-20000, 30000-50000];disks:{sda1}").get();
 
   string output =
     "cpus(*):45.55; ports(*):[10000-20000, 30000-50000]; disks(*):{sda1}";
@@ -183,7 +182,7 @@ TEST(ResourcesTest, Printing)
 TEST(ResourcesTest, InitializedIsEmpty)
 {
   Resources r;
-  EXPECT_EQ(0u, r.size());
+  EXPECT_TRUE(r.empty());
 }
 
 
@@ -192,13 +191,18 @@ TEST(ResourcesTest, BadResourcesNotAllocatable)
   Resource cpus;
   cpus.set_type(Value::SCALAR);
   cpus.mutable_scalar()->set_value(1);
+
   Resources r;
   r += cpus;
-  EXPECT_EQ(0u, r.allocatable().size());
+
+  EXPECT_TRUE(r.empty());
+
   cpus.set_name("cpus");
   cpus.mutable_scalar()->set_value(0);
+
   r += cpus;
-  EXPECT_EQ(0u, r.allocatable().size());
+
+  EXPECT_TRUE(r.empty());
 }
 
 
@@ -215,12 +219,13 @@ TEST(ResourcesTest, ScalarEquals)
   r2 += cpus;
   r2 += mem;
 
-  EXPECT_EQ(2u, r1.size());
-  EXPECT_EQ(2u, r2.size());
+  EXPECT_FALSE(r1.empty());
+  EXPECT_FALSE(r2.empty());
   EXPECT_EQ(r1, r2);
 
-  Resource cpus1 = Resources::parse("cpus", "3", "role1").get();
-  Resource cpus2 = Resources::parse("cpus", "3", "role2").get();
+  Resources cpus1 = Resources::parse("cpus", "3", "role1").get();
+  Resources cpus2 = Resources::parse("cpus", "3", "role2").get();
+
   EXPECT_NE(cpus1, cpus2);
 }
 
@@ -241,8 +246,8 @@ TEST(ResourcesTest, ScalarSubset)
   r2 += cpus2;
   r2 += mem2;
 
-  EXPECT_TRUE(r1 <= r2);
-  EXPECT_FALSE(r2 <= r1);
+  EXPECT_TRUE(r2.contains(r1));
+  EXPECT_FALSE(r1.contains(r2));
 }
 
 
@@ -257,18 +262,18 @@ TEST(ResourcesTest, ScalarSubset2)
   Resources r2;
   r2 += cpus2;
 
-  EXPECT_FALSE(cpus1 <= cpus2);
-  EXPECT_FALSE(cpus2 <= cpus1);
+  EXPECT_FALSE(r2.contains(r1));
+  EXPECT_FALSE(r1.contains(r2));
 
   Resource cpus3 = Resources::parse("cpus", "3", "role1").get();
 
   Resources r3;
   r3 += cpus3;
 
-  EXPECT_FALSE(r3 <= r1);
-  EXPECT_FALSE(r3 <= r2);
-  EXPECT_FALSE(r2 <= r3);
-  EXPECT_LE(r1, r3);
+  EXPECT_FALSE(r1.contains(r3));
+  EXPECT_FALSE(r2.contains(r3));
+  EXPECT_FALSE(r3.contains(r2));
+  EXPECT_TRUE(r3.contains(r1));
 }
 
 
@@ -289,15 +294,17 @@ TEST(ResourcesTest, ScalarAddition)
   r2 += mem2;
 
   Resources sum = r1 + r2;
-  EXPECT_EQ(2u, sum.size());
-  EXPECT_EQ(3, sum.get("cpus", Value::Scalar()).value());
-  EXPECT_EQ(15, sum.get("mem", Value::Scalar()).value());
+
+  EXPECT_FALSE(sum.empty());
+  EXPECT_EQ(3, sum.get<Value::Scalar>("cpus").get().value());
+  EXPECT_EQ(15, sum.get<Value::Scalar>("mem").get().value());
 
   Resources r = r1;
   r += r2;
-  EXPECT_EQ(2u, r.size());
-  EXPECT_EQ(3, r.get("cpus", Value::Scalar()).value());
-  EXPECT_EQ(15, r.get("mem", Value::Scalar()).value());
+
+  EXPECT_FALSE(r.empty());
+  EXPECT_EQ(3, r.get<Value::Scalar>("cpus").get().value());
+  EXPECT_EQ(15, r.get<Value::Scalar>("mem").get().value());
 }
 
 
@@ -315,7 +322,8 @@ TEST(ResourcesTest, ScalarAddition2)
   r2 += cpus3;
 
   Resources sum = r1 + r2;
-  EXPECT_EQ(2u, sum.size());
+
+  EXPECT_FALSE(sum.empty());
   EXPECT_EQ(9, sum.cpus().get());
   EXPECT_EQ(sum, Resources::parse("cpus(role1):6;cpus(role2):3").get());
 }
@@ -338,18 +346,21 @@ TEST(ResourcesTest, ScalarSubtraction)
   r2 += mem2;
 
   Resources diff = r1 - r2;
-  EXPECT_EQ(2u, diff.size());
-  EXPECT_EQ(49.5, diff.get("cpus", Value::Scalar()).value());
-  EXPECT_EQ(3072, diff.get("mem", Value::Scalar()).value());
+
+  EXPECT_FALSE(diff.empty());
+  EXPECT_EQ(49.5, diff.get<Value::Scalar>("cpus").get().value());
+  EXPECT_EQ(3072, diff.get<Value::Scalar>("mem").get().value());
 
   Resources r = r1;
   r -= r2;
-  EXPECT_EQ(49.5, diff.get("cpus", Value::Scalar()).value());
-  EXPECT_EQ(3072, diff.get("mem", Value::Scalar()).value());
+
+  EXPECT_EQ(49.5, diff.get<Value::Scalar>("cpus").get().value());
+  EXPECT_EQ(3072, diff.get<Value::Scalar>("mem").get().value());
 
   r = r1;
   r -= r1;
-  EXPECT_EQ(0u, r.allocatable().size());
+
+  EXPECT_TRUE(r.empty());
 }
 
 
@@ -367,7 +378,8 @@ TEST(ResourcesTest, ScalarSubtraction2)
   r2 += cpus3;
 
   Resources diff = r1 - r2;
-  EXPECT_EQ(2u, diff.size());
+
+  EXPECT_FALSE(diff.empty());
   EXPECT_EQ(7, diff.cpus().get());
   EXPECT_EQ(diff, Resources::parse("cpus(role1):4;cpus(role2):3").get());
 }
@@ -375,9 +387,11 @@ TEST(ResourcesTest, ScalarSubtraction2)
 
 TEST(ResourcesTest, RangesEquals)
 {
-  Resource ports1 = Resources::parse("ports", "[20-40]", "*").get();
-  Resource ports2 =
-    Resources::parse("ports", "[20-30, 31-39, 40-40]", "*").get();
+  Resource ports1 = Resources::parse(
+      "ports", "[20-40]", "*").get();
+
+  Resource ports2 = Resources::parse(
+      "ports", "[20-30, 31-39, 40-40]", "*").get();
 
   Resources r1;
   r1 += ports1;
@@ -418,35 +432,36 @@ TEST(ResourcesTest, RangesSubset)
   Resources r5;
   r5 += ports5;
 
-  EXPECT_TRUE(r1 <= r2);
-  EXPECT_FALSE(r2 <= r1);
-  EXPECT_FALSE(r1 <= r3);
-  EXPECT_FALSE(r3 <= r1);
-  EXPECT_TRUE(r3 <= r2);
-  EXPECT_FALSE(r2 <= r3);
-  EXPECT_TRUE(r1 <= r4);
-  EXPECT_TRUE(r4 <= r2);
-  EXPECT_TRUE(r1 <= r5);
-  EXPECT_FALSE(r5 <= r1);
+  EXPECT_TRUE(r2.contains(r1));
+  EXPECT_FALSE(r1.contains(r2));
+  EXPECT_FALSE(r3.contains(r1));
+  EXPECT_FALSE(r1.contains(r3));
+  EXPECT_TRUE(r2.contains(r3));
+  EXPECT_FALSE(r3.contains(r2));
+  EXPECT_TRUE(r4.contains(r1));
+  EXPECT_TRUE(r2.contains(r4));
+  EXPECT_TRUE(r5.contains(r1));
+  EXPECT_FALSE(r1.contains(r5));
 }
 
 
 TEST(ResourcesTest, RangesAddition)
 {
-  Resource ports1 =
-    Resources::parse("ports", "[20000-40000, 21000-38000]", "*").get();
-  Resource ports2 =
-    Resources::parse("ports", "[30000-50000, 10000-20000]", "*").get();
+  Resource ports1 = Resources::parse(
+      "ports", "[20000-40000]", "*").get();
+
+  Resource ports2 = Resources::parse(
+      "ports", "[30000-50000, 10000-20000]", "*").get();
 
   Resources r;
   r += ports1;
   r += ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[10000-50000]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[10000-50000]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
@@ -459,11 +474,11 @@ TEST(ResourcesTest, RangesAddition2)
   r += ports1;
   r += ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[1-65, 70-80]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[1-65, 70-80]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
@@ -478,65 +493,69 @@ TEST(ResourcesTest, RangesAdditon3)
   r1 += ports1;
   r1 += ports2;
 
-  EXPECT_EQ(1u, r1.size());
+  EXPECT_FALSE(r1.empty());
 
-  const Value::Ranges& ranges = r1.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[1-4]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[1-4]").get().ranges(),
+      r1.get<Value::Ranges>("ports"));
 
   Resources r2;
   r2 += ports3;
   r2 += ports4;
 
-  EXPECT_EQ(1u, r2.size());
+  EXPECT_FALSE(r2.empty());
 
-  const Value::Ranges& ranges2 = r2.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[5-8]").get().ranges(), ranges2);
+  EXPECT_SOME_EQ(
+      values::parse("[5-8]").get().ranges(),
+      r2.get<Value::Ranges>("ports"));
 
   r2 += r1;
 
-  EXPECT_EQ(1u, r2.size());
+  EXPECT_FALSE(r2.empty());
 
-  const Value::Ranges& ranges3 = r2.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[1-8]").get().ranges(), ranges3);
+  EXPECT_SOME_EQ(
+      values::parse("[1-8]").get().ranges(),
+      r2.get<Value::Ranges>("ports"));
 }
 
 
 TEST(ResourcesTest, RangesAddition4)
 {
-  Resource ports1 =
-    Resources::parse("ports", "[1-4, 9-10, 20-22, 26-30]", "*").get();
-  Resource ports2 = Resources::parse("ports", "[5-8, 23-25]", "*").get();
+  Resource ports1 = Resources::parse(
+      "ports", "[1-4, 9-10, 20-22, 26-30]", "*").get();
+
+  Resource ports2 = Resources::parse(
+      "ports", "[5-8, 23-25]", "*").get();
 
   Resources r;
   r += ports1;
   r += ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[1-10, 20-30]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[1-10, 20-30]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
 TEST(ResourcesTest, RangesSubtraction)
 {
-  Resource ports1 = Resources::parse("ports", "[20000-40000]", "*").get();
-  Resource ports2 =
-    Resources::parse("ports", "[10000-20000, 30000-50000]", "*").get();
+  Resource ports1 = Resources::parse(
+      "ports", "[20000-40000]", "*").get();
+
+  Resource ports2 = Resources::parse(
+      "ports", "[10000-20000, 30000-50000]", "*").get();
 
   Resources r;
   r += ports1;
   r -= ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[20001-29999]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[20001-29999]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
@@ -549,11 +568,11 @@ TEST(ResourcesTest, RangesSubtraction1)
   r += ports1;
   r -= ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[50002-60000]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[50002-60000]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
@@ -566,11 +585,11 @@ TEST(ResourcesTest, RangesSubtraction2)
   r += ports1;
   r -= ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[50001-60000]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[50001-60000]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
@@ -583,13 +602,11 @@ TEST(ResourcesTest, RangesSubtraction3)
 
   Resources resourcesFree = resources - (resourcesOffered + resourcesInUse);
 
-  resourcesFree = resourcesFree.allocatable();
+  EXPECT_FALSE(resourcesFree.empty());
 
-  EXPECT_EQ(1u, resourcesFree.size());
-
-  const Value::Ranges& ranges = resourcesFree.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[50002-60000]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[50002-60000]").get().ranges(),
+      resourcesFree.get<Value::Ranges>("ports"));
 }
 
 
@@ -598,34 +615,31 @@ TEST(ResourcesTest, RangesSubtraction4)
   Resources resources = Resources::parse("ports:[50000-60000]").get();
 
   Resources resourcesOffered;
-
   resourcesOffered += resources;
-
   resourcesOffered -= resources;
 
-  EXPECT_EQ(0u, resourcesOffered.size());
-
-  const Value::Ranges& ranges = resourcesOffered.get("ports", Value::Ranges());
-
-  EXPECT_EQ(0, ranges.range_size());
+  EXPECT_TRUE(resourcesOffered.empty());
+  EXPECT_NONE(resourcesOffered.get<Value::Ranges>("ports"));
 }
 
 
 TEST(ResourcesTest, RangesSubtraction5)
 {
-  Resource ports1 =
-    Resources::parse("ports", "[1-10, 20-30, 40-50]", "*").get();
-  Resource ports2 = Resources::parse("ports", "[2-9, 15-45, 48-50]", "*").get();
+  Resource ports1 = Resources::parse(
+      "ports", "[1-10, 20-30, 40-50]", "*").get();
+
+  Resource ports2 = Resources::parse(
+      "ports", "[2-9, 15-45, 48-50]", "*").get();
 
   Resources r;
   r += ports1;
   r -= ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[1-1, 10-10, 46-47]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[1-1, 10-10, 46-47]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
@@ -638,11 +652,11 @@ TEST(ResourcesTest, RangesSubtraction6)
   r += ports1;
   r -= ports2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Ranges& ranges = r.get("ports", Value::Ranges());
-
-  EXPECT_EQ(values::parse("[1-10]").get().ranges(), ranges);
+  EXPECT_SOME_EQ(
+      values::parse("[1-10]").get().ranges(),
+      r.get<Value::Ranges>("ports"));
 }
 
 
@@ -662,9 +676,11 @@ TEST(ResourcesTest, SetEquals)
 
 TEST(ResourcesTest, SetSubset)
 {
-  Resource disks1 = Resources::parse("disks", "{sda1,sda2}", "*").get();
-  Resource disks2 =
-    Resources::parse("disks", "{sda1,sda3,sda4,sda2}", "*").get();
+  Resource disks1 = Resources::parse(
+      "disks", "{sda1,sda2}", "*").get();
+
+  Resource disks2 = Resources::parse(
+      "disks", "{sda1,sda3,sda4,sda2}", "*").get();
 
   Resources r1;
   r1 += disks1;
@@ -672,47 +688,53 @@ TEST(ResourcesTest, SetSubset)
   Resources r2;
   r2 += disks2;
 
-  EXPECT_EQ(1u, r1.size());
-  EXPECT_EQ(1u, r2.size());
-  EXPECT_TRUE(r1 <= r2);
-  EXPECT_FALSE(r2 <= r1);
+  EXPECT_FALSE(r1.empty());
+  EXPECT_FALSE(r2.empty());
+  EXPECT_TRUE(r2.contains(r1));
+  EXPECT_FALSE(r1.contains(r2));
 }
 
 
 TEST(ResourcesTest, SetAddition)
 {
-  Resource disks1 = Resources::parse("disks", "{sda1,sda2,sda3}", "*").get();
-  Resource disks2 =
-    Resources::parse("disks", "{sda1,sda2,sda3,sda4}", "*").get();
+  Resource disks1 = Resources::parse(
+      "disks", "{sda1,sda2,sda3}", "*").get();
+
+  Resource disks2 = Resources::parse(
+      "disks", "{sda1,sda2,sda3,sda4}", "*").get();
 
   Resources r;
   r += disks1;
   r += disks2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Set& set = r.get("disks", Value::Set());
+  Option<Value::Set> set = r.get<Value::Set>("disks");
 
-  EXPECT_EQ(4, set.item_size());
+  ASSERT_SOME(set);
+  EXPECT_EQ(4, set.get().item_size());
 }
 
 
 TEST(ResourcesTest, SetSubtraction)
 {
-  Resource disks1 =
-    Resources::parse("disks", "{sda1,sda2,sda3,sda4}", "*").get();
-  Resource disks2 = Resources::parse("disks", "{sda2,sda3,sda4}", "*").get();
+  Resource disks1 = Resources::parse(
+      "disks", "{sda1,sda2,sda3,sda4}", "*").get();
+
+  Resource disks2 = Resources::parse(
+      "disks", "{sda2,sda3,sda4}", "*").get();
 
   Resources r;
   r += disks1;
   r -= disks2;
 
-  EXPECT_EQ(1u, r.size());
+  EXPECT_FALSE(r.empty());
 
-  const Value::Set& set = r.get("disks", Value::Set());
+  Option<Value::Set> set = r.get<Value::Set>("disks");
 
-  EXPECT_EQ(1, set.item_size());
-  EXPECT_EQ("sda1", set.item(0));
+  ASSERT_SOME(set);
+  EXPECT_EQ(1, set.get().item_size());
+  EXPECT_EQ("sda1", set.get().item(0));
 }
 
 
@@ -722,6 +744,33 @@ TEST(ResourcesTest, EmptyUnequal)
   Resources cpus2 = Resources::parse("cpus:2").get();
 
   EXPECT_FALSE(empty == cpus2);
+}
+
+
+TEST(ResourcesTest, Reservations)
+{
+  Resources unreserved = Resources::parse(
+      "cpus:1;mem:2;disk:4").get();
+  Resources role1 = Resources::parse(
+      "cpus(role1):2;mem(role1):4;disk(role1):8;").get();
+  Resources role2 = Resources::parse(
+      "cpus(role2):4;mem(role2):8;disk(role2):6;").get();
+
+  Resources resources = unreserved + role1 + role2;
+
+  hashmap<string, Resources> reserved = resources.reserved();
+
+  EXPECT_EQ(2u, reserved.size());
+  EXPECT_EQ(role1, reserved["role1"]);
+  EXPECT_EQ(role2, reserved["role2"]);
+
+  EXPECT_EQ(role1, resources.reserved("role1"));
+  EXPECT_EQ(role2, resources.reserved("role2"));
+
+  // Resources with role "*" are not considered reserved.
+  EXPECT_EQ(Resources(), resources.reserved("*"));
+
+  EXPECT_EQ(unreserved, resources.unreserved());
 }
 
 
@@ -742,38 +791,167 @@ TEST(ResourcesTest, FlattenRoles)
 
 TEST(ResourcesTest, Find)
 {
-  Resources resources1 =
-    Resources::parse("cpus(role1):2;mem(role1):10;cpus:4;mem:20").get();
-  Resources toFind1 = Resources::parse("cpus:3;mem:15").get();
+  Resources resources1 = Resources::parse(
+      "cpus(role1):2;mem(role1):10;cpus:4;mem:20").get();
 
-  Resources found1 = resources1.find(toFind1, "role1").get();
-  Resources expected1 =
-    Resources::parse("cpus(role1):2;mem(role1):10;cpus:1;mem:5").get();
-  EXPECT_EQ(found1, expected1);
+  Resources targets1 = Resources::parse(
+      "cpus(role1):3;mem(role1):15").get();
 
-  Resources resources2 =
-    Resources::parse("cpus(role1):1;mem(role1):5;cpus(role2):2;"
-                     "mem(role2):8;cpus:1;mem:7").get();
-  Resources toFind2 = Resources::parse("cpus:3;mem:15").get();
+  EXPECT_SOME_EQ(
+      Resources::parse("cpus(role1):2;mem(role1):10;cpus:1;mem:5").get(),
+      resources1.find(targets1));
 
-  Resources found2 = resources2.find(toFind2, "role1").get();
-  Resources expected2 =
-    Resources::parse("cpus(role1):1;mem(role1):5;cpus:1;mem:7;"
-                     "cpus(role2):1;mem(role2):3").get();
-  EXPECT_EQ(found2, expected2);
+  Resources resources2 = Resources::parse(
+      "cpus(role1):1;mem(role1):5;cpus(role2):2;"
+      "mem(role2):8;cpus:1;mem:7").get();
 
-  Resources resources3 =
-    Resources::parse("cpus(role1):5;mem(role1):5;cpus:5;mem:5").get();
-  Resources toFind3 = Resources::parse("cpus:6;mem:6").get();
+  Resources targets2 = Resources::parse(
+      "cpus(role1):3;mem(role1):15").get();
 
-  Resources found3 = resources3.find(toFind3).get();
-  Resources expected3 =
-    Resources::parse("cpus:5;mem:5;cpus(role1):1;mem(role1):1").get();
+  EXPECT_SOME_EQ(
+      Resources::parse(
+        "cpus(role1):1;mem(role1):5;cpus:1;mem:7;"
+        "cpus(role2):1;mem(role2):3").get(),
+      resources2.find(targets2));
 
-  EXPECT_EQ(found3, expected3);
+  Resources resources3 = Resources::parse(
+      "cpus(role1):5;mem(role1):5;cpus:5;mem:5").get();
+
+  Resources targets3 = Resources::parse("cpus:6;mem:6").get();
+
+  EXPECT_SOME_EQ(
+      Resources::parse("cpus:5;mem:5;cpus(role1):1;mem(role1):1").get(),
+      resources3.find(targets3));
 
   Resources resources4 = Resources::parse("cpus(role1):1;mem(role1):1").get();
-  Resources toFind4 = Resources::parse("cpus:2;mem:2").get();
+  Resources targets4 = Resources::parse("cpus(role1):2;mem(role1):2").get();
 
-  EXPECT_NONE(resources4.find(toFind1, "role1"));
+  EXPECT_NONE(resources4.find(targets4));
+}
+
+
+// Helper for creating a disk resource.
+static Resource createDiskResource(
+    const string& value,
+    const string& role,
+    const Option<string>& persistenceID,
+    const Option<string>& containerPath)
+{
+  Resource resource = Resources::parse("disk", value, role).get();
+
+  if (persistenceID.isSome() || containerPath.isSome()) {
+    resource.mutable_disk()->CopyFrom(
+        createDiskInfo(persistenceID, containerPath));
+  }
+
+  return resource;
+}
+
+
+TEST(DiskResourcesTest, Validation)
+{
+  Resource cpus = Resources::parse("cpus", "2", "*").get();
+  cpus.mutable_disk()->CopyFrom(createDiskInfo("1", "path"));
+
+  Option<Error> error = Resources::validate(cpus);
+  ASSERT_SOME(error);
+  EXPECT_EQ(
+      "DiskInfo should not be set for cpus resource",
+      error.get().message);
+
+  EXPECT_NONE(
+      Resources::validate(createDiskResource("10", "role", "1", "path")));
+
+  EXPECT_NONE(
+      Resources::validate(createDiskResource("10", "*", None(), "path")));
+}
+
+
+TEST(DiskResourcesTest, Equals)
+{
+  Resources r1 = createDiskResource("10", "*", None(), None());
+  Resources r2 = createDiskResource("10", "*", None(), "path1");
+  Resources r3 = createDiskResource("10", "*", None(), "path2");
+  Resources r4 = createDiskResource("10", "role", None(), "path2");
+  Resources r5 = createDiskResource("10", "role", "1", "path1");
+  Resources r6 = createDiskResource("10", "role", "1", "path2");
+  Resources r7 = createDiskResource("10", "role", "2", "path2");
+
+  EXPECT_EQ(r1, r2);
+  EXPECT_EQ(r2, r3);
+  EXPECT_EQ(r5, r6);
+
+  EXPECT_NE(r6, r7);
+  EXPECT_NE(r4, r7);
+}
+
+
+TEST(DiskResourcesTest, Addition)
+{
+  Resources r1 = createDiskResource("10", "role", None(), "path");
+  Resources r2 = createDiskResource("10", "role", None(), None());
+  Resources r3 = createDiskResource("20", "role", None(), "path");
+
+  EXPECT_EQ(r3, r1 + r2);
+
+  Resources r4 = createDiskResource("10", "role", "1", "path");
+  Resources r5 = createDiskResource("10", "role", "2", "path");
+  Resources r6 = createDiskResource("20", "role", "1", "path");
+
+  Resources sum = r4 + r5;
+
+  EXPECT_TRUE(sum.contains(r4));
+  EXPECT_TRUE(sum.contains(r5));
+  EXPECT_FALSE(sum.contains(r3));
+  EXPECT_FALSE(sum.contains(r6));
+}
+
+
+TEST(DiskResourcesTest, Subtraction)
+{
+  Resources r1 = createDiskResource("10", "role", None(), "path");
+  Resources r2 = createDiskResource("10", "role", None(), None());
+
+  EXPECT_TRUE((r1 - r2).empty());
+
+  Resources r3 = createDiskResource("10", "role", "1", "path");
+  Resources r4 = createDiskResource("10", "role", "2", "path");
+  Resources r5 = createDiskResource("10", "role", "2", "path2");
+
+  EXPECT_EQ(r3, r3 - r4);
+  EXPECT_TRUE((r3 - r3).empty());
+  EXPECT_TRUE((r4 - r5).empty());
+}
+
+
+TEST(DiskResourcesTest, FilterPersistentDisks)
+{
+  Resources resources = Resources::parse("cpus:1;mem:512;disk:1000").get();
+
+  Resources disk1 = createDiskResource("10", "role1", "1", "path");
+  Resources disk2 = createDiskResource("20", "role2", None(), None());
+
+  resources += disk1;
+  resources += disk2;
+
+  EXPECT_EQ(resources.persistentDisks(), disk1);
+}
+
+
+TEST(ResourcesTransformationTest, AcquirePersistentDisk)
+{
+  Resources total = Resources::parse("cpus:1;mem:512;disk(role):1000").get();
+
+  Resource disk1 = createDiskResource("200", "role", "1", "path");
+  Resources::AcquirePersistentDisk acquire1(disk1);
+
+  EXPECT_SOME_EQ(
+      Resources::parse("cpus:1;mem:512;disk(role):800").get() + disk1,
+      acquire1(total));
+
+  // Check the case of insufficient disk resources.
+  Resource disk2 = createDiskResource("2000", "role", "1", "path");
+  Resources::AcquirePersistentDisk acquire2(disk2);
+
+  EXPECT_ERROR(acquire2(total));
 }

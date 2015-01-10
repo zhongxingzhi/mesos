@@ -24,6 +24,8 @@ EXTRA_DIST =
 
 PHONY_TARGETS =
 
+pkgconfigdir = $(libdir)/pkgconfig
+pkgconfig_DATA = mesos.pc
 
 # Since we generate several files in src/ with config.status, make
 # sure they're regenerated before we recurse into the src directory.
@@ -35,6 +37,13 @@ all-recursive: src/python/setup.py			\
 # Standard stuff.
 EXTRA_DIST += bootstrap LICENSE NOTICE README.md	\
 	support/atexit.sh support/colors.sh
+
+# On install, pip fetches and installs all missing dependencies. When running
+# distcheck, this behavior ends up installing files that we are not able to
+# uninstall (protobuf for example). Using this flag during the distcheck run
+# forces us to verify that we can install/uninstall the mesos specific
+# libraries and only those libraries.
+AM_DISTCHECK_CONFIGURE_FLAGS = --disable-python-dependency-install
 
 
 # MPI framework.

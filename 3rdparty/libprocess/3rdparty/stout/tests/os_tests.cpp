@@ -133,6 +133,30 @@ TEST_F(OsTest, system)
 }
 
 
+TEST_F(OsTest, cloexec)
+{
+  Try<int> fd = os::open(
+      "cloexec",
+      O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC,
+      S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+
+  ASSERT_SOME(fd);
+  EXPECT_SOME_TRUE(os::isCloexec(fd.get()));
+
+  close(fd.get());
+
+  fd = os::open(
+      "non-cloexec",
+      O_CREAT | O_WRONLY | O_APPEND,
+      S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+
+  ASSERT_SOME(fd);
+  EXPECT_SOME_FALSE(os::isCloexec(fd.get()));
+
+  close(fd.get());
+}
+
+
 TEST_F(OsTest, nonblock)
 {
   int pipes[2];
@@ -265,7 +289,7 @@ TEST_F(OsTest, sysname)
 
 TEST_F(OsTest, release)
 {
-  const Try<os::Release>& info = os::release();
+  const Try<Version>& info = os::release();
 
   ASSERT_SOME(info);
 }
@@ -471,8 +495,7 @@ TEST_F(OsTest, processes)
 void dosetsid(void)
 {
   if (::setsid() == -1) {
-    perror("Failed to setsid");
-    abort();
+    ABORT(string("Failed to setsid: ") + strerror(errno));
   }
 }
 
@@ -597,6 +620,115 @@ TEST_F(OsTest, killtree)
 
   // We have to reap the child for running the tests in repetition.
   ASSERT_EQ(child, waitpid(child, NULL, 0));
+}
+
+
+TEST_F(OsTest, killtreeNoRoot)
+{
+  Try<ProcessTree> tree =
+    Fork(dosetsid,        // Child.
+         Fork(None(),     // Grandchild.
+              Fork(None(),
+                   Exec("sleep 100")),
+              Exec("sleep 100")),
+         Exec("exit 0"))();
+  ASSERT_SOME(tree);
+
+  // The process tree we instantiate initially looks like this:
+  //
+  // -+- child exit 0             [new session and process group leader]
+  //  \-+- grandchild sleep 100
+  //   \-+- great grandchild sleep 100
+  //
+  // But becomes the following tree after the child exits:
+  //
+  // -+- child (exited 0)
+  //  \-+- grandchild sleep 100
+  //   \-+- great grandchild sleep 100
+  //
+  // And gets reparented when we reap the child:
+  //
+  // -+- new parent
+  //  \-+- grandchild sleep 100
+  //   \-+- great grandchild sleep 100
+
+  // Grab the pids from the instantiated process tree.
+  ASSERT_EQ(1u, tree.get().children.size());
+  ASSERT_EQ(1u, tree.get().children.front().children.size());
+
+  pid_t child = tree.get();
+  pid_t grandchild = tree.get().children.front();
+  pid_t greatGrandchild = tree.get().children.front().children.front();
+
+  // Wait for the child to exit.
+  Duration elapsed = Duration::zero();
+  while (true) {
+    Result<os::Process> process = os::process(child);
+    ASSERT_FALSE(process.isError());
+
+    if (process.get().zombie) {
+      break;
+    }
+
+    if (elapsed > Seconds(1)) {
+      FAIL() << "Child process " << stringify(child) << " did not terminate";
+    }
+
+    os::sleep(Milliseconds(5));
+    elapsed += Milliseconds(5);
+  }
+
+  // Ensure we reap our child now.
+  EXPECT_SOME(os::process(child));
+  EXPECT_TRUE(os::process(child).get().zombie);
+  ASSERT_EQ(child, waitpid(child, NULL, 0));
+
+  // Check the grandchild and great grandchild are still running.
+  ASSERT_TRUE(os::exists(grandchild));
+  ASSERT_TRUE(os::exists(greatGrandchild));
+
+  // Check the subtree has been reparented: the parent is no longer
+  // child (the root of the tree), and that the process is not a
+  // zombie. This is done because some systems run a secondary init
+  // process for the user (init --user) that does not have pid 1,
+  // meaning we can't just check that the parent pid == 1.
+  Result<os::Process> _grandchild = os::process(grandchild);
+  ASSERT_SOME(_grandchild);
+  ASSERT_NE(child, _grandchild.get().parent);
+  ASSERT_FALSE(_grandchild.get().zombie);
+
+  // Check that grandchild's parent is also not a zombie.
+  Result<os::Process> currentParent = os::process(_grandchild.get().parent);
+  ASSERT_SOME(currentParent);
+  ASSERT_FALSE(currentParent.get().zombie);
+
+
+  // Kill the process tree. Even though the root process has exited,
+  // we specify to follow sessions and groups which should kill the
+  // grandchild and greatgrandchild.
+  Try<std::list<ProcessTree>> trees = os::killtree(child, SIGKILL, true, true);
+
+  ASSERT_SOME(trees);
+  EXPECT_FALSE(trees.get().empty());
+
+  // All processes should be reparented and reaped by init.
+  elapsed = Duration::zero();
+  while (true) {
+    if (os::process(grandchild).isNone() &&
+        os::process(greatGrandchild).isNone()) {
+      break;
+    }
+
+    if (elapsed > Seconds(10)) {
+      FAIL() << "Processes were not reaped after killtree invocation";
+    }
+
+    os::sleep(Milliseconds(5));
+    elapsed += Milliseconds(5);
+  }
+
+  EXPECT_NONE(os::process(grandchild));
+  EXPECT_NONE(os::process(greatGrandchild));
 }
 
 
@@ -725,4 +857,44 @@ TEST_F(OsTest, user)
 
   EXPECT_SOME(os::su(user.get()));
   EXPECT_ERROR(os::su(UUID::random().toString()));
+}
+
+
+// Test setting/resetting/appending to LD_LIBRARY_PATH environment
+// variable (DYLD_LIBRARY_PATH on OS X).
+TEST_F(OsTest, Libraries)
+{
+  const std::string path1 = "/tmp/path1";
+  const std::string path2 = "/tmp/path1";
+  std::string ldLibraryPath;
+  const std::string originalLibraryPath = os::libraries::paths();
+
+  // Test setPaths.
+  os::libraries::setPaths(path1);
+  EXPECT_EQ(os::libraries::paths(), path1);
+
+  // Test appendPaths.
+  // 1. With empty LD_LIBRARY_PATH.
+  // 1a. Set LD_LIBRARY_PATH to an empty string.
+  os::libraries::setPaths("");
+  ldLibraryPath = os::libraries::paths();
+  EXPECT_EQ(ldLibraryPath, "");
+
+  // 1b. Now test appendPaths.
+  os::libraries::appendPaths(path1);
+  EXPECT_EQ(os::libraries::paths(), path1);
+
+  // 2. With non-empty LD_LIBRARY_PATH.
+  // 2a. Set LD_LIBRARY_PATH to some non-empty value.
+  os::libraries::setPaths(path2);
+  ldLibraryPath = os::libraries::paths();
+  EXPECT_EQ(ldLibraryPath, path2);
+
+  // 2b. Now test appendPaths.
+  os::libraries::appendPaths(path1);
+  EXPECT_EQ(os::libraries::paths(), path2 + ":" + path1);
+
+  // Reset LD_LIBRARY_PATH.
+  os::libraries::setPaths(originalLibraryPath);
+  EXPECT_EQ(os::libraries::paths(), originalLibraryPath);
 }

@@ -30,16 +30,24 @@ PICOJSON = 3rdparty/picojson-$(PICOJSON_VERSION)
 noinst_LTLIBRARIES = libprocess.la
 
 libprocess_la_SOURCES =		\
+  src/clock.cpp			\
   src/config.hpp		\
   src/decoder.hpp		\
   src/encoder.hpp		\
+  src/event_loop.hpp		\
   src/gate.hpp			\
+  src/help.cpp			\
   src/http.cpp			\
+  src/io.cpp			\
   src/latch.cpp			\
   src/metrics/metrics.cpp	\
   src/pid.cpp			\
+  src/poll_socket.cpp		\
+  src/poll_socket.hpp		\
   src/process.cpp		\
+  src/process_reference.hpp	\
   src/reap.cpp			\
+  src/socket.cpp		\
   src/subprocess.cpp		\
   src/synchronized.hpp		\
   src/timeseries.cpp
@@ -51,6 +59,18 @@ libprocess_la_CPPFLAGS =		\
   -I$(LIBEV)				\
   -I$(PICOJSON)				\
   $(AM_CPPFLAGS)
+
+if ENABLE_LIBEVENT
+libprocess_la_SOURCES +=	\
+    src/libevent.hpp		\
+    src/libevent.cpp		\
+    src/libevent_poll.cpp
+else
+  libprocess_la_SOURCES +=	\
+    src/libev.hpp		\
+    src/libev.cpp		\
+    src/libev_poll.cpp
+endif
 
 if WITH_BUNDLED_GLOG
   libprocess_la_CPPFLAGS += -I$(GLOG)/src
@@ -68,16 +88,20 @@ else
   HTTP_PARSER_LIB = -lhttp_parser
 endif
 
-if WITH_BUNDLED_LIBEV
-  LIBEV_LIB = $(LIBEV)/libev.la
+if ENABLE_LIBEVENT
+  EVENT_LIB = -levent -levent_pthreads
 else
-  LIBEV_LIB = -lev
+if WITH_BUNDLED_LIBEV
+  EVENT_LIB = $(LIBEV)/libev.la
+else
+  EVENT_LIB = -lev
+endif
 endif
 
 libprocess_la_LIBADD =			\
   $(LIBGLOG)				\
   $(HTTP_PARSER_LIB)			\
-  $(LIBEV_LIB)
+  $(EVENT_LIB)
 
 if HAS_GPERFTOOLS
 libprocess_la_CPPFLAGS += -I$(GPERFTOOLS)/src
@@ -85,7 +109,7 @@ libprocess_la_LIBADD += $(GPERFTOOLS)/libprofiler.la
 endif
 
 # Tests.
-check_PROGRAMS = tests
+check_PROGRAMS = tests benchmarks
 
 tests_SOURCES =							\
   src/tests/decoder_tests.cpp					\
@@ -118,13 +142,29 @@ tests_LDADD =				\
   libprocess.la				\
   $(LIBGLOG)				\
   $(HTTP_PARSER_LIB)			\
-  $(LIBEV_LIB)
+  $(EVENT_LIB)
+
+benchmarks_SOURCES =			\
+  src/tests/benchmarks.cpp
+
+benchmarks_CPPFLAGS =			\
+  -I$(top_srcdir)/src			\
+  -I$(GTEST)/include			\
+  -I$(GMOCK)/include			\
+  $(libprocess_la_CPPFLAGS)
+
+benchmarks_LDADD =			\
+  3rdparty/libgmock.la			\
+  libprocess.la				\
+  $(LIBGLOG)				\
+  $(HTTP_PARSER_LIB)			\
+  $(EVENT_LIB)
 
 # We use a check-local target for now to avoid the parallel test
 # runner that ships with newer versions of autotools.
 # See the following discussion for the workaround:
 # http://lists.gnu.org/archive/html/automake/2013-01/msg00051.html
-check-local: tests
+check-local: tests benchmarks
 	./tests
 
 # TODO(benh): Fix shared builds (tests need libglog, libev, etc).

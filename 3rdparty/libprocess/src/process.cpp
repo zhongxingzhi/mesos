@@ -1,5 +1,4 @@
 #include <errno.h>
-#include <ev.h>
 #include <limits.h>
 #include <libgen.h>
 #include <netdb.h>
@@ -41,8 +40,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include <boost/shared_array.hpp>
-
+#include <process/check.hpp>
 #include <process/clock.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
@@ -56,6 +54,7 @@
 #include <process/io.hpp>
 #include <process/logging.hpp>
 #include <process/mime.hpp>
+#include <process/node.hpp>
 #include <process/process.hpp>
 #include <process/profiler.hpp>
 #include <process/socket.hpp>
@@ -80,7 +79,9 @@
 #include "config.hpp"
 #include "decoder.hpp"
 #include "encoder.hpp"
+#include "event_loop.hpp"
 #include "gate.hpp"
+#include "process_reference.hpp"
 #include "synchronized.hpp"
 
 using namespace process::metrics::internal;
@@ -95,6 +96,7 @@ using process::http::OK;
 using process::http::Request;
 using process::http::Response;
 using process::http::ServiceUnavailable;
+using process::network::Socket;
 
 using std::deque;
 using std::find;
@@ -108,33 +110,6 @@ using std::stack;
 using std::string;
 using std::stringstream;
 using std::vector;
-
-// Represents a remote "node" (encapsulates IP address and port).
-class Node
-{
-public:
-  Node(uint32_t _ip = 0, uint16_t _port = 0)
-    : ip(_ip), port(_port) {}
-
-  bool operator < (const Node& that) const
-  {
-    if (ip == that.ip) {
-      return port < that.port;
-    } else {
-      return ip < that.ip;
-    }
-  }
-
-  ostream& operator << (ostream& stream) const
-  {
-    stream << ip << ":" << port;
-    return stream;
-  }
-
-  uint32_t ip;
-  uint16_t port;
-};
-
 
 namespace process {
 
@@ -162,81 +137,6 @@ namespace mime {
 map<string, string> types;
 
 } // namespace mime {
-
-
-// Provides reference counting semantics for a process pointer.
-class ProcessReference
-{
-public:
-  ProcessReference() : process(NULL) {}
-
-  ~ProcessReference()
-  {
-    cleanup();
-  }
-
-  ProcessReference(const ProcessReference& that)
-  {
-    copy(that);
-  }
-
-  ProcessReference& operator = (const ProcessReference& that)
-  {
-    if (this != &that) {
-      cleanup();
-      copy(that);
-    }
-    return *this;
-  }
-
-  ProcessBase* operator -> ()
-  {
-    return process;
-  }
-
-  operator ProcessBase* ()
-  {
-    return process;
-  }
-
-  operator bool () const
-  {
-    return process != NULL;
-  }
-
-private:
-  friend class ProcessManager; // For ProcessManager::use.
-
-  explicit ProcessReference(ProcessBase* _process)
-    : process(_process)
-  {
-    if (process != NULL) {
-      __sync_fetch_and_add(&(process->refs), 1);
-    }
-  }
-
-  void copy(const ProcessReference& that)
-  {
-    process = that.process;
-
-    if (process != NULL) {
-      // There should be at least one reference to the process, so
-      // we don't need to worry about checking if it's exiting or
-      // not, since we know we can always create another reference.
-      CHECK(process->refs > 0);
-      __sync_fetch_and_add(&(process->refs), 1);
-    }
-  }
-
-  void cleanup()
-  {
-    if (process != NULL) {
-      __sync_fetch_and_sub(&(process->refs), 1);
-    }
-  }
-
-  ProcessBase* process;
-};
 
 
 // Provides a process that manages sending HTTP responses so as to
@@ -367,7 +267,7 @@ public:
   SocketManager();
   ~SocketManager();
 
-  Socket accepted(int s);
+  void accepted(const Socket& socket);
 
   void link(ProcessBase* process, const UPID& to);
 
@@ -387,11 +287,21 @@ public:
   void exited(ProcessBase* process);
 
 private:
-  // Map from UPID (local/remote) to process.
-  map<UPID, set<ProcessBase*> > links;
+  // TODO(bmahler): Leverage a bidirectional multimap instead, or
+  // hide the complexity of manipulating 'links' through methods.
+  struct
+  {
+    // For links, we maintain a bidirectional mapping between the
+    // "linkers" (Processes) and the "linkees" (remote / local UPIDs).
+    // For remote nodes, we also need a mapping to the linkees on the
+    // node, because socket closure only notifies at the node level.
+    hashmap<UPID, hashset<ProcessBase*>> linkers;
+    hashmap<ProcessBase*, hashset<UPID>> linkees;
+    hashmap<Node, hashset<UPID>> remotes;
+  } links;
 
   // Collection of all actice sockets.
-  map<int, Socket> sockets;
+  map<int, Socket*> sockets;
 
   // Collection of sockets that should be disposed when they are
   // finished being used (e.g., when there is no more data to send on
@@ -533,58 +443,20 @@ const string Profiler::STOP_HELP = HELP(
 // Unique id that can be assigned to each process.
 static uint32_t __id__ = 0;
 
+// Server socket listen backlog.
+static const int LISTEN_BACKLOG = 500000;
+
 // Local server socket.
-static int __s__ = -1;
+static Socket* __s__ = NULL;
 
-// Local IP address.
-static uint32_t __ip__ = 0;
-
-// Local port.
-static uint16_t __port__ = 0;
+// Local node.
+static Node __node__;
 
 // Active SocketManager (eventually will probably be thread-local).
 static SocketManager* socket_manager = NULL;
 
 // Active ProcessManager (eventually will probably be thread-local).
 static ProcessManager* process_manager = NULL;
-
-// Event loop.
-static struct ev_loop* loop = NULL;
-
-// Asynchronous watcher for interrupting loop.
-static ev_async async_watcher;
-
-// Watcher for timeouts.
-static ev_timer timeouts_watcher;
-
-// Server watcher for accepting connections.
-static ev_io server_watcher;
-
-// Queue of I/O watchers to be asynchronously added to the event loop
-// (protected by 'watchers' below).
-// TODO(benh): Replace this queue with functions that we put in
-// 'functions' below that perform the ev_io_start themselves.
-static queue<ev_io*>* watchers = new queue<ev_io*>();
-static synchronizable(watchers) = SYNCHRONIZED_INITIALIZER;
-
-// Queue of functions to be invoked asynchronously within the vent
-// loop (protected by 'watchers' below).
-static queue<lambda::function<void(void)> >* functions =
-  new queue<lambda::function<void(void)> >();
-
-// We store the timers in a map of lists indexed by the timeout of the
-// timer so that we can have two timers that have the same timeout. We
-// exploit that the map is SORTED!
-static map<Time, list<Timer> >* timeouts = new map<Time, list<Timer> >();
-static synchronizable(timeouts) = SYNCHRONIZED_INITIALIZER_RECURSIVE;
-
-// For supporting Clock::settle(), true if timers have been removed
-// from 'timeouts' but may not have been executed yet. Protected by
-// the timeouts lock. This is only used when the clock is paused.
-static bool pending_timers = false;
-
-// Flag to indicate whether or to update the timer on async interrupt.
-static bool update_timer = false;
 
 // Scheduling gate that threads wait at when there is nothing to run.
 static Gate* gate = new Gate();
@@ -611,185 +483,12 @@ ThreadLocal<Executor>* _executor_ = new ThreadLocal<Executor>();
 // const Duration LIBPROCESS_STATISTICS_WINDOW = Days(1);
 
 
-// We namespace the clock related variables to keep them well
-// named. In the future we'll probably want to associate a clock with
-// a specific ProcessManager/SocketManager instance pair, so this will
-// likely change.
-namespace clock {
-
-map<ProcessBase*, Time>* currents = new map<ProcessBase*, Time>();
-
-// TODO(dhamon): These static non-POD instances should be replaced by pointers
-// or functions.
-Time initial = Time::epoch();
-Time current = Time::epoch();
-
-Duration advanced = Duration::zero();
-
-bool paused = false;
-
-} // namespace clock {
-
-
-Time Clock::now()
-{
-  return now(__process__);
-}
-
-
-Time Clock::now(ProcessBase* process)
-{
-  synchronized (timeouts) {
-    if (Clock::paused()) {
-      if (process != NULL) {
-        if (clock::currents->count(process) != 0) {
-          return (*clock::currents)[process];
-        } else {
-          return (*clock::currents)[process] = clock::initial;
-        }
-      } else {
-        return clock::current;
-      }
-    }
-  }
-
-  // TODO(benh): Versus ev_now()?
-  double d = ev_time();
-  Try<Time> time = Time::create(d); // Compensates for clock::advanced.
-
-  // TODO(xujyan): Move CHECK_SOME to libprocess and add CHECK_SOME
-  // here.
-  if (time.isError()) {
-    LOG(FATAL) << "Failed to create a Time from " << d << ": "
-               << time.error();
-  }
-  return time.get();
-}
-
-
-void Clock::pause()
-{
-  process::initialize(); // To make sure the libev watchers are ready.
-
-  synchronized (timeouts) {
-    if (!clock::paused) {
-      clock::initial = clock::current = now();
-      clock::paused = true;
-      VLOG(2) << "Clock paused at " << clock::initial;
-    }
-  }
-
-  // Note that after pausing the clock an existing libev timer might
-  // still fire (invoking handle_timeout), but since paused == true no
-  // "time" will actually have passed, so no timer will actually fire.
-}
-
-
-bool Clock::paused()
-{
-  return clock::paused;
-}
-
-
-void Clock::resume()
-{
-  process::initialize(); // To make sure the libev watchers are ready.
-
-  synchronized (timeouts) {
-    if (clock::paused) {
-      VLOG(2) << "Clock resumed at " << clock::current;
-      clock::paused = false;
-      clock::currents->clear();
-      update_timer = true;
-      ev_async_send(loop, &async_watcher);
-    }
-  }
-}
-
-
-void Clock::advance(const Duration& duration)
-{
-  synchronized (timeouts) {
-    if (clock::paused) {
-      clock::advanced += duration;
-      clock::current += duration;
-      VLOG(2) << "Clock advanced ("  << duration << ") to " << clock::current;
-      if (!update_timer) {
-        update_timer = true;
-        ev_async_send(loop, &async_watcher);
-      }
-    }
-  }
-}
-
-
-void Clock::advance(ProcessBase* process, const Duration& duration)
-{
-  synchronized (timeouts) {
-    if (clock::paused) {
-      Time current = now(process);
-      current += duration;
-      (*clock::currents)[process] = current;
-      VLOG(2) << "Clock of " << process->self() << " advanced (" << duration
-              << ") to " << current;
-    }
-  }
-}
-
-
-void Clock::update(const Time& time)
-{
-  synchronized (timeouts) {
-    if (clock::paused) {
-      if (clock::current < time) {
-        clock::advanced += (time - clock::current);
-        clock::current = Time(time);
-        VLOG(2) << "Clock updated to " << clock::current;
-        if (!update_timer) {
-          update_timer = true;
-          ev_async_send(loop, &async_watcher);
-        }
-      }
-    }
-  }
-}
-
-
-void Clock::update(ProcessBase* process, const Time& time)
-{
-  synchronized (timeouts) {
-    if (clock::paused) {
-      if (now(process) < time) {
-        VLOG(2) << "Clock of " << process->self() << " updated to " << time;
-        (*clock::currents)[process] = Time(time);
-      }
-    }
-  }
-}
-
-
-void Clock::order(ProcessBase* from, ProcessBase* to)
-{
-  update(to, now(from));
-}
-
-
+// NOTE: Clock::* implementations are in clock.cpp except for
+// Clock::settle which currently has a dependency on
+// 'process_manager'.
 void Clock::settle()
 {
-  CHECK(clock::paused); // TODO(benh): Consider returning a bool instead.
   process_manager->settle();
-}
-
-
-Try<Time> Time::create(double seconds)
-{
-  Try<Duration> duration = Duration::create(seconds);
-  if (duration.isSome()) {
-    // In production code, clock::advanced will always be zero!
-    return Time(duration.get() + clock::advanced);
-  } else {
-    return Error("Argument too large for Time: " + duration.error());
-  }
 }
 
 
@@ -809,7 +508,7 @@ static Message* encode(const UPID& from,
 
 static void transport(Message* message, ProcessBase* sender = NULL)
 {
-  if (message->to.ip == __ip__ && message->to.port == __port__) {
+  if (message->to.node == __node__) {
     // Local message.
     process_manager->deliver(message->to, new MessageEvent(message), sender);
   } else {
@@ -866,7 +565,7 @@ static Message* parse(Request* request)
     return NULL;
   }
 
-  const UPID to(decode.get(), __ip__, __port__);
+  const UPID to(decode.get(), __node__);
 
   // And now determine 'name'.
   index = index != string::npos ? index + 2: request->path.size();
@@ -884,582 +583,56 @@ static Message* parse(Request* request)
   return message;
 }
 
-// Wrapper around function we want to run in the event loop.
-template <typename T>
-void _run_in_event_loop(
-    const lambda::function<Future<T>(void)>& f,
-    const Owned<Promise<T> >& promise)
+
+namespace internal {
+
+void decode_recv(
+    const Future<size_t>& length,
+    char* data,
+    size_t size,
+    Socket* socket,
+    DataDecoder* decoder)
 {
-  // Don't bother running the function if the future has been discarded.
-  if (promise->future().hasDiscard()) {
-    promise->discard();
-  } else {
-    promise->set(f());
-  }
-}
-
-
-// Helper for running a function in the event loop.
-template <typename T>
-Future<T> run_in_event_loop(const lambda::function<Future<T>(void)>& f)
-{
-  Owned<Promise<T> > promise(new Promise<T>());
-
-  Future<T> future = promise->future();
-
-  // Enqueue the function.
-  synchronized (watchers) {
-    functions->push(lambda::bind(&_run_in_event_loop<T>, f, promise));
-  }
-
-  // Interrupt the loop.
-  ev_async_send(loop, &async_watcher);
-
-  return future;
-}
-
-
-void handle_async(struct ev_loop* loop, ev_async* _, int revents)
-{
-  synchronized (watchers) {
-    // Start all the new I/O watchers.
-    while (!watchers->empty()) {
-      ev_io* watcher = watchers->front();
-      watchers->pop();
-      ev_io_start(loop, watcher);
+  if (length.isDiscarded() || length.isFailed()) {
+    if (length.isFailed()) {
+      VLOG(1) << "Decode failure: " << length.failure();
     }
 
-    while (!functions->empty()) {
-      (functions->front())();
-      functions->pop();
-    }
-  }
-
-  synchronized (timeouts) {
-    if (update_timer) {
-      if (!timeouts->empty()) {
-        // Determine when the next timer should fire.
-        timeouts_watcher.repeat =
-          (timeouts->begin()->first - Clock::now()).secs();
-
-        if (timeouts_watcher.repeat <= 0) {
-          // Feed the event now!
-          timeouts_watcher.repeat = 0;
-          ev_timer_again(loop, &timeouts_watcher);
-          ev_feed_event(loop, &timeouts_watcher, EV_TIMEOUT);
-        } else {
-          // Don't fire the timer if the clock is paused since we
-          // don't want time to advance (instead a call to
-          // clock::advance() will handle the timer).
-          if (Clock::paused() && timeouts_watcher.repeat > 0) {
-            timeouts_watcher.repeat = 0;
-          }
-
-          ev_timer_again(loop, &timeouts_watcher);
-        }
-      }
-
-      update_timer = false;
-    }
-  }
-}
-
-
-void handle_timeouts(struct ev_loop* loop, ev_timer* _, int revents)
-{
-  list<Timer> timedout;
-
-  synchronized (timeouts) {
-    Time now = Clock::now();
-
-    VLOG(3) << "Handling timeouts up to " << now;
-
-    foreachkey (const Time& timeout, *timeouts) {
-      if (timeout > now) {
-        break;
-      }
-
-      VLOG(3) << "Have timeout(s) at " << timeout;
-
-      // Record that we have pending timers to execute so the
-      // Clock::settle() operation can wait until we're done.
-      pending_timers = true;
-
-      foreach (const Timer& timer, (*timeouts)[timeout]) {
-        timedout.push_back(timer);
-      }
-    }
-
-    // Now erase the range of timeouts that timed out.
-    timeouts->erase(timeouts->begin(), timeouts->upper_bound(now));
-
-    // Okay, so the timeout for the next timer should not have fired.
-    CHECK(timeouts->empty() || (timeouts->begin()->first > now));
-
-    // Update the timer as necessary.
-    if (!timeouts->empty()) {
-      // Determine when the next timer should fire.
-      timeouts_watcher.repeat =
-        (timeouts->begin()->first - Clock::now()).secs();
-
-      if (timeouts_watcher.repeat <= 0) {
-        // Feed the event now!
-        timeouts_watcher.repeat = 0;
-        ev_timer_again(loop, &timeouts_watcher);
-        ev_feed_event(loop, &timeouts_watcher, EV_TIMEOUT);
-      } else {
-        // Don't fire the timer if the clock is paused since we don't
-        // want time to advance (instead a call to Clock::advance()
-        // will handle the timer).
-        if (Clock::paused() && timeouts_watcher.repeat > 0) {
-          timeouts_watcher.repeat = 0;
-        }
-
-        ev_timer_again(loop, &timeouts_watcher);
-      }
-    }
-
-    update_timer = false; // Since we might have a queued update_timer.
-  }
-
-  // Update current time of process (if it's present/valid). It might
-  // be necessary to actually add some more synchronization around
-  // this so that, for example, pausing and resuming the clock doesn't
-  // cause some processes to get thier current times updated and
-  // others not. Since ProcessManager::use acquires the 'processes'
-  // lock we had to move this out of the synchronized (timeouts) above
-  // since there was a deadlock with acquring 'processes' then
-  // 'timeouts' (reverse order) in ProcessManager::cleanup. Note that
-  // current time may be greater than the timeout if a local message
-  // was received (and happens-before kicks in).
-  if (Clock::paused()) {
-    foreach (const Timer& timer, timedout) {
-      if (ProcessReference process = process_manager->use(timer.creator())) {
-        Clock::update(process, timer.timeout().time());
-      }
-    }
-  }
-
-  // Invoke the timers that timed out (TODO(benh): Do this
-  // asynchronously so that we don't tie up the event thread!).
-  foreach (const Timer& timer, timedout) {
-    timer();
-  }
-
-  // Mark ourselves as done executing the timers since it's now safe
-  // for a call to Clock::settle() to check if there will be any
-  // future timeouts reached.
-  synchronized (timeouts) {
-    pending_timers = false;
-  }
-}
-
-
-void recv_data(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  DataDecoder* decoder = (DataDecoder*) watcher->data;
-
-  int s = watcher->fd;
-
-  while (true) {
-    const ssize_t size = 80 * 1024;
-    ssize_t length = 0;
-
-    char data[size];
-
-    length = recv(s, data, size, 0);
-
-    if (length < 0 && (errno == EINTR)) {
-      // Interrupted, try again now.
-      continue;
-    } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // Might block, try again later.
-      break;
-    } else if (length <= 0) {
-      // Socket error or closed.
-      if (length < 0) {
-        const char* error = strerror(errno);
-        VLOG(1) << "Socket error while receiving: " << error;
-      } else {
-        VLOG(2) << "Socket closed while receiving";
-      }
-      socket_manager->close(s);
-      delete decoder;
-      ev_io_stop(loop, watcher);
-      delete watcher;
-      break;
-    } else {
-      CHECK(length > 0);
-
-      // Decode as much of the data as possible into HTTP requests.
-      const deque<Request*>& requests = decoder->decode(data, length);
-
-      if (!requests.empty()) {
-        foreach (Request* request, requests) {
-          process_manager->handle(decoder->socket(), request);
-        }
-      } else if (requests.empty() && decoder->failed()) {
-        VLOG(1) << "Decoder error while receiving";
-        socket_manager->close(s);
-        delete decoder;
-        ev_io_stop(loop, watcher);
-        delete watcher;
-        break;
-      }
-    }
-  }
-}
-
-
-// A variant of 'recv_data' that doesn't do anything with the
-// data. Used by sockets created via SocketManager::link as well as
-// SocketManager::send(Message) where we don't care about the data
-// received we mostly just want to know when the socket has been
-// closed.
-void ignore_data(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  Socket* socket = (Socket*) watcher->data;
-
-  int s = watcher->fd;
-
-  while (true) {
-    const ssize_t size = 80 * 1024;
-    ssize_t length = 0;
-
-    char data[size];
-
-    length = recv(s, data, size, 0);
-
-    if (length < 0 && (errno == EINTR)) {
-      // Interrupted, try again now.
-      continue;
-    } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // Might block, try again later.
-      break;
-    } else if (length <= 0) {
-      // Socket error or closed.
-      if (length < 0) {
-        const char* error = strerror(errno);
-        VLOG(1) << "Socket error while receiving: " << error;
-      } else {
-        VLOG(2) << "Socket closed while receiving";
-      }
-      socket_manager->close(s);
-      ev_io_stop(loop, watcher);
-      delete socket;
-      delete watcher;
-      break;
-    } else {
-      VLOG(2) << "Ignoring " << length << " bytes of data received "
-              << "on socket used only for sending";
-    }
-  }
-}
-
-
-void send_data(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  DataEncoder* encoder = (DataEncoder*) watcher->data;
-
-  int s = watcher->fd;
-
-  while (true) {
-    const void* data;
-    size_t size;
-
-    data = encoder->next(&size);
-    CHECK(size > 0);
-
-    ssize_t length = send(s, data, size, MSG_NOSIGNAL);
-
-    if (length < 0 && (errno == EINTR)) {
-      // Interrupted, try again now.
-      encoder->backup(size);
-      continue;
-    } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // Might block, try again later.
-      encoder->backup(size);
-      break;
-    } else if (length <= 0) {
-      // Socket error or closed.
-      if (length < 0) {
-        const char* error = strerror(errno);
-        VLOG(1) << "Socket error while sending: " << error;
-      } else {
-        VLOG(1) << "Socket closed while sending";
-      }
-      socket_manager->close(s);
-      delete encoder;
-      ev_io_stop(loop, watcher);
-      delete watcher;
-      break;
-    } else {
-      CHECK(length > 0);
-
-      // Update the encoder with the amount sent.
-      encoder->backup(size - length);
-
-      // See if there is any more of the message to send.
-      if (encoder->remaining() == 0) {
-        delete encoder;
-
-        // Stop this watcher for now.
-        ev_io_stop(loop, watcher);
-
-        // Check for more stuff to send on socket.
-        Encoder* next = socket_manager->next(s);
-        if (next != NULL) {
-          watcher->data = next;
-          ev_io_init(watcher, next->sender(), s, EV_WRITE);
-          ev_io_start(loop, watcher);
-        } else {
-          // Nothing more to send right now, clean up.
-          delete watcher;
-        }
-        break;
-      }
-    }
-  }
-}
-
-
-void send_file(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  FileEncoder* encoder = (FileEncoder*) watcher->data;
-
-  int s = watcher->fd;
-
-  while (true) {
-    int fd;
-    off_t offset;
-    size_t size;
-
-    fd = encoder->next(&offset, &size);
-    CHECK(size > 0);
-
-    ssize_t length = os::sendfile(s, fd, offset, size);
-
-    if (length < 0 && (errno == EINTR)) {
-      // Interrupted, try again now.
-      encoder->backup(size);
-      continue;
-    } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // Might block, try again later.
-      encoder->backup(size);
-      break;
-    } else if (length <= 0) {
-      // Socket error or closed.
-      if (length < 0) {
-        const char* error = strerror(errno);
-        VLOG(1) << "Socket error while sending: " << error;
-      } else {
-        VLOG(1) << "Socket closed while sending";
-      }
-      socket_manager->close(s);
-      delete encoder;
-      ev_io_stop(loop, watcher);
-      delete watcher;
-      break;
-    } else {
-      CHECK(length > 0);
-
-      // Update the encoder with the amount sent.
-      encoder->backup(size - length);
-
-      // See if there is any more of the message to send.
-      if (encoder->remaining() == 0) {
-        delete encoder;
-
-        // Stop this watcher for now.
-        ev_io_stop(loop, watcher);
-
-        // Check for more stuff to send on socket.
-        Encoder* next = socket_manager->next(s);
-        if (next != NULL) {
-          watcher->data = next;
-          ev_io_init(watcher, next->sender(), s, EV_WRITE);
-          ev_io_start(loop, watcher);
-        } else {
-          // Nothing more to send right now, clean up.
-          delete watcher;
-        }
-        break;
-      }
-    }
-  }
-}
-
-
-void sending_connect(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  int s = watcher->fd;
-
-  // Now check that a successful connection was made.
-  int opt;
-  socklen_t optlen = sizeof(opt);
-
-  if (getsockopt(s, SOL_SOCKET, SO_ERROR, &opt, &optlen) < 0 || opt != 0) {
-    // Connect failure.
-    VLOG(1) << "Socket error while connecting";
-    socket_manager->close(s);
-    MessageEncoder* encoder = (MessageEncoder*) watcher->data;
-    delete encoder;
-    ev_io_stop(loop, watcher);
-    delete watcher;
-  } else {
-    // We're connected! Now let's do some sending.
-    ev_io_stop(loop, watcher);
-    ev_io_init(watcher, send_data, s, EV_WRITE);
-    ev_io_start(loop, watcher);
-  }
-}
-
-
-void receiving_connect(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  int s = watcher->fd;
-
-  // Now check that a successful connection was made.
-  int opt;
-  socklen_t optlen = sizeof(opt);
-
-  if (getsockopt(s, SOL_SOCKET, SO_ERROR, &opt, &optlen) < 0 || opt != 0) {
-    // Connect failure.
-    VLOG(1) << "Socket error while connecting";
-    socket_manager->close(s);
-    Socket* socket = (Socket*) watcher->data;
+    socket_manager->close(*socket);
+    delete[] data;
+    delete decoder;
     delete socket;
-    ev_io_stop(loop, watcher);
-    delete watcher;
-  } else {
-    // We're connected! Now let's do some receiving.
-    ev_io_stop(loop, watcher);
-    ev_io_init(watcher, ignore_data, s, EV_READ);
-    ev_io_start(loop, watcher);
-  }
-}
-
-
-void accept(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  CHECK_EQ(__s__, watcher->fd);
-
-  sockaddr_in addr;
-  socklen_t addrlen = sizeof(addr);
-
-  int s = ::accept(__s__, (sockaddr*) &addr, &addrlen);
-
-  if (s < 0) {
     return;
   }
 
-  Try<Nothing> nonblock = os::nonblock(s);
-  if (nonblock.isError()) {
-    LOG_IF(INFO, VLOG_IS_ON(1)) << "Failed to accept, nonblock: "
-                                << nonblock.error();
-    os::close(s);
+  if (length.get() == 0) {
+    socket_manager->close(*socket);
+    delete[] data;
+    delete decoder;
+    delete socket;
+    return;
+  }
+  // Decode as much of the data as possible into HTTP requests.
+  const deque<Request*>& requests = decoder->decode(data, length.get());
+
+  if (!requests.empty()) {
+    foreach (Request* request, requests) {
+      process_manager->handle(decoder->socket(), request);
+    }
+  } else if (requests.empty() && decoder->failed()) {
+    VLOG(1) << "Decoder error while receiving";
+    socket_manager->close(*socket);
+    delete[] data;
+    delete decoder;
+    delete socket;
     return;
   }
 
-  Try<Nothing> cloexec = os::cloexec(s);
-  if (cloexec.isError()) {
-    LOG_IF(INFO, VLOG_IS_ON(1)) << "Failed to accept, cloexec: "
-                                << cloexec.error();
-    os::close(s);
-    return;
-  }
-
-  // Turn off Nagle (TCP_NODELAY) so pipelined requests don't wait.
-  int on = 1;
-  if (setsockopt(s, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
-    const char* error = strerror(errno);
-    VLOG(1) << "Failed to turn off the Nagle algorithm: " << error;
-    os::close(s);
-  } else {
-    // Inform the socket manager for proper bookkeeping.
-    const Socket& socket = socket_manager->accepted(s);
-
-    // Allocate and initialize the decoder and watcher.
-    DataDecoder* decoder = new DataDecoder(socket);
-
-    ev_io* watcher = new ev_io();
-    watcher->data = decoder;
-
-    ev_io_init(watcher, recv_data, s, EV_READ);
-    ev_io_start(loop, watcher);
-  }
+  socket->recv(data, size)
+    .onAny(lambda::bind(&decode_recv, lambda::_1, data, size, socket, decoder));
 }
 
-
-// Data necessary for polling so we can discard polling and actually
-// stop it in the event loop.
-struct Poll
-{
-  Poll()
-  {
-    // Need to explicitly instantiate the watchers.
-    watcher.io.reset(new ev_io());
-    watcher.async.reset(new ev_async());
-  }
-
-  // An I/O watcher for checking for readability or writeability and
-  // an async watcher for being able to discard the polling.
-  struct {
-    memory::shared_ptr<ev_io> io;
-    memory::shared_ptr<ev_async> async;
-  } watcher;
-
-  Promise<short> promise;
-};
-
-
-// Event loop callback when I/O is ready on polling file descriptor.
-void polled(struct ev_loop* loop, ev_io* watcher, int revents)
-{
-  Poll* poll = (Poll*) watcher->data;
-
-  ev_io_stop(loop, poll->watcher.io.get());
-
-  // Stop the async watcher (also clears if pending so 'discard_poll'
-  // will not get invoked and we can delete 'poll' here).
-  ev_async_stop(loop, poll->watcher.async.get());
-
-  poll->promise.set(revents);
-
-  delete poll;
-}
-
-
-// Event loop callback when future associated with polling file
-// descriptor has been discarded.
-void discard_poll(struct ev_loop* loop, ev_async* watcher, int revents)
-{
-  Poll* poll = (Poll*) watcher->data;
-
-  // Check and see if we have a pending 'polled' callback and if so
-  // let it "win".
-  if (ev_is_pending(poll->watcher.io.get())) {
-    return;
-  }
-
-  ev_async_stop(loop, poll->watcher.async.get());
-
-  // Stop the I/O watcher (but note we check if pending above) so it
-  // won't get invoked and we can delete 'poll' here.
-  ev_io_stop(loop, poll->watcher.io.get());
-
-  poll->promise.discard();
-
-  delete poll;
-}
-
-
-void* serve(void* arg)
-{
-  ev_loop(((struct ev_loop*) arg), 0);
-
-  return NULL;
-}
+} // namespace internal {
 
 
 void* schedule(void* arg)
@@ -1481,6 +654,27 @@ void* schedule(void* arg)
 }
 
 
+void timedout(const list<Timer>& timers)
+{
+  // Update current time of process (if it's present/valid). Note that
+  // current time may be greater than the timeout if a local message
+  // was received (and happens-before kicks in).
+  if (Clock::paused()) {
+    foreach (const Timer& timer, timers) {
+      if (ProcessReference process = process_manager->use(timer.creator())) {
+        Clock::update(process, timer.timeout().time());
+      }
+    }
+  }
+
+  // Invoke the timers that timed out (TODO(benh): Do this
+  // asynchronously so that we don't tie up the event thread!).
+  foreach (const Timer& timer, timers) {
+    timer();
+  }
+}
+
+
 // We might find value in catching terminating signals at some point.
 // However, for now, adding signal handlers freely is not allowed
 // because they will clash with Java and Python virtual machines and
@@ -1496,6 +690,37 @@ void* schedule(void* arg)
 //   sigaction(signal, &sa, NULL);
 //   raise(signal);
 // }
+
+
+namespace internal {
+
+void on_accept(const Future<Socket>& socket)
+{
+  if (socket.isReady()) {
+    // Inform the socket manager for proper bookkeeping.
+    socket_manager->accepted(socket.get());
+
+    const size_t size = 80 * 1024;
+    char* data = new char[size];
+    memset(data, 0, size);
+
+    DataDecoder* decoder = new DataDecoder(socket.get());
+
+    socket.get().recv(data, size)
+      .onAny(lambda::bind(
+          &internal::decode_recv,
+          lambda::_1,
+          data,
+          size,
+          new Socket(socket.get()),
+          decoder));
+  }
+
+  __s__->accept()
+    .onAny(lambda::bind(&on_accept, lambda::_1));
+}
+
+} // namespace internal {
 
 
 void initialize(const string& delegate)
@@ -1572,117 +797,9 @@ void initialize(const string& delegate)
     }
   }
 
-  __ip__ = 0;
-  __port__ = 0;
-
-  char* value;
-
-  // Check environment for ip.
-  value = getenv("LIBPROCESS_IP");
-  if (value != NULL) {
-    int result = inet_pton(AF_INET, value, &__ip__);
-    if (result == 0) {
-      LOG(FATAL) << "LIBPROCESS_IP=" << value << " was unparseable";
-    } else if (result < 0) {
-      PLOG(FATAL) << "Failed to initialize, inet_pton";
-    }
-  }
-
-  // Check environment for port.
-  value = getenv("LIBPROCESS_PORT");
-  if (value != NULL) {
-    int result = atoi(value);
-    if (result < 0 || result > USHRT_MAX) {
-      LOG(FATAL) << "LIBPROCESS_PORT=" << value << " is not a valid port";
-    }
-    __port__ = result;
-  }
-
-  // Create a "server" socket for communicating with other nodes.
-  if ((__s__ = ::socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-    PLOG(FATAL) << "Failed to initialize, socket";
-  }
-
-  // Make socket non-blocking.
-  Try<Nothing> nonblock = os::nonblock(__s__);
-  if (nonblock.isError()) {
-    LOG(FATAL) << "Failed to initialize, nonblock: " << nonblock.error();
-  }
-
-  // Set FD_CLOEXEC flag.
-  Try<Nothing> cloexec = os::cloexec(__s__);
-  if (cloexec.isError()) {
-    LOG(FATAL) << "Failed to initialize, cloexec: " << cloexec.error();
-  }
-
-  // Allow address reuse.
-  int on = 1;
-  if (setsockopt(__s__, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
-    PLOG(FATAL) << "Failed to initialize, setsockopt(SO_REUSEADDR)";
-  }
-
-  // Set up socket.
-  sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = PF_INET;
-  addr.sin_addr.s_addr = __ip__;
-  addr.sin_port = htons(__port__);
-
-  if (bind(__s__, (sockaddr*) &addr, sizeof(addr)) < 0) {
-    PLOG(FATAL) << "Failed to initialize, bind";
-  }
-
-  // Lookup and store assigned ip and assigned port.
-  socklen_t addrlen = sizeof(addr);
-  if (getsockname(__s__, (sockaddr*) &addr, &addrlen) < 0) {
-    PLOG(FATAL) << "Failed to initialize, getsockname";
-  }
-
-  __ip__ = addr.sin_addr.s_addr;
-  __port__ = ntohs(addr.sin_port);
-
-  // Lookup hostname if missing ip or if ip is 127.0.0.1 in case we
-  // actually have a valid external ip address. Note that we need only
-  // one ip address, so that other processes can send and receive and
-  // don't get confused as to whom they are sending to.
-  if (__ip__ == 0 || __ip__ == 2130706433) {
-    char hostname[512];
-
-    if (gethostname(hostname, sizeof(hostname)) < 0) {
-      LOG(FATAL) << "Failed to initialize, gethostname: "
-                 << hstrerror(h_errno);
-    }
-
-    // Lookup IP address of local hostname.
-    hostent* he;
-
-    if ((he = gethostbyname2(hostname, AF_INET)) == NULL) {
-      LOG(FATAL) << "Failed to initialize, gethostbyname2: "
-                 << hstrerror(h_errno);
-    }
-
-    __ip__ = *((uint32_t *) he->h_addr_list[0]);
-  }
-
-  if (listen(__s__, 500000) < 0) {
-    PLOG(FATAL) << "Failed to initialize, listen";
-  }
-
-  // Setup event loop.
-#ifdef __sun__
-  loop = ev_default_loop(EVBACKEND_POLL | EVBACKEND_SELECT);
-#else
-  loop = ev_default_loop(EVFLAG_AUTO);
-#endif // __sun__
-
-  ev_async_init(&async_watcher, handle_async);
-  ev_async_start(loop, &async_watcher);
-
-  ev_timer_init(&timeouts_watcher, handle_timeouts, 0., 2100000.0);
-  ev_timer_again(loop, &timeouts_watcher);
-
-  ev_io_init(&server_watcher, accept, __s__, EV_READ);
-  ev_io_start(loop, &server_watcher);
+  // Initialize the event loop.
+  EventLoop::initialize();
+  Clock::initialize(lambda::bind(&timedout, lambda::_1));
 
 //   ev_child_init(&child_watcher, child_exited, pid, 0);
 //   ev_child_start(loop, &cw);
@@ -1700,13 +817,89 @@ void initialize(const string& delegate)
 //   sigprocmask (SIG_UNBLOCK, &sa.sa_mask, 0);
 
   pthread_t thread; // For now, not saving handles on our threads.
-  if (pthread_create(&thread, NULL, serve, loop) != 0) {
+  if (pthread_create(&thread, NULL, &EventLoop::run, NULL) != 0) {
     LOG(FATAL) << "Failed to initialize, pthread_create";
+  }
+
+  __node__.ip = 0;
+  __node__.port = 0;
+
+  char* value;
+
+  // Check environment for ip.
+  value = getenv("LIBPROCESS_IP");
+  if (value != NULL) {
+    int result = inet_pton(AF_INET, value, &__node__.ip);
+    if (result == 0) {
+      LOG(FATAL) << "LIBPROCESS_IP=" << value << " was unparseable";
+    } else if (result < 0) {
+      PLOG(FATAL) << "Failed to initialize, inet_pton";
+    }
+  }
+
+  // Check environment for port.
+  value = getenv("LIBPROCESS_PORT");
+  if (value != NULL) {
+    int result = atoi(value);
+    if (result < 0 || result > USHRT_MAX) {
+      LOG(FATAL) << "LIBPROCESS_PORT=" << value << " is not a valid port";
+    }
+    __node__.port = result;
+  }
+
+  // Create a "server" socket for communicating with other nodes.
+  Try<Socket> create = Socket::create();
+  if (create.isError()) {
+    PLOG(FATAL) << "Failed to construct server socket:" << create.error();
+  }
+  __s__ = new Socket(create.get());
+
+  // Allow address reuse.
+  int on = 1;
+  if (setsockopt(__s__->get(), SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+    PLOG(FATAL) << "Failed to initialize, setsockopt(SO_REUSEADDR)";
+  }
+
+  Try<Node> bind = __s__->bind(__node__);
+  if (bind.isError()) {
+    PLOG(FATAL) << "Failed to initialize: " << bind.error();
+  }
+
+  __node__ = bind.get();
+
+  // Lookup hostname if missing ip or if ip is 127.0.0.1 in case we
+  // actually have a valid external ip address. Note that we need only
+  // one ip address, so that other processes can send and receive and
+  // don't get confused as to whom they are sending to.
+  if (__node__.ip == 0 || __node__.ip == 2130706433) {
+    char hostname[512];
+
+    if (gethostname(hostname, sizeof(hostname)) < 0) {
+      LOG(FATAL) << "Failed to initialize, gethostname: "
+                 << hstrerror(h_errno);
+    }
+
+    // Lookup IP address of local hostname.
+    Try<uint32_t> ip = net::getIP(hostname, AF_INET);
+
+    if (ip.isError()) {
+      LOG(FATAL) << ip.error();
+    }
+
+    __node__.ip = ip.get();
+  }
+
+  Try<Nothing> listen = __s__->listen(LISTEN_BACKLOG);
+  if (listen.isError()) {
+    PLOG(FATAL) << "Failed to initialize: " << listen.error();
   }
 
   // Need to set initialzing here so that we can actually invoke
   // 'spawn' below for the garbage collector.
   initializing = false;
+
+  __s__->accept()
+    .onAny(lambda::bind(&internal::on_accept, lambda::_1));
 
   // TODO(benh): Make sure creating the garbage collector, logging
   // process, and profiler always succeeds and use supervisors to make
@@ -1762,27 +955,24 @@ void initialize(const string& delegate)
 
   new Route("/__processes__", None(), __processes__);
 
-  char temp[INET_ADDRSTRLEN];
-  if (inet_ntop(AF_INET, (in_addr*) &__ip__, temp, INET_ADDRSTRLEN) == NULL) {
-    PLOG(FATAL) << "Failed to initialize, inet_ntop";
-  }
-
-  VLOG(1) << "libprocess is initialized on " << temp << ":" << __port__
-          << " for " << cpus << " cpus";
+  VLOG(1) << "libprocess is initialized on " << node() << " for " << cpus
+          << " cpus";
 }
 
 
-uint32_t ip()
+void finalize()
 {
-  process::initialize();
-  return __ip__;
+  delete process_manager;
+
+  // TODO(benh): Finialize/shutdown Clock so that it doesn't attempt
+  // to dereference 'process_manager' in the 'timedout' callback.
 }
 
 
-uint16_t port()
+Node node()
 {
   process::initialize();
-  return __port__;
+  return __node__;
 }
 
 
@@ -2039,14 +1229,87 @@ SocketManager::SocketManager()
 SocketManager::~SocketManager() {}
 
 
-Socket SocketManager::accepted(int s)
+void SocketManager::accepted(const Socket& socket)
 {
   synchronized (this) {
-    return sockets[s] = Socket(s);
+    sockets[socket] = new Socket(socket);
+  }
+}
+
+
+namespace internal {
+
+void ignore_recv_data(
+    const Future<size_t>& length,
+    Socket* socket,
+    char* data,
+    size_t size)
+{
+  if (length.isDiscarded() || length.isFailed()) {
+    socket_manager->close(*socket);
+    delete[] data;
+    delete socket;
+    return;
   }
 
-  return UNREACHABLE(); // Quiet the compiler.
+  if (length.get() == 0) {
+    socket_manager->close(*socket);
+    delete[] data;
+    delete socket;
+    return;
+  }
+
+  socket->recv(data, size)
+    .onAny(lambda::bind(&ignore_recv_data, lambda::_1, socket, data, size));
 }
+
+
+// Forward declaration.
+void send(Encoder* encoder, Socket* socket);
+
+
+void link_connect(const Future<Nothing>& future, Socket* socket)
+{
+  if (future.isDiscarded() || future.isFailed()) {
+    if (future.isFailed()) {
+      VLOG(1) << "Failed to link, connect: " << future.failure();
+    }
+    socket_manager->close(*socket);
+    delete socket;
+    return;
+  }
+
+  size_t size = 80 * 1024;
+  char* data = new char[size];
+
+  socket->recv(data, size)
+    .onAny(lambda::bind(
+        &ignore_recv_data,
+        lambda::_1,
+        socket,
+        data,
+        size));
+
+  // In order to avoid a race condition where internal::send() is
+  // called after SocketManager::link() but before the socket is
+  // connected, we initialize the 'outgoing' queue in
+  // SocketManager::link() and then check if the queue has anything in
+  // it to send during this connection completion. When a subsequent
+  // call to SocketManager::send() occurs we'll now just add the
+  // encoder to the 'outgoing' queue, and when we complete the
+  // connection here we'll start sending, otherwise when we call
+  // SocketManager::next() the 'outgoing' queue will get removed and
+  // any subsequent call to SocketManager::send() will take care of
+  // setting it back up and sending.
+  Encoder* encoder = socket_manager->next(*socket);
+
+  if (encoder != NULL) {
+    send(encoder, new Socket(*socket));
+  }
+}
+
+
+} // namespace internal {
 
 
 void SocketManager::link(ProcessBase* process, const UPID& to)
@@ -2061,71 +1324,50 @@ void SocketManager::link(ProcessBase* process, const UPID& to)
 
   CHECK(process != NULL);
 
-  Node node(to.ip, to.port);
+  Option<Socket> socket = None();
+  bool connect = false;
 
   synchronized (this) {
     // Check if node is remote and there isn't a persistant link.
-    if ((node.ip != __ip__ || node.port != __port__)
-        && persists.count(node) == 0) {
+    if (to.node != __node__  && persists.count(to.node) == 0) {
       // Okay, no link, let's create a socket.
-      Try<int> socket = process::socket(AF_INET, SOCK_STREAM, 0);
-      if (socket.isError()) {
-        LOG(FATAL) << "Failed to link, socket: " << socket.error();
+      Try<Socket> create = Socket::create();
+      if (create.isError()) {
+        VLOG(1) << "Failed to link, create socket: " << create.error();
+        return;
       }
+      socket = create.get();
+      int s = socket.get().get();
 
-      int s = socket.get();
+      sockets[s] = new Socket(socket.get());
+      nodes[s] = to.node;
 
-      Try<Nothing> nonblock = os::nonblock(s);
-      if (nonblock.isError()) {
-        LOG(FATAL) << "Failed to link, nonblock: " << nonblock.error();
-      }
+      persists[to.node] = s;
 
-      Try<Nothing> cloexec = os::cloexec(s);
-      if (cloexec.isError()) {
-        LOG(FATAL) << "Failed to link, cloexec: " << cloexec.error();
-      }
+      // Initialize 'outgoing' to prevent a race with
+      // SocketManager::send() while the socket is not yet connected.
+      // Initializing the 'outgoing' queue prevents
+      // SocketManager::send() from trying to write before it's
+      // connected.
+      outgoing[s];
 
-      sockets[s] = Socket(s);
-      nodes[s] = node;
-
-      persists[node] = s;
-
-      // Allocate and initialize a watcher for reading data from this
-      // socket. Note that we don't expect to receive anything other
-      // than HTTP '202 Accepted' responses which we anyway ignore.
-      // We do, however, want to react when it gets closed so we can
-      // generate appropriate lost events (since this is a 'link').
-      ev_io* watcher = new ev_io();
-      watcher->data = new Socket(sockets[s]);
-
-      // Try and connect to the node using this socket.
-      sockaddr_in addr;
-      memset(&addr, 0, sizeof(addr));
-      addr.sin_family = PF_INET;
-      addr.sin_port = htons(to.port);
-      addr.sin_addr.s_addr = to.ip;
-
-      if (connect(s, (sockaddr*) &addr, sizeof(addr)) < 0) {
-        if (errno != EINPROGRESS) {
-          PLOG(FATAL) << "Failed to link, connect";
-        }
-
-        // Wait for socket to be connected.
-        ev_io_init(watcher, receiving_connect, s, EV_WRITE);
-      } else {
-        ev_io_init(watcher, ignore_data, s, EV_READ);
-      }
-
-      // Enqueue the watcher.
-      synchronized (watchers) {
-        watchers->push(watcher);
-      }
-
-      // Interrupt the loop.
-      ev_async_send(loop, &async_watcher);
+      connect = true;
     }
 
-    links[to].insert(process);
+    links.linkers[to].insert(process);
+    links.linkees[process].insert(to);
+    if (to.node != __node__) {
+      links.remotes[to.node].insert(to);
+    }
+  }
+
+  if (connect) {
+    CHECK_SOME(socket);
+    Socket(socket.get()).connect(to.node) // Copy to drop const.
+      .onAny(lambda::bind(
+          &internal::link_connect,
+          lambda::_1,
+          new Socket(socket.get())));
   }
 }
 
@@ -2142,7 +1384,7 @@ PID<HttpProxy> SocketManager::proxy(const Socket& socket)
       if (proxies.count(socket) > 0) {
         return proxies[socket]->self();
       } else {
-        proxy = new HttpProxy(sockets[socket]);
+        proxy = new HttpProxy(*sockets[socket]);
         proxies[socket] = proxy;
       }
     }
@@ -2162,40 +1404,110 @@ PID<HttpProxy> SocketManager::proxy(const Socket& socket)
 }
 
 
+namespace internal {
+
+void _send(
+    const Future<size_t>& result,
+    Socket* socket,
+    Encoder* encoder,
+    size_t size);
+
+
+void send(Encoder* encoder, Socket* socket)
+{
+  switch (encoder->kind()) {
+    case Encoder::DATA: {
+      size_t size;
+      const char* data = reinterpret_cast<DataEncoder*>(encoder)->next(&size);
+      socket->send(data, size)
+        .onAny(lambda::bind(
+            &internal::_send,
+            lambda::_1,
+            socket,
+            encoder,
+            size));
+      break;
+    }
+    case Encoder::FILE: {
+      off_t offset;
+      size_t size;
+      int fd = reinterpret_cast<FileEncoder*>(encoder)->next(&offset, &size);
+      socket->sendfile(fd, offset, size)
+        .onAny(lambda::bind(
+            &internal::_send,
+            lambda::_1,
+            socket,
+            encoder,
+            size));
+      break;
+    }
+  }
+}
+
+
+void _send(
+    const Future<size_t>& length,
+    Socket* socket,
+    Encoder* encoder,
+    size_t size)
+{
+  if (length.isDiscarded() || length.isFailed()) {
+    socket_manager->close(*socket);
+    delete socket;
+    delete encoder;
+  } else {
+    // Update the encoder with the amount sent.
+    encoder->backup(size - length.get());
+
+    // See if there is any more of the message to send.
+    if (encoder->remaining() == 0) {
+      delete encoder;
+
+      // Check for more stuff to send on socket.
+      Encoder* next = socket_manager->next(*socket);
+      if (next != NULL) {
+        send(next, socket);
+      } else {
+        delete socket;
+      }
+    } else {
+      send(encoder, socket);
+    }
+  }
+}
+
+} // namespace internal {
+
+
 void SocketManager::send(Encoder* encoder, bool persist)
 {
   CHECK(encoder != NULL);
 
   synchronized (this) {
-    if (sockets.count(encoder->socket()) > 0) {
+    Socket socket = encoder->socket();
+    if (sockets.count(socket) > 0) {
       // Update whether or not this socket should get disposed after
       // there is no more data to send.
       if (!persist) {
-        dispose.insert(encoder->socket());
+        dispose.insert(socket);
       }
 
-      if (outgoing.count(encoder->socket()) > 0) {
-        outgoing[encoder->socket()].push(encoder);
+      if (outgoing.count(socket) > 0) {
+        outgoing[socket].push(encoder);
+        encoder = NULL;
       } else {
         // Initialize the outgoing queue.
-        outgoing[encoder->socket()];
-
-        // Allocate and initialize the watcher.
-        ev_io* watcher = new ev_io();
-        watcher->data = encoder;
-
-        ev_io_init(watcher, encoder->sender(), encoder->socket(), EV_WRITE);
-
-        synchronized (watchers) {
-          watchers->push(watcher);
-        }
-
-        ev_async_send(loop, &async_watcher);
+        outgoing[socket];
       }
     } else {
       VLOG(1) << "Attempting to send on a no longer valid socket!";
       delete encoder;
+      encoder = NULL;
     }
+  }
+
+  if (encoder != NULL) {
+    internal::send(encoder, new Socket(encoder->socket()));
   }
 }
 
@@ -2219,11 +1531,53 @@ void SocketManager::send(
 }
 
 
+namespace internal {
+
+void send_connect(
+    const Future<Nothing>& future,
+    Socket* socket,
+    Message* message)
+{
+  if (future.isDiscarded() || future.isFailed()) {
+    if (future.isFailed()) {
+      VLOG(1) << "Failed to send, connect: " << future.failure();
+    }
+    socket_manager->close(*socket);
+    delete socket;
+    delete message;
+    return;
+  }
+
+  Encoder* encoder = new MessageEncoder(*socket, message);
+
+  // Receive and ignore data from this socket. Note that we don't
+  // expect to receive anything other than HTTP '202 Accepted'
+  // responses which we just ignore.
+  size_t size = 80 * 1024;
+  char* data = new char[size];
+
+  socket->recv(data, size)
+    .onAny(lambda::bind(
+        &ignore_recv_data,
+        lambda::_1,
+        new Socket(*socket),
+        data,
+        size));
+
+  internal::send(encoder, socket);
+}
+
+} // namespace internal {
+
+
 void SocketManager::send(Message* message)
 {
   CHECK(message != NULL);
 
-  Node node(message->to.ip, message->to.port);
+  const Node& node = message->to.node;
+
+  Option<Socket> socket = None();
+  bool connect = false;
 
   synchronized (this) {
     // Check if there is already a socket.
@@ -2232,28 +1586,35 @@ void SocketManager::send(Message* message)
     if (persist || temp) {
       int s = persist ? persists[node] : temps[node];
       CHECK(sockets.count(s) > 0);
-      send(new MessageEncoder(sockets[s], message), persist);
+      socket = *sockets[s];
+
+      // Update whether or not this socket should get disposed after
+      // there is no more data to send.
+      if (!persist) {
+        dispose.insert(socket.get());
+      }
+
+      if (outgoing.count(socket.get()) > 0) {
+        outgoing[socket.get()].push(new MessageEncoder(socket.get(), message));
+        return;
+      } else {
+        // Initialize the outgoing queue.
+        outgoing[socket.get()];
+      }
+
     } else {
       // No peristent or temporary socket to the node currently
       // exists, so we create a temporary one.
-      Try<int> socket = process::socket(AF_INET, SOCK_STREAM, 0);
-      if (socket.isError()) {
-        LOG(FATAL) << "Failed to send, socket: " << socket.error();
+      Try<Socket> create = Socket::create();
+      if (create.isError()) {
+        VLOG(1) << "Failed to send, create socket: " << create.error();
+        delete message;
+        return;
       }
-
+      socket = create.get();
       int s = socket.get();
 
-      Try<Nothing> nonblock = os::nonblock(s);
-      if (nonblock.isError()) {
-        LOG(FATAL) << "Failed to send, nonblock: " << nonblock.error();
-      }
-
-      Try<Nothing> cloexec = os::cloexec(s);
-      if (cloexec.isError()) {
-        LOG(FATAL) << "Failed to send, cloexec: " << cloexec.error();
-      }
-
-      sockets[s] = Socket(s);
+      sockets[s] = new Socket(socket.get());
       nodes[s] = node;
       temps[node] = s;
 
@@ -2262,49 +1623,24 @@ void SocketManager::send(Message* message)
       // Initialize the outgoing queue.
       outgoing[s];
 
-      // Allocate and initialize a watcher for reading data from this
-      // socket. Note that we don't expect to receive anything other
-      // than HTTP '202 Accepted' responses which we anyway ignore.
-      ev_io* watcher = new ev_io();
-      watcher->data = new Socket(sockets[s]);
-
-      ev_io_init(watcher, ignore_data, s, EV_READ);
-
-      // Enqueue the watcher.
-      synchronized (watchers) {
-        watchers->push(watcher);
-      }
-
-      // Allocate and initialize a watcher for sending the message.
-      watcher = new ev_io();
-      watcher->data = new MessageEncoder(sockets[s], message);
-
-      // Try and connect to the node using this socket.
-      sockaddr_in addr;
-      memset(&addr, 0, sizeof(addr));
-      addr.sin_family = PF_INET;
-      addr.sin_port = htons(message->to.port);
-      addr.sin_addr.s_addr = message->to.ip;
-
-      if (connect(s, (sockaddr*) &addr, sizeof(addr)) < 0) {
-        if (errno != EINPROGRESS) {
-          PLOG(FATAL) << "Failed to send, connect";
-        }
-
-        // Initialize watcher for connecting.
-        ev_io_init(watcher, sending_connect, s, EV_WRITE);
-      } else {
-        // Initialize watcher for sending.
-        ev_io_init(watcher, send_data, s, EV_WRITE);
-      }
-
-      // Enqueue the watcher.
-      synchronized (watchers) {
-        watchers->push(watcher);
-      }
-
-      ev_async_send(loop, &async_watcher);
+      connect = true;
     }
+  }
+
+  if (connect) {
+    CHECK_SOME(socket);
+    Socket(socket.get()).connect(node) // Copy to drop const.
+      .onAny(lambda::bind(
+          &internal::send_connect,
+          lambda::_1,
+          new Socket(socket.get()),
+          message));
+  } else {
+    // If we're not connecting and we haven't added the encoder to
+    // the 'outgoing' queue then schedule it to be sent.
+    internal::send(
+        new MessageEncoder(socket.get(), message),
+        new Socket(socket.get()));
   }
 }
 
@@ -2317,8 +1653,8 @@ Encoder* SocketManager::next(int s)
     // We cannot assume 'sockets.count(s) > 0' here because it's
     // possible that 's' has been removed with a a call to
     // SocketManager::close. For example, it could be the case that a
-    // socket has gone to CLOSE_WAIT and the call to 'recv' in
-    // recv_data returned 0 causing SocketManager::close to get
+    // socket has gone to CLOSE_WAIT and the call to read in
+    // io::read returned 0 causing SocketManager::close to get
     // invoked. Later a call to 'send' or 'sendfile' (e.g., in
     // send_data or send_file) can "succeed" (because the socket is
     // not "closed" yet because there are still some Socket
@@ -2356,7 +1692,9 @@ Encoder* SocketManager::next(int s)
           }
 
           dispose.erase(s);
-          sockets.erase(s);
+          auto iterator = sockets.find(s);
+          delete iterator->second;
+          sockets.erase(iterator);
 
           // We don't actually close the socket (we wait for the Socket
           // abstraction to close it once there are no more references),
@@ -2386,7 +1724,7 @@ void SocketManager::close(int s)
   synchronized (this) {
     // This socket might not be active if it was already asked to get
     // closed (e.g., a write on the socket failed so we try and close
-    // it and then later the read side of the socket gets closed so we
+    // it and then later the recv side of the socket gets closed so we
     // try and close it again). Thus, ignore the request if we don't
     // know about the socket.
     if (sockets.count(s) > 0) {
@@ -2422,18 +1760,20 @@ void SocketManager::close(int s)
         proxies.erase(s);
       }
 
-      // We need to stop any 'ignore_data' readers as they may have
-      // the last Socket reference so we shutdown reads but don't do a
+      // We need to stop any 'ignore_data' receivers as they may have
+      // the last Socket reference so we shutdown recvs but don't do a
       // full close (since that will be taken care of by ~Socket, see
       // comment below). Calling 'shutdown' will trigger 'ignore_data'
-      // which will get back a 0 (i.e., EOF) when it tries to read
+      // which will get back a 0 (i.e., EOF) when it tries to 'recv'
       // from the socket. Note we need to do this before we call
       // 'sockets.erase(s)' to avoid the potential race with the last
       // reference being in 'sockets'.
       shutdown(s, SHUT_RD);
 
       dispose.erase(s);
-      sockets.erase(s);
+      auto iterator = sockets.find(s);
+      delete iterator->second;
+      sockets.erase(iterator);
     }
   }
 
@@ -2459,7 +1799,7 @@ void SocketManager::close(int s)
   // 'sockets' any attempt to send with it will just get ignored.
   // TODO(benh): Always do a 'shutdown(s, SHUT_RDWR)' since that
   // should keep the file descriptor valid until the last Socket
-  // reference does a close but force all libev watchers to stop?
+  // reference does a close but force all event loop watchers to stop?
 }
 
 
@@ -2470,20 +1810,30 @@ void SocketManager::exited(const Node& node)
   // ourselves that the accesses to each Process object will always be
   // valid.
   synchronized (this) {
-    list<UPID> removed;
-    // Look up all linked processes.
-    foreachpair (const UPID& linkee, set<ProcessBase*>& processes, links) {
-      if (linkee.ip == node.ip && linkee.port == node.port) {
-        foreach (ProcessBase* linker, processes) {
-          linker->enqueue(new ExitedEvent(linkee));
-        }
-        removed.push_back(linkee);
-      }
+    if (!links.remotes.contains(node)) {
+      return; // No linkees for this node!
     }
 
-    foreach (const UPID& pid, removed) {
-      links.erase(pid);
+    foreach (const UPID& linkee, links.remotes[node]) {
+      // Find and notify the linkers.
+      CHECK(links.linkers.contains(linkee));
+
+      foreach (ProcessBase* linker, links.linkers[linkee]) {
+        linker->enqueue(new ExitedEvent(linkee));
+
+        // Remove the linkee pid from the linker.
+        CHECK(links.linkees.contains(linker));
+
+        links.linkees[linker].erase(linkee);
+        if (links.linkees[linker].empty()) {
+          links.linkees.erase(linker);
+        }
+      }
+
+      links.linkers.erase(linkee);
     }
+
+    links.remotes.erase(node);
   }
 }
 
@@ -2501,25 +1851,53 @@ void SocketManager::exited(ProcessBase* process)
   const Time time = Clock::now(process);
 
   synchronized (this) {
-    // Iterate through the links, removing any links the process might
-    // have had and creating exited events for any linked processes.
-    foreachpair (const UPID& linkee, set<ProcessBase*>& processes, links) {
-      processes.erase(process);
+    // If this process had linked to anything, we need to clean
+    // up any pointers to it. Also, if this process was the last
+    // linker to a remote linkee, we must remove linkee from the
+    // remotes!
+    if (links.linkees.contains(process)) {
+      foreach (const UPID& linkee, links.linkees[process]) {
+        CHECK(links.linkers.contains(linkee));
 
-      if (linkee == pid) {
-        foreach (ProcessBase* linker, processes) {
-          CHECK(linker != process) << "Process linked with itself";
-          synchronized (timeouts) {
-            if (Clock::paused()) {
-              Clock::update(linker, time);
+        links.linkers[linkee].erase(process);
+        if (links.linkers[linkee].empty()) {
+          links.linkers.erase(linkee);
+
+          // The exited process was the last linker for this linkee,
+          // so we need to remove the linkee from the remotes.
+          if (linkee.node != __node__) {
+            CHECK(links.remotes.contains(linkee.node));
+
+            links.remotes[linkee.node].erase(linkee);
+            if (links.remotes[linkee.node].empty()) {
+              links.remotes.erase(linkee.node);
             }
           }
-          linker->enqueue(new ExitedEvent(linkee));
         }
+      }
+      links.linkees.erase(process);
+    }
+
+    // Find the linkers to notify.
+    if (!links.linkers.contains(pid)) {
+      return; // No linkers for this process!
+    }
+
+    foreach (ProcessBase* linker, links.linkers[pid]) {
+      CHECK(linker != process) << "Process linked with itself";
+      Clock::update(linker, time);
+      linker->enqueue(new ExitedEvent(pid));
+
+      // Remove the linkee pid from the linker.
+      CHECK(links.linkees.contains(linker));
+
+      links.linkees[linker].erase(pid);
+      if (links.linkees[linker].empty()) {
+        links.linkees.erase(linker);
       }
     }
 
-    links.erase(pid);
+    links.linkers.erase(pid);
   }
 }
 
@@ -2534,12 +1912,27 @@ ProcessManager::ProcessManager(const string& _delegate)
 }
 
 
-ProcessManager::~ProcessManager() {}
+ProcessManager::~ProcessManager()
+{
+  ProcessBase* process = NULL;
+  // Pop a process off the top and terminate it. Don't hold the lock
+  // or process the whole map as terminating one process might
+  // trigger other terminations. Deal with them one at a time.
+  do {
+    synchronized (processes) {
+      process = !processes.empty() ? processes.begin()->second : NULL;
+    }
+    if (process != NULL) {
+      process::terminate(process);
+      process::wait(process);
+    }
+  } while (process != NULL);
+}
 
 
 ProcessReference ProcessManager::use(const UPID& pid)
 {
-  if (pid.ip == __ip__ && pid.port == __port__) {
+  if (pid.node == __node__) {
     synchronized (processes) {
       if (processes.count(pid.id) > 0) {
         // Note that the ProcessReference constructor _must_ get
@@ -2575,7 +1968,7 @@ bool ProcessManager::handle(
       // Only send back an HTTP response if this isn't from libprocess
       // (which we determine by looking at the User-Agent). This is
       // necessary because older versions of libprocess would try and
-      // read the data and parse it as an HTTP request which would
+      // recv the data and parse it as an HTTP request which would
       // fail thus causing the socket to get closed (but now
       // libprocess will ignore responses, see ignore_data).
       Option<string> agent = request->headers.get("User-Agent");
@@ -2645,12 +2038,12 @@ bool ProcessManager::handle(
 
   if (tokens.size() == 0 && delegate != "") {
     request->path = "/" + delegate;
-    receiver = use(UPID(delegate, __ip__, __port__));
+    receiver = use(UPID(delegate, __node__));
   } else if (tokens.size() > 0) {
     // Decode possible percent-encoded path.
     Try<string> decode = http::decode(tokens[0]);
     if (!decode.isError()) {
-      receiver = use(UPID(decode.get(), __ip__, __port__));
+      receiver = use(UPID(decode.get(), __node__));
     } else {
       VLOG(1) << "Failed to decode URL path: " << decode.error();
     }
@@ -2659,7 +2052,7 @@ bool ProcessManager::handle(
   if (!receiver && delegate != "") {
     // Try and delegate the request.
     request->path = "/" + delegate + request->path;
-    receiver = use(UPID(delegate, __ip__, __port__));
+    receiver = use(UPID(delegate, __node__));
   }
 
   if (receiver) {
@@ -2698,15 +2091,7 @@ bool ProcessManager::deliver(
   // the duration of this routine (so that we can look up it's current
   // time).
   if (Clock::paused()) {
-    synchronized (timeouts) {
-      if (Clock::paused()) {
-        if (sender != NULL) {
-          Clock::order(sender, receiver);
-        } else {
-          Clock::update(receiver, Clock::now());
-        }
-      }
-    }
+    Clock::update(receiver, Clock::now(sender != NULL ? sender : __process__));
   }
 
   receiver->enqueue(event);
@@ -2978,7 +2363,7 @@ void ProcessManager::cleanup(ProcessBase* process)
 void ProcessManager::link(ProcessBase* process, const UPID& to)
 {
   // Check if the pid is local.
-  if (!(to.ip == __ip__ && to.port == __port__)) {
+  if (to.node != __node__) {
     socket_manager->link(process, to);
   } else {
     // Since the pid is local we want to get a reference to it's
@@ -3002,15 +2387,7 @@ void ProcessManager::terminate(
 {
   if (ProcessReference process = use(pid)) {
     if (Clock::paused()) {
-      synchronized (timeouts) {
-        if (Clock::paused()) {
-          if (sender != NULL) {
-            Clock::order(sender, process);
-          } else {
-            Clock::update(process, Clock::now());
-          }
-        }
-      }
+      Clock::update(process, Clock::now(sender != NULL ? sender : __process__));
     }
 
     if (sender != NULL) {
@@ -3058,7 +2435,15 @@ bool ProcessManager::wait(const UPID& pid)
           list<ProcessBase*>::iterator it =
             find(runq.begin(), runq.end(), process);
           if (it != runq.end()) {
+            // Found it! Remove it from the run queue since we'll be
+            // donating our thread and also increment 'running' before
+            // leaving this 'runq' protected critical section so that
+            // everyone that is waiting for the processes to settle
+            // continue to wait (otherwise they could see nothing in
+            // 'runq' and 'running' equal to 0 between when we exit
+            // this critical section and increment 'running').
             runq.erase(it);
+            __sync_fetch_and_add(&running, 1);
           } else {
             // Another thread has resumed the process ...
             process = NULL;
@@ -3074,7 +2459,6 @@ bool ProcessManager::wait(const UPID& pid)
   if (process != NULL) {
     VLOG(2) << "Donating thread to " << process->pid << " while waiting";
     ProcessBase* donator = __process__;
-    __sync_fetch_and_add(&running, 1);
     process_manager->resume(process);
     __process__ = donator;
   }
@@ -3143,30 +2527,39 @@ void ProcessManager::settle()
 {
   bool done = true;
   do {
+    // While refactoring in order to isolate libev behind abstractions
+    // it became evident that this os::sleep is vital for tests to
+    // pass. In particular, there are certain tests that assume too
+    // much before they attempt to do a settle. One such example is
+    // tests doing http::get followed by Clock::settle, where they
+    // expect the http::get will have properly enqueued a process on
+    // the run queue but http::get is just sending bytes on a
+    // socket. Without sleeping at the beginning of this function we
+    // can get unlucky and appear settled when in actuallity the
+    // kernel just hasn't copied the bytes to a socket or we haven't
+    // yet read the bytes and enqueued an event on a process (and the
+    // process on the run queue).
     os::sleep(Milliseconds(10));
-    done = true;
-    // Hopefully this is the only place we acquire both these locks.
+
+    done = true; // Assume to start that we are settled.
+
     synchronized (runq) {
-      synchronized (timeouts) {
-        CHECK(Clock::paused()); // Since another thread could resume the clock!
+      if (!runq.empty()) {
+        done = false;
+        continue;
+      }
 
-        if (!runq.empty()) {
-          done = false;
-        }
+      // Read barrier for 'running'.
+      __sync_synchronize();
 
-        __sync_synchronize(); // Read barrier for 'running'.
-        if (running > 0) {
-          done = false;
-        }
+      if (running > 0) {
+        done = false;
+        continue;
+      }
 
-        if (timeouts->size() > 0 &&
-            timeouts->begin()->first <= clock::current) {
-          done = false;
-        }
-
-        if (pending_timers) {
-          done = false;
-        }
+      if (!Clock::settled()) {
+        done = false;
+        continue;
       }
     }
   } while (!done);
@@ -3257,61 +2650,6 @@ Future<Response> ProcessManager::__processes__(const Request&)
 }
 
 
-Timer Timer::create(
-    const Duration& duration,
-    const lambda::function<void(void)>& thunk)
-{
-  static uint64_t id = 1; // Start at 1 since Timer() instances use id 0.
-
-  // Assumes Clock::now() does Clock::now(__process__).
-  Timeout timeout = Timeout::in(duration);
-
-  UPID pid = __process__ != NULL ? __process__->self() : UPID();
-
-  Timer timer(__sync_fetch_and_add(&id, 1), timeout, pid, thunk);
-
-  VLOG(3) << "Created a timer for " << timeout.time();
-
-  // Add the timer.
-  synchronized (timeouts) {
-    if (timeouts->size() == 0 ||
-        timer.timeout().time() < timeouts->begin()->first) {
-      // Need to interrupt the loop to update/set timer repeat.
-      (*timeouts)[timer.timeout().time()].push_back(timer);
-      update_timer = true;
-      ev_async_send(loop, &async_watcher);
-    } else {
-      // Timer repeat is adequate, just add the timeout.
-      CHECK(timeouts->size() >= 1);
-      (*timeouts)[timer.timeout().time()].push_back(timer);
-    }
-  }
-
-  return timer;
-}
-
-
-bool Timer::cancel(const Timer& timer)
-{
-  bool canceled = false;
-  synchronized (timeouts) {
-    // Check if the timeout is still pending, and if so, erase it. In
-    // addition, erase an empty list if we just removed the last
-    // timeout.
-    Time time = timer.timeout().time();
-    if (timeouts->count(time) > 0) {
-      canceled = true;
-      (*timeouts)[time].remove(timer);
-      if ((*timeouts)[time].empty()) {
-        timeouts->erase(time);
-      }
-    }
-  }
-
-  return canceled;
-}
-
-
 ProcessBase::ProcessBase(const string& id)
 {
   process::initialize();
@@ -3327,22 +2665,13 @@ ProcessBase::ProcessBase(const string& id)
   refs = 0;
 
   pid.id = id != "" ? id : ID::generate();
-  pid.ip = __ip__;
-  pid.port = __port__;
+  pid.node = __node__;
 
   // If using a manual clock, try and set current time of process
-  // using happens before relationship between creator and createe!
+  // using happens before relationship between creator (__process__)
+  // and createe (this)!
   if (Clock::paused()) {
-    synchronized (timeouts) {
-      if (Clock::paused()) {
-        clock::currents->erase(this); // In case the address is reused!
-        if (__process__ != NULL) {
-          Clock::order(__process__, this);
-        } else {
-          Clock::update(this, Clock::now());
-        }
-      }
-    }
+    Clock::update(this, Clock::now(__process__), Clock::FORCE);
   }
 }
 
@@ -3529,17 +2858,15 @@ UPID ProcessBase::link(const UPID& to)
 }
 
 
-bool ProcessBase::route(
+void ProcessBase::route(
     const string& name,
     const Option<string>& help_,
     const HttpRequestHandler& handler)
 {
-  if (name.find('/') != 0) {
-    return false;
-  }
+  // Routes must start with '/'.
+  CHECK(name.find('/') == 0);
   handlers.http[name.substr(1)] = handler;
   dispatch(help, &Help::add, pid.id, name, help_);
-  return true;
 }
 
 
@@ -3550,17 +2877,10 @@ UPID spawn(ProcessBase* process, bool manage)
 
   if (process != NULL) {
     // If using a manual clock, try and set current time of process
-    // using happens before relationship between spawner and spawnee!
+    // using happens before relationship between spawner (__process__)
+    // and spawnee (process)!
     if (Clock::paused()) {
-      synchronized (timeouts) {
-        if (Clock::paused()) {
-          if (__process__ != NULL) {
-            Clock::order(__process__, process);
-          } else {
-            Clock::update(process, Clock::now());
-          }
-        }
-      }
+      Clock::update(process, Clock::now(__process__));
     }
 
     return process_manager->spawn(process, manage);
@@ -3683,686 +3003,6 @@ void post(const UPID& from,
 }
 
 
-namespace io {
-
-namespace internal {
-
-// Helper/continuation of 'poll' on future discard.
-void _poll(const memory::shared_ptr<ev_async>& async)
-{
-  ev_async_send(loop, async.get());
-}
-
-
-Future<short> poll(int fd, short events)
-{
-  Poll* poll = new Poll();
-
-  // Have the watchers data point back to the struct.
-  poll->watcher.async->data = poll;
-  poll->watcher.io->data = poll;
-
-  // Get a copy of the future to avoid any races with the event loop.
-  Future<short> future = poll->promise.future();
-
-  // Initialize and start the async watcher.
-  ev_async_init(poll->watcher.async.get(), discard_poll);
-  ev_async_start(loop, poll->watcher.async.get());
-
-  // Make sure we stop polling if a discard occurs on our future.
-  // Note that it's possible that we'll invoke '_poll' when someone
-  // does a discard even after the polling has already completed, but
-  // in this case while we will interrupt the event loop since the
-  // async watcher has already been stopped we won't cause
-  // 'discard_poll' to get invoked.
-  future.onDiscard(lambda::bind(&_poll, poll->watcher.async));
-
-  // Initialize and start the I/O watcher.
-  ev_io_init(poll->watcher.io.get(), polled, fd, events);
-  ev_io_start(loop, poll->watcher.io.get());
-
-  return future;
-}
-
-
-void read(
-    int fd,
-    void* data,
-    size_t size,
-    const memory::shared_ptr<Promise<size_t> >& promise,
-    const Future<short>& future)
-{
-  // Ignore this function if the read operation has been discarded.
-  if (promise->future().hasDiscard()) {
-    CHECK(!future.isPending());
-    promise->discard();
-    return;
-  }
-
-  if (size == 0) {
-    promise->set(0);
-    return;
-  }
-
-  if (future.isDiscarded()) {
-    promise->fail("Failed to poll: discarded future");
-  } else if (future.isFailed()) {
-    promise->fail(future.failure());
-  } else {
-    ssize_t length = ::read(fd, data, size);
-    if (length < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-        // Restart the read operation.
-        Future<short> future =
-          io::poll(fd, process::io::READ).onAny(
-              lambda::bind(&internal::read,
-                           fd,
-                           data,
-                           size,
-                           promise,
-                           lambda::_1));
-
-        // Stop polling if a discard occurs on our future.
-        promise->future().onDiscard(
-            lambda::bind(&process::internal::discard<short>,
-                         WeakFuture<short>(future)));
-      } else {
-        // Error occurred.
-        promise->fail(strerror(errno));
-      }
-    } else {
-      promise->set(length);
-    }
-  }
-}
-
-
-void write(
-    int fd,
-    void* data,
-    size_t size,
-    const memory::shared_ptr<Promise<size_t> >& promise,
-    const Future<short>& future)
-{
-  // Ignore this function if the write operation has been discarded.
-  if (promise->future().hasDiscard()) {
-    promise->discard();
-    return;
-  }
-
-  if (size == 0) {
-    promise->set(0);
-    return;
-  }
-
-  if (future.isDiscarded()) {
-    promise->fail("Failed to poll: discarded future");
-  } else if (future.isFailed()) {
-    promise->fail(future.failure());
-  } else {
-    // Do a write but ignore SIGPIPE so we can return an error when
-    // writing to a pipe or socket where the reading end is closed.
-    // TODO(benh): The 'suppress' macro failed to work on OS X as it
-    // appears that signal delivery was happening asynchronously.
-    // That is, the signal would not appear to be pending when the
-    // 'suppress' block was closed thus the destructor for
-    // 'Suppressor' was not waiting/removing the signal via 'sigwait'.
-    // It also appeared that the signal would be delivered to another
-    // thread even if it remained blocked in this thiread. The
-    // workaround here is to check explicitly for EPIPE and then do
-    // 'sigwait' regardless of what 'os::signals::pending' returns. We
-    // don't have that luxury with 'Suppressor' and arbitrary signals
-    // because we don't always have something like EPIPE to tell us
-    // that a signal is (or will soon be) pending.
-    bool pending = os::signals::pending(SIGPIPE);
-    bool unblock = !pending ? os::signals::block(SIGPIPE) : false;
-
-    ssize_t length = ::write(fd, data, size);
-
-    // Save the errno so we can restore it after doing sig* functions
-    // below.
-    int errno_ = errno;
-
-    if (length < 0 && errno == EPIPE && !pending) {
-      sigset_t mask;
-      sigemptyset(&mask);
-      sigaddset(&mask, SIGPIPE);
-
-      int result;
-      do {
-        int ignored;
-        result = sigwait(&mask, &ignored);
-      } while (result == -1 && errno == EINTR);
-    }
-
-    if (unblock) {
-      os::signals::unblock(SIGPIPE);
-    }
-
-    errno = errno_;
-
-    if (length < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-        // Restart the write operation.
-        Future<short> future =
-          io::poll(fd, process::io::WRITE).onAny(
-              lambda::bind(&internal::write,
-                           fd,
-                           data,
-                           size,
-                           promise,
-                           lambda::_1));
-
-        // Stop polling if a discard occurs on our future.
-        promise->future().onDiscard(
-            lambda::bind(&process::internal::discard<short>,
-                         WeakFuture<short>(future)));
-      } else {
-        // Error occurred.
-        promise->fail(strerror(errno));
-      }
-    } else {
-      // TODO(benh): Retry if 'length' is 0?
-      promise->set(length);
-    }
-  }
-}
-
-} // namespace internal {
-
-
-Future<short> poll(int fd, short events)
-{
-  process::initialize();
-
-  // TODO(benh): Check if the file descriptor is non-blocking?
-
-  return run_in_event_loop<short>(lambda::bind(&internal::poll, fd, events));
-}
-
-
-Future<size_t> read(int fd, void* data, size_t size)
-{
-  process::initialize();
-
-  memory::shared_ptr<Promise<size_t> > promise(new Promise<size_t>());
-
-  // Check the file descriptor.
-  Try<bool> nonblock = os::isNonblock(fd);
-  if (nonblock.isError()) {
-    // The file descriptor is not valid (e.g., has been closed).
-    promise->fail(
-        "Failed to check if file descriptor was non-blocking: " +
-        nonblock.error());
-    return promise->future();
-  } else if (!nonblock.get()) {
-    // The file descriptor is not non-blocking.
-    promise->fail("Expected a non-blocking file descriptor");
-    return promise->future();
-  }
-
-  // Because the file descriptor is non-blocking, we call read()
-  // immediately. The read may in turn call poll if necessary,
-  // avoiding unnecessary polling. We also observed that for some
-  // combination of libev and Linux kernel versions, the poll would
-  // block for non-deterministically long periods of time. This may be
-  // fixed in a newer version of libev (we use 3.8 at the time of
-  // writing this comment).
-  internal::read(fd, data, size, promise, io::READ);
-
-  return promise->future();
-}
-
-
-Future<size_t> write(int fd, void* data, size_t size)
-{
-  process::initialize();
-
-  memory::shared_ptr<Promise<size_t> > promise(new Promise<size_t>());
-
-  // Check the file descriptor.
-  Try<bool> nonblock = os::isNonblock(fd);
-  if (nonblock.isError()) {
-    // The file descriptor is not valid (e.g., has been closed).
-    promise->fail(
-        "Failed to check if file descriptor was non-blocking: " +
-        nonblock.error());
-    return promise->future();
-  } else if (!nonblock.get()) {
-    // The file descriptor is not non-blocking.
-    promise->fail("Expected a non-blocking file descriptor");
-    return promise->future();
-  }
-
-  // Because the file descriptor is non-blocking, we call write()
-  // immediately. The write may in turn call poll if necessary,
-  // avoiding unnecessary polling. We also observed that for some
-  // combination of libev and Linux kernel versions, the poll would
-  // block for non-deterministically long periods of time. This may be
-  // fixed in a newer version of libev (we use 3.8 at the time of
-  // writing this comment).
-  internal::write(fd, data, size, promise, io::WRITE);
-
-  return promise->future();
-}
-
-
-namespace internal {
-
-#if __cplusplus >= 201103L
-Future<string> _read(
-    int fd,
-    const memory::shared_ptr<string>& buffer,
-    const boost::shared_array<char>& data,
-    size_t length)
-{
-  return io::read(fd, data.get(), length)
-    .then([=] (size_t size) -> Future<string> {
-      if (size == 0) { // EOF.
-        return string(*buffer);
-      }
-      buffer->append(data.get(), size);
-      return _read(fd, buffer, data, length);
-    });
-}
-#else
-// Forward declataion.
-Future<string> _read(
-    int fd,
-    const memory::shared_ptr<string>& buffer,
-    const boost::shared_array<char>& data,
-    size_t length);
-
-
-Future<string> __read(
-    size_t size,
-    int fd,
-    const memory::shared_ptr<string>& buffer,
-    const boost::shared_array<char>& data,
-    size_t length)
-{
-  if (size == 0) { // EOF.
-    return string(*buffer);
-  }
-
-  buffer->append(data.get(), size);
-
-  return _read(fd, buffer, data, length);
-}
-
-
-Future<string> _read(
-    int fd,
-    const memory::shared_ptr<string>& buffer,
-    const boost::shared_array<char>& data,
-    size_t length)
-{
-  return io::read(fd, data.get(), length)
-    .then(lambda::bind(&__read, lambda::_1, fd, buffer, data, length));
-}
-#endif // __cplusplus >= 201103L
-
-
-#if __cplusplus >= 201103L
-Future<Nothing> _write(
-    int fd,
-    Owned<string> data,
-    size_t index)
-{
-  return io::write(fd, (void*) (data->data() + index), data->size() - index)
-    .then([=] (size_t length) -> Future<Nothing> {
-      if (index + length == data->size()) {
-        return Nothing();
-      }
-      return _write(fd, data, index + length);
-    });
-}
-#else
-// Forward declaration.
-Future<Nothing> _write(
-    int fd,
-    Owned<string> data,
-    size_t index);
-
-
-Future<Nothing> __write(
-    int fd,
-    Owned<string> data,
-    size_t index,
-    size_t length)
-{
-  if (index + length == data->size()) {
-    return Nothing();
-  }
-  return _write(fd, data, index + length);
-}
-
-
-Future<Nothing> _write(
-    int fd,
-    Owned<string> data,
-    size_t index)
-{
-  return io::write(fd, (void*) (data->data() + index), data->size() - index)
-    .then(lambda::bind(&__write, fd, data, index, lambda::_1));
-}
-#endif // __cplusplus >= 201103L
-
-
-#if __cplusplus >= 201103L
-void _splice(
-    int from,
-    int to,
-    size_t chunk,
-    boost::shared_array<char> data,
-    memory::shared_ptr<Promise<Nothing>> promise)
-{
-  // Stop splicing if a discard occured on our future.
-  if (promise->future().hasDiscard()) {
-    // TODO(benh): Consider returning the number of bytes already
-    // spliced on discarded, or a failure. Same for the 'onDiscarded'
-    // callbacks below.
-    promise->discard();
-    return;
-  }
-
-  // Note that only one of io::read or io::write is outstanding at any
-  // one point in time thus the reuse of 'data' for both operations.
-
-  Future<size_t> read = io::read(from, data.get(), chunk);
-
-  // Stop reading (or potentially indefinitely polling) if a discard
-  // occcurs on our future.
-  promise->future().onDiscard(
-      lambda::bind(&process::internal::discard<size_t>,
-                   WeakFuture<size_t>(read)));
-
-  read
-    .onReady([=] (size_t size) {
-      if (size == 0) { // EOF.
-        promise->set(Nothing());
-      } else {
-        // Note that we always try and complete the write, even if a
-        // discard has occured on our future, in order to provide
-        // semantics where everything read is written. The promise
-        // will eventually be discarded in the next read.
-        io::write(to, string(data.get(), size))
-          .onReady([=] () { _splice(from, to, chunk, data, promise); })
-          .onFailed([=] (const string& message) { promise->fail(message); })
-          .onDiscarded([=] () { promise->discard(); });
-      }
-    })
-    .onFailed([=] (const string& message) { promise->fail(message); })
-    .onDiscarded([=] () { promise->discard(); });
-}
-#else
-// Forward declarations.
-void __splice(
-    int from,
-    int to,
-    size_t chunk,
-    boost::shared_array<char> data,
-    memory::shared_ptr<Promise<Nothing> > promise,
-    size_t size);
-
-void ___splice(
-    memory::shared_ptr<Promise<Nothing> > promise,
-    const string& message);
-
-void ____splice(
-    memory::shared_ptr<Promise<Nothing> > promise);
-
-
-void _splice(
-    int from,
-    int to,
-    size_t chunk,
-    boost::shared_array<char> data,
-    memory::shared_ptr<Promise<Nothing> > promise)
-{
-  // Stop splicing if a discard occured on our future.
-  if (promise->future().hasDiscard()) {
-    // TODO(benh): Consider returning the number of bytes already
-    // spliced on discarded, or a failure. Same for the 'onDiscarded'
-    // callbacks below.
-    promise->discard();
-    return;
-  }
-
-  Future<size_t> read = io::read(from, data.get(), chunk);
-
-  // Stop reading (or potentially indefinitely polling) if a discard
-  // occurs on our future.
-  promise->future().onDiscard(
-      lambda::bind(&process::internal::discard<size_t>,
-                   WeakFuture<size_t>(read)));
-
-  read
-    .onReady(
-        lambda::bind(&__splice, from, to, chunk, data, promise, lambda::_1))
-    .onFailed(lambda::bind(&___splice, promise, lambda::_1))
-    .onDiscarded(lambda::bind(&____splice, promise));
-}
-
-
-void __splice(
-    int from,
-    int to,
-    size_t chunk,
-    boost::shared_array<char> data,
-    memory::shared_ptr<Promise<Nothing> > promise,
-    size_t size)
-{
-  if (size == 0) { // EOF.
-    promise->set(Nothing());
-  } else {
-    // Note that we always try and complete the write, even if a
-    // discard has occured on our future, in order to provide
-    // semantics where everything read is written. The promise will
-    // eventually be discarded in the next read.
-    io::write(to, string(data.get(), size))
-      .onReady(lambda::bind(&_splice, from, to, chunk, data, promise))
-      .onFailed(lambda::bind(&___splice, promise, lambda::_1))
-      .onDiscarded(lambda::bind(&____splice, promise));
-  }
-}
-
-
-void ___splice(
-    memory::shared_ptr<Promise<Nothing> > promise,
-    const string& message)
-{
-  promise->fail(message);
-}
-
-
-void ____splice(
-    memory::shared_ptr<Promise<Nothing> > promise)
-{
-  promise->discard();
-}
-#endif // __cplusplus >= 201103L
-
-
-Future<Nothing> splice(int from, int to, size_t chunk)
-{
-  boost::shared_array<char> data(new char[chunk]);
-
-  // Rather than having internal::_splice return a future and
-  // implementing internal::_splice as a chain of io::read and
-  // io::write calls, we use an explicit promise that we pass around
-  // so that we don't increase memory usage the longer that we splice.
-  memory::shared_ptr<Promise<Nothing> > promise(new Promise<Nothing>());
-
-  Future<Nothing> future = promise->future();
-
-  _splice(from, to, chunk, data, promise);
-
-  return future;
-}
-
-} // namespace internal {
-
-
-Future<string> read(int fd)
-{
-  process::initialize();
-
-  // Get our own copy of the file descriptor so that we're in control
-  // of the lifetime and don't crash if/when someone by accidently
-  // closes the file descriptor before discarding this future. We can
-  // also make sure it's non-blocking and will close-on-exec. Start by
-  // checking we've got a "valid" file descriptor before dup'ing.
-  if (fd < 0) {
-    return Failure(strerror(EBADF));
-  }
-
-  fd = dup(fd);
-  if (fd == -1) {
-    return Failure(ErrnoError("Failed to duplicate file descriptor"));
-  }
-
-  // Set the close-on-exec flag.
-  Try<Nothing> cloexec = os::cloexec(fd);
-  if (cloexec.isError()) {
-    os::close(fd);
-    return Failure(
-        "Failed to set close-on-exec on duplicated file descriptor: " +
-        cloexec.error());
-  }
-
-  // Make the file descriptor is non-blocking.
-  Try<Nothing> nonblock = os::nonblock(fd);
-  if (nonblock.isError()) {
-    os::close(fd);
-    return Failure(
-        "Failed to make duplicated file descriptor non-blocking: " +
-        nonblock.error());
-  }
-
-  // TODO(benh): Wrap up this data as a struct, use 'Owner'.
-  // TODO(bmahler): For efficiency, use a rope for the buffer.
-  memory::shared_ptr<string> buffer(new string());
-  boost::shared_array<char> data(new char[BUFFERED_READ_SIZE]);
-
-  return internal::_read(fd, buffer, data, BUFFERED_READ_SIZE)
-    .onAny(lambda::bind(&os::close, fd));
-}
-
-
-Future<Nothing> write(int fd, const std::string& data)
-{
-  process::initialize();
-
-  // Get our own copy of the file descriptor so that we're in control
-  // of the lifetime and don't crash if/when someone by accidently
-  // closes the file descriptor before discarding this future. We can
-  // also make sure it's non-blocking and will close-on-exec. Start by
-  // checking we've got a "valid" file descriptor before dup'ing.
-  if (fd < 0) {
-    return Failure(strerror(EBADF));
-  }
-
-  fd = dup(fd);
-  if (fd == -1) {
-    return Failure(ErrnoError("Failed to duplicate file descriptor"));
-  }
-
-  // Set the close-on-exec flag.
-  Try<Nothing> cloexec = os::cloexec(fd);
-  if (cloexec.isError()) {
-    os::close(fd);
-    return Failure(
-        "Failed to set close-on-exec on duplicated file descriptor: " +
-        cloexec.error());
-  }
-
-  // Make the file descriptor is non-blocking.
-  Try<Nothing> nonblock = os::nonblock(fd);
-  if (nonblock.isError()) {
-    os::close(fd);
-    return Failure(
-        "Failed to make duplicated file descriptor non-blocking: " +
-        nonblock.error());
-  }
-
-  return internal::_write(fd, Owned<string>(new string(data)), 0)
-    .onAny(lambda::bind(&os::close, fd));
-}
-
-
-Future<Nothing> redirect(int from, Option<int> to, size_t chunk)
-{
-  // Make sure we've got "valid" file descriptors.
-  if (from < 0 || (to.isSome() && to.get() < 0)) {
-    return Failure(strerror(EBADF));
-  }
-
-  if (to.isNone()) {
-    // Open up /dev/null that we can splice into.
-    Try<int> open = os::open("/dev/null", O_WRONLY);
-
-    if (open.isError()) {
-      return Failure("Failed to open /dev/null for writing: " + open.error());
-    }
-
-    to = open.get();
-  } else {
-    // Duplicate 'to' so that we're in control of its lifetime.
-    int fd = dup(to.get());
-    if (fd == -1) {
-      return Failure(ErrnoError("Failed to duplicate 'to' file descriptor"));
-    }
-
-    to = fd;
-  }
-
-  CHECK_SOME(to);
-
-  // Duplicate 'from' so that we're in control of its lifetime.
-  from = dup(from);
-  if (from == -1) {
-    return Failure(ErrnoError("Failed to duplicate 'from' file descriptor"));
-  }
-
-  // Set the close-on-exec flag (no-op if already set).
-  Try<Nothing> cloexec = os::cloexec(from);
-  if (cloexec.isError()) {
-    os::close(from);
-    os::close(to.get());
-    return Failure("Failed to set close-on-exec on 'from': " + cloexec.error());
-  }
-
-  cloexec = os::cloexec(to.get());
-  if (cloexec.isError()) {
-    os::close(from);
-    os::close(to.get());
-    return Failure("Failed to set close-on-exec on 'to': " + cloexec.error());
-  }
-
-  // Make the file descriptors non-blocking (no-op if already set).
-  Try<Nothing> nonblock = os::nonblock(from);
-  if (nonblock.isError()) {
-    os::close(from);
-    os::close(to.get());
-    return Failure("Failed to make 'from' non-blocking: " + nonblock.error());
-  }
-
-  nonblock = os::nonblock(to.get());
-  if (nonblock.isError()) {
-    os::close(from);
-    os::close(to.get());
-    return Failure("Failed to make 'to' non-blocking: " + nonblock.error());
-  }
-
-  return internal::splice(from, to.get(), chunk)
-    .onAny(lambda::bind(&os::close, from))
-    .onAny(lambda::bind(&os::close, to.get()));
-}
-
-} // namespace io {
-
-
 namespace inject {
 
 bool exited(const UPID& from, const UPID& to)
@@ -4381,11 +3021,11 @@ namespace internal {
 void dispatch(
     const UPID& pid,
     const memory::shared_ptr<lambda::function<void(ProcessBase*)> >& f,
-    const string& method)
+    const Option<const std::type_info*>& functionType)
 {
   process::initialize();
 
-  DispatchEvent* event = new DispatchEvent(pid, f, method);
+  DispatchEvent* event = new DispatchEvent(pid, f, functionType);
   process_manager->deliver(pid, event, __process__);
 }
 

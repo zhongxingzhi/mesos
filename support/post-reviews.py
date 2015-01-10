@@ -65,10 +65,11 @@ def execute(command, ignore_errors=False):
 
 # Choose 'post-review' if available, otherwise choose 'rbt'.
 post_review = None
-if execute(['post-review', '--version'], ignore_errors=True):
-  post_review = ['post-review']
-elif execute(['rbt', '--version'], ignore_errors=True):
+rbt_version = execute(['rbt', '--version'], ignore_errors=True)
+if rbt_version:
   post_review = ['rbt', 'post']
+elif execute(['post-review', '--version'], ignore_errors=True):
+  post_review = ['post-review']
 else:
   print 'Please install RBTools before proceeding'
   sys.exit(1)
@@ -114,8 +115,9 @@ call(['git',
       merge_base + '..HEAD'])
 
 log = execute(['git',
-	       '--no-pager',
+               '--no-pager',
                'log',
+               '--no-color',
                '--pretty=oneline',
                '--reverse',
                merge_base + '..HEAD']).strip()
@@ -138,9 +140,9 @@ for i in range(len(shas)):
     execute(['git', 'branch', '-D', temporary_branch], True)
 
     message = execute(['git',
-	               '--no-pager',
+                       '--no-pager',
                        'log',
-                       '--pretty=format:%s%n%b',
+                       '--pretty=format:%s%n%n%b',
                        previous + '..' + sha])
 
     review_request_id = None
@@ -154,14 +156,14 @@ for i in range(len(shas)):
     if review_request_id is None:
         print '\nCreating diff of:\n'
         call(['git',
-	      '--no-pager',
+              '--no-pager',
               'log',
               '--pretty=format:%Cred%H%Creset -%C(yellow)%d%Creset %s',
               previous + '..' + sha])
     else:
         print '\nUpdating diff of:\n'
         call(['git',
-	      '--no-pager',
+              '--no-pager',
               'log',
               '--pretty=format:%Cred%H%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr)%Creset',
               previous + '..' + sha])
@@ -169,7 +171,7 @@ for i in range(len(shas)):
     # Show the "parent" commit(s).
     print '\n... with parent diff created from:\n'
     call(['git',
-	  '--no-pager',
+          '--no-pager',
           'log',
           '--pretty=format:%Cred%H%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr)%Creset',
           parent_branch + '..' + previous])
@@ -190,11 +192,12 @@ for i in range(len(shas)):
         command = command + ['--review-request-id=' + review_request_id]
 
     # Determine how to specify the revision range.
-    if 'rbt' in post_review:
-        # rbt revisions are passed in as args.
+    if 'rbt' in post_review and rbt_version.startswith('RBTools 0.6'):
+        # rbt >= 0.6 revisions are passed in as args.
         command = command + sys.argv[1:] + [previous, sha]
     else:
-        # post-review revisions are passed in using the revision range option.
+        # post-review and rbt < 0.6 revisions are passed in using the revision
+        # range option.
         command = command + \
             ['--revision-range=' + revision_range] + \
             sys.argv[1:]
@@ -214,6 +217,12 @@ for i in range(len(shas)):
     # The second to the last line of output in rbt is the review url.
     url = lines[len(lines) - 2] if 'rbt' in post_review \
         else lines[len(lines) - 1]
+
+    # Using rbt >= 0.6.3 on Linux prints out two URLs where the second
+    # one has /diff/ at the end. We want to remove this so that a
+    # subsequent call to post-reviews does not fail when looking up
+    # the reviewboard entry to edit.
+    url = url.replace('diff/','')
     url = url.strip('/')
 
     # Construct new commit message.

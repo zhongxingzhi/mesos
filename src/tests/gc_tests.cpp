@@ -49,6 +49,7 @@
 #include "slave/constants.hpp"
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
+#include "slave/graceful_shutdown.hpp"
 #include "slave/paths.hpp"
 #include "slave/slave.hpp"
 
@@ -276,8 +277,8 @@ TEST_F(GarbageCollectorIntegrationTest, Restart)
     .Times(1);
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -383,8 +384,8 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedFramework)
     .WillOnce(SaveArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -440,7 +441,8 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedFramework)
     FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule);
 
   // Advance clock to kill executor via isolator.
-  Clock::advance(flags.executor_shutdown_grace_period);
+  Clock::advance(slave::getContainerizerGracePeriod(
+      flags.executor_shutdown_grace_period));
 
   Clock::settle();
 
@@ -458,7 +460,7 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedFramework)
 
   ASSERT_FALSE(os::exists(frameworkDir));
 
-  process::UPID filesUpid("files", process::ip(), process::port());
+  process::UPID filesUpid("files", process::node());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(filesUpid, "browse.json", "path=" + frameworkDir));
@@ -498,8 +500,8 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedExecutor)
     .WillOnce(FutureArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -559,7 +561,7 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedExecutor)
   // Executor's directory should be gc'ed by now.
   ASSERT_FALSE(os::exists(executorDir));
 
-  process::UPID files("files", process::ip(), process::port());
+  process::UPID files("files", process::node());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(files, "browse.json", "path=" + executorDir));
@@ -602,8 +604,8 @@ TEST_F(GarbageCollectorIntegrationTest, DiskUsage)
     .WillOnce(FutureArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -674,7 +676,7 @@ TEST_F(GarbageCollectorIntegrationTest, DiskUsage)
   // Executor's directory should be gc'ed by now.
   ASSERT_FALSE(os::exists(executorDir));
 
-  process::UPID files("files", process::ip(), process::port());
+  process::UPID files("files", process::node());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(files, "browse.json", "path=" + executorDir));
@@ -730,8 +732,8 @@ TEST_F(GarbageCollectorIntegrationTest, Unschedule)
     .WillOnce(FutureArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(executor1, 1, cpus, mem, "*"));

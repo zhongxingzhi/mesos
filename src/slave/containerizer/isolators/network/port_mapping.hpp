@@ -27,10 +27,12 @@
 #include <vector>
 
 #include <process/owned.hpp>
+#include <process/subprocess.hpp>
 
 #include <process/metrics/metrics.hpp>
 #include <process/metrics/counter.hpp>
 
+#include <stout/bytes.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
 #include <stout/interval.hpp>
@@ -132,7 +134,9 @@ public:
 
   virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo);
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user);
 
   virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,
@@ -224,6 +228,8 @@ private:
       const net::IP& _hostIP,
       const size_t _hostEth0MTU,
       const net::IP& _hostDefaultGateway,
+      const hashmap<std::string, std::string>& _hostNetworkConfigurations,
+      const Option<Bytes>& _egressRateLimitPerContainer,
       const IntervalSet<uint16_t>& _managedNonEphemeralPorts,
       const process::Owned<EphemeralPortsAllocator>& _ephemeralPortsAllocator)
     : flags(_flags),
@@ -233,6 +239,8 @@ private:
       hostIP(_hostIP),
       hostEth0MTU(_hostEth0MTU),
       hostDefaultGateway(_hostDefaultGateway),
+      hostNetworkConfigurations(_hostNetworkConfigurations),
+      egressRateLimitPerContainer(_egressRateLimitPerContainer),
       managedNonEphemeralPorts(_managedNonEphemeralPorts),
       ephemeralPortsAllocator(_ephemeralPortsAllocator) {}
 
@@ -241,8 +249,16 @@ private:
   Try<Info*> _recover(pid_t pid);
 
   void _update(
-      const process::Future<Option<int> >& status,
-      const ContainerID& containerId);
+      const ContainerID& containerId,
+      const process::Future<Option<int> >& status);
+
+  process::Future<ResourceStatistics> _usage(
+      const ResourceStatistics& result,
+      const process::Subprocess& s);
+
+  process::Future<ResourceStatistics> __usage(
+      ResourceStatistics result,
+      const process::Future<std::string>& out);
 
   // Helper functions.
   Try<Nothing> addHostIPFilters(
@@ -265,6 +281,14 @@ private:
   const net::IP hostIP;
   const size_t hostEth0MTU;
   const net::IP hostDefaultGateway;
+
+  // Describe the host network configurations. It is a map between
+  // configure proc files (e.g., /proc/sys/net/core/somaxconn) and
+  // values of the configure proc files.
+  const hashmap<std::string, std::string> hostNetworkConfigurations;
+
+  // The optional throughput limit to containers' egress traffic.
+  const Option<Bytes> egressRateLimitPerContainer;
 
   // All the non-ephemeral ports managed by the slave, as passed in
   // via flags.resources.
@@ -300,6 +324,32 @@ public:
   };
 
   PortMappingUpdate() : Subcommand(NAME) {}
+
+  Flags flags;
+
+protected:
+  virtual int execute();
+  virtual flags::FlagsBase* getFlags() { return &flags; }
+};
+
+
+// Defines the subcommand for 'statistics' that needs to be executed
+// by a subprocess to retrieve newtork statistics from inside a
+// container.
+class PortMappingStatistics : public Subcommand
+{
+public:
+  static const std::string NAME;
+
+  struct Flags : public flags::FlagsBase
+  {
+    Flags();
+
+    bool help;
+    Option<pid_t> pid;
+  };
+
+  PortMappingStatistics() : Subcommand(NAME) {}
 
   Flags flags;
 

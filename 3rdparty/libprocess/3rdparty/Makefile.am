@@ -146,6 +146,7 @@ stout_tests_SOURCES =				\
   $(STOUT)/tests/base64_tests.cpp		\
   $(STOUT)/tests/bytes_tests.cpp		\
   $(STOUT)/tests/cache_tests.cpp		\
+  $(STOUT)/tests/svn_tests.cpp			\
   $(STOUT)/tests/duration_tests.cpp		\
   $(STOUT)/tests/dynamiclibrary_tests.cpp	\
   $(STOUT)/tests/error_tests.cpp		\
@@ -162,10 +163,12 @@ stout_tests_SOURCES =				\
   $(STOUT)/tests/none_tests.cpp			\
   $(STOUT)/tests/option_tests.cpp		\
   $(STOUT)/tests/os_tests.cpp			\
+  $(STOUT)/tests/path_tests.cpp			\
   $(STOUT)/tests/protobuf_tests.cpp		\
   $(STOUT)/tests/protobuf_tests.pb.cc		\
   $(STOUT)/tests/protobuf_tests.pb.h		\
   $(STOUT)/tests/protobuf_tests.proto		\
+  $(STOUT)/tests/result_tests.cpp		\
   $(STOUT)/tests/os/sendfile_tests.cpp		\
   $(STOUT)/tests/os/signals_tests.cpp		\
   $(STOUT)/tests/set_tests.cpp			\
@@ -173,11 +176,11 @@ stout_tests_SOURCES =				\
   $(STOUT)/tests/strings_tests.cpp		\
   $(STOUT)/tests/subcommand_tests.cpp		\
   $(STOUT)/tests/thread_tests.cpp		\
-  $(STOUT)/tests/uuid_tests.cpp
+  $(STOUT)/tests/uuid_tests.cpp			\
+  $(STOUT)/tests/version_tests.cpp
 
 if OS_LINUX
   stout_tests_SOURCES += $(STOUT)/tests/proc_tests.cpp
-  stout_tests_SOURCES += $(STOUT)/tests/os/setns_tests.cpp
 endif
 
 stout_tests_CPPFLAGS =				\
@@ -209,7 +212,10 @@ stout_tests_LDADD =			\
   libgmock.la				\
   $(LIBGLOG)				\
   $(LIBPROTOBUF)			\
-  -ldl
+  -ldl					\
+  -lsvn_subr-1				\
+  -lsvn_delta-1				\
+  -lapr-1
 
 # We use a check-local target for now to avoid the parallel test
 # runner that ships with newer versions of autotools.

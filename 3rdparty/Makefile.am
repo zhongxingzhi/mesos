@@ -34,12 +34,16 @@ include versions.am
 
 DISTRIBUTE = distribute-$(DISTRIBUTE_VERSION)
 LEVELDB = leveldb
+PIP = pip-$(PIP_VERSION)
+WHEEL = wheel-$(WHEEL_VERSION)
 ZOOKEEPER = zookeeper-$(ZOOKEEPER_VERSION)
 
 
 EXTRA_DIST =		\
   $(DISTRIBUTE).tar.gz	\
   $(LEVELDB).tar.gz	\
+  $(PIP).tar.gz		\
+  $(WHEEL).tar.gz	\
   $(ZOOKEEPER).tar.gz
 
 # We need to patch leveldb to prevent it from linking to snappy and
@@ -47,11 +51,17 @@ EXTRA_DIST =		\
 EXTRA_DIST +=		\
   $(LEVELDB).patch
 
+# We need to patch ZooKeeper in order to get 3.4.5 to compile on
+# OS X 10.10. See: MESOS-1797.
+EXTRA_DIST +=		\
+  $(ZOOKEEPER).patch
+
 CLEAN_EXTRACTED =	\
   $(DISTRIBUTE)		\
   $(LEVELDB)		\
+  $(PIP)		\
+  $(WHEEL)		\
   $(ZOOKEEPER)
-
 
 # This is where the magic happens: we use stamp files as dependencies
 # which cause the packages to get extracted as necessary. We also
@@ -66,13 +76,15 @@ ALL_LOCAL = # Initialize ALL_LOCAL so we can add to it.
 
 if HAS_PYTHON
 if WITH_BUNDLED_DISTRIBUTE
-  DISTRIBUTE_EGG = \
-    $(DISTRIBUTE)/dist/$(DISTRIBUTE)$(PYTHON_EGG_PUREPY_POSTFIX).egg
+  ALL_LOCAL += $(DISTRIBUTE)-stamp
+endif
 
-  $(DISTRIBUTE_EGG): $(DISTRIBUTE)-stamp
-	cd $(DISTRIBUTE) && $(PYTHON) setup.py bdist_egg
+if WITH_BUNDLED_PIP
+  ALL_LOCAL += $(PIP)-stamp
+endif
 
-  ALL_LOCAL += $(DISTRIBUTE_EGG)
+if WITH_BUNDLED_WHEEL
+  ALL_LOCAL += $(WHEEL)-stamp
 endif
 endif
 

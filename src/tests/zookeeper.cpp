@@ -28,7 +28,6 @@
 #include <jvm/jvm.hpp>
 
 #include <jvm/org/apache/log4j.hpp>
-#include <jvm/org/apache/log4j.hpp>
 
 #include <stout/check.hpp>
 #include <stout/lambda.hpp>
@@ -51,7 +50,7 @@ namespace mesos {
 namespace internal {
 namespace tests {
 
-const Duration ZooKeeperTest::NO_TIMEOUT = Milliseconds(5000);
+const Duration ZooKeeperTest::NO_TIMEOUT = Seconds(10);
 
 
 void ZooKeeperTest::SetUpTestCase()
@@ -186,4 +185,3 @@ ZooKeeperTest::TestWatcher::awaitEvent(
 } // namespace tests {
 } // namespace internal {
 } // namespace mesos {
-

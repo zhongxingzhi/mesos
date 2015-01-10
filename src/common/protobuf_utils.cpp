@@ -27,6 +27,8 @@
 
 #include "messages/messages.hpp"
 
+using std::string;
+
 namespace mesos {
 namespace internal {
 namespace protobuf {
@@ -36,7 +38,8 @@ bool isTerminalState(const TaskState& state)
   return (state == TASK_FINISHED ||
           state == TASK_FAILED ||
           state == TASK_KILLED ||
-          state == TASK_LOST);
+          state == TASK_LOST ||
+          state == TASK_ERROR);
 }
 
 
@@ -47,8 +50,11 @@ StatusUpdate createStatusUpdate(
     const Option<SlaveID>& slaveId,
     const TaskID& taskId,
     const TaskState& state,
-    const std::string& message = "",
-    const Option<ExecutorID>& executorId = None())
+    const TaskStatus::Source& source,
+    const string& message = "",
+    const Option<TaskStatus::Reason>& reason = None(),
+    const Option<ExecutorID>& executorId = None(),
+    const Option<bool>& healthy = None())
 {
   StatusUpdate update;
 
@@ -72,17 +78,26 @@ StatusUpdate createStatusUpdate(
   }
 
   status->set_state(state);
+  status->set_source(source);
   status->set_message(message);
   status->set_timestamp(update.timestamp());
+
+  if (reason.isSome()) {
+    status->set_reason(reason.get());
+  }
+
+  if (healthy.isSome()) {
+    status->set_healthy(healthy.get());
+  }
 
   return update;
 }
 
 
-Task createTask(const TaskInfo& task,
-                       const TaskState& state,
-                       const ExecutorID& executorId,
-                       const FrameworkID& frameworkId)
+Task createTask(
+    const TaskInfo& task,
+    const TaskState& state,
+    const FrameworkID& frameworkId)
 {
   Task t;
   t.mutable_framework_id()->MergeFrom(frameworkId);
@@ -92,11 +107,34 @@ Task createTask(const TaskInfo& task,
   t.mutable_slave_id()->MergeFrom(task.slave_id());
   t.mutable_resources()->MergeFrom(task.resources());
 
-  if (!task.has_command()) {
-    t.mutable_executor_id()->MergeFrom(executorId);
+  if (task.has_executor()) {
+    t.mutable_executor_id()->CopyFrom(task.executor().executor_id());
+  }
+
+  t.mutable_labels()->MergeFrom(task.labels());
+
+  if (task.has_discovery()) {
+      t.mutable_discovery()->MergeFrom(task.discovery());
   }
 
   return t;
+}
+
+
+Option<bool> getTaskHealth(const Task& task)
+{
+  Option<bool> healthy = None();
+  if (task.statuses_size() > 0) {
+    // The statuses list only keeps the most recent TaskStatus for
+    // each state, and appends later states at the end. Thus the last
+    // status is either a terminal state (where health is
+    // irrelevant), or the latest RUNNING status.
+    TaskStatus lastStatus = task.statuses(task.statuses_size() - 1);
+    if (lastStatus.has_healthy()) {
+      healthy = lastStatus.healthy();
+    }
+  }
+  return healthy;
 }
 
 
@@ -104,18 +142,17 @@ MasterInfo createMasterInfo(const process::UPID& pid)
 {
   MasterInfo info;
   info.set_id(stringify(pid) + "-" + UUID::random().toString());
-  info.set_ip(pid.ip);
-  info.set_port(pid.port);
+  info.set_ip(pid.node.ip);
+  info.set_port(pid.node.port);
   info.set_pid(pid);
 
-  Try<std::string> hostname = net::getHostname(pid.ip);
+  Try<string> hostname = net::getHostname(pid.node.ip);
   if (hostname.isSome()) {
     info.set_hostname(hostname.get());
   }
 
   return info;
 }
-
 
 } // namespace protobuf {
 } // namespace internal {

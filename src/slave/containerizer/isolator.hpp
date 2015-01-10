@@ -41,10 +41,10 @@ namespace slave {
 // Forward declaration.
 class IsolatorProcess;
 
-// Information when an executor is impacted by a resource limitation and should
-// be terminated. Intended to support resources like memory where the Linux
-// kernel may invoke the OOM killer, killing some/all of a container's
-// processes.
+// Information when an executor is impacted by a resource limitation
+// and should be terminated. Intended to support resources like memory
+// where the Linux kernel may invoke the OOM killer, killing some/all
+// of a container's processes.
 struct Limitation
 {
   Limitation(
@@ -54,9 +54,10 @@ struct Limitation
       message(_message) {}
 
   // Resource (type and value) that triggered the limitation.
-  const Resource resource;
+  Resource resource;
+
   // Description of the limitation.
-  const std::string message;
+  std::string message;
 };
 
 
@@ -77,7 +78,9 @@ public:
   // only the command value is used.
   process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo);
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user);
 
   // Isolate the executor.
   process::Future<Nothing> isolate(
@@ -119,7 +122,9 @@ public:
 
   virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo) = 0;
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user) = 0;
 
   virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,

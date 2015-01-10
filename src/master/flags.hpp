@@ -35,6 +35,8 @@
 
 #include "mesos/mesos.hpp"
 
+#include "messages/messages.hpp"
+
 namespace mesos {
 namespace internal {
 namespace master {
@@ -52,7 +54,8 @@ public:
     add(&Flags::hostname,
         "hostname",
         "The hostname the master should advertise in ZooKeeper.\n"
-        "If left unset, system hostname will be used (recommended).");
+        "If left unset, the hostname is resolved from the IP address\n"
+        "that the master binds to.");
 
     add(&Flags::root_submissions,
         "root_submissions",
@@ -190,7 +193,7 @@ public:
 
     add(&Flags::weights,
         "weights",
-        "A comma seperated list of role/weight pairs\n"
+        "A comma separated list of role/weight pairs\n"
         "of the form 'role=weight,role=weight'. Weights\n"
         "are used to indicate forms of priority.");
 
@@ -287,8 +290,73 @@ public:
 #ifdef WITH_NETWORK_ISOLATOR
     add(&Flags::max_executors_per_slave,
         "max_executors_per_slave",
-        "A maximum number of executors to allow per slave.");
+        "Maximum number of executors allowed per slave. The network\n"
+        "monitoring/isolation technique imposes an implicit resource\n"
+        "acquisition on each executor (# ephemeral ports), as a result\n"
+        "one can only run a certain number of executors on each slave.");
 #endif  // WITH_NETWORK_ISOLATOR
+
+    // TODO(karya): When we have optimistic offers, this will only
+    // benefit frameworks that accidentally lose an offer.
+    add(&Flags::offer_timeout,
+        "offer_timeout",
+        "Duration of time before an offer is rescinded from a framework.\n"
+        "This helps fairness when running frameworks that hold on to offers,\n"
+        "or frameworks that accidentally drop offers.");
+
+    // This help message for --modules flag is the same for
+    // {master,slave,tests}/flags.hpp and should always be kept in
+    // sync.
+    // TODO(karya): Remove the JSON example and add reference to the
+    // doc file explaining the --modules flag.
+    add(&Flags::modules,
+        "modules",
+        "List of modules to be loaded and be available to the internal\n"
+        "subsystems.\n"
+        "\n"
+        "Use --modules=filepath to specify the list of modules via a\n"
+        "file containing a JSON formatted string. 'filepath' can be\n"
+        "of the form 'file:///path/to/file' or '/path/to/file'.\n"
+        "\n"
+        "Use --modules=\"{...}\" to specify the list of modules inline.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "  \"libraries\": [\n"
+        "    {\n"
+        "      \"file\": \"/path/to/libfoo.so\",\n"
+        "      \"modules\": [\n"
+        "        {\n"
+        "          \"name\": \"org_apache_mesos_bar\",\n"
+        "          \"parameters\": [\n"
+        "            {\n"
+        "              \"key\": \"X\",\n"
+        "              \"value\": \"Y\"\n"
+        "            }\n"
+        "          ]\n"
+        "        },\n"
+        "        {\n"
+        "          \"name\": \"org_apache_mesos_baz\"\n"
+        "        }\n"
+        "      ]\n"
+        "    },\n"
+        "    {\n"
+        "      \"name\": \"qux\",\n"
+        "      \"modules\": [\n"
+        "        {\n"
+        "          \"name\": \"org_apache_mesos_norf\"\n"
+        "        }\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}");
+
+    add(&Flags::authenticators,
+        "authenticators",
+        "Authenticator implementation to use when authenticating frameworks\n"
+        "and/or slaves. Use the default '" + DEFAULT_AUTHENTICATOR + "', or\n"
+        "load an alternate authenticator module using --modules.",
+        DEFAULT_AUTHENTICATOR);
   }
 
   bool version;
@@ -317,6 +385,9 @@ public:
   Option<std::string> credentials;
   Option<ACLs> acls;
   Option<RateLimits> rate_limits;
+  Option<Duration> offer_timeout;
+  Option<Modules> modules;
+  std::string authenticators;
 
 #ifdef WITH_NETWORK_ISOLATOR
   Option<size_t> max_executors_per_slave;

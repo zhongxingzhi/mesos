@@ -19,7 +19,6 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <list>
 #include <map>
 #include <string>
 #include <vector>
@@ -30,6 +29,7 @@
 
 #include <stout/check.hpp>
 #include <stout/foreach.hpp>
+#include <stout/numify.hpp>
 #include <stout/result.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
@@ -85,7 +85,7 @@ struct Object
   // Returns the JSON value (specified by the type) given a "path"
   // into the structure, for example:
   //
-  //   Result<JSON::Array> array = object.find<JSON::Array>("nested.array");
+  //   Result<JSON::Array> array = object.find<JSON::Array>("nested.array[0]");
   //
   // Will return 'None' if no field could be found called 'array'
   // within a field called 'nested' of 'object' (where 'nested' must
@@ -94,8 +94,6 @@ struct Object
   // Returns an error if a JSON value of the wrong type is found, or
   // an intermediate JSON value is not an object that we can do a
   // recursive find on.
-  //
-  // TODO(benh): Support paths that index, e.g., 'nested.array[4].field'.
   template <typename T>
   Result<T> find(const std::string& path) const;
 
@@ -105,7 +103,7 @@ struct Object
 
 struct Array
 {
-  std::list<Value> values;
+  std::vector<Value> values;
 };
 
 
@@ -153,25 +151,25 @@ typedef boost::variant<boost::recursive_wrapper<Null>,
 
 struct Value : internal::Variant
 {
-  // Empty constructur gets the variant default.
+  // Empty constructor gets the variant default.
   Value() {}
 
-  // bool creates a JSON::Boolean explicitly.
   Value(bool value) : internal::Variant(JSON::Boolean(value)) {}
 
-  // CStrings create a JSON::String explicitly.
   Value(char* value) : internal::Variant(JSON::String(value)) {}
   Value(const char* value) : internal::Variant(JSON::String(value)) {}
 
   // Arithmetic types are specifically routed through Number because
-  // there would be ambiguity between JSON::Bool and JSON::Number otherwise.
+  // there would be ambiguity between JSON::Bool and JSON::Number
+  // otherwise.
   template <typename T>
   Value(
       const T& value,
       typename boost::enable_if<boost::is_arithmetic<T>, int>::type = 0)
     : internal::Variant(Number(value)) {}
 
-  // Non-arithmetic types are passed to the default constructor of Variant.
+  // Non-arithmetic types are passed to the default constructor of
+  // Variant.
   template <typename T>
   Value(
       const T& value,
@@ -225,13 +223,52 @@ Result<T> Object::find(const std::string& path) const
     return None();
   }
 
-  std::map<std::string, Value>::const_iterator entry = values.find(names[0]);
+  std::string name = names[0];
+
+  // Determine if we have an array subscript. If so, save it but
+  // remove it from the name for doing the lookup.
+  Option<size_t> subscript = None();
+  size_t index = name.find('[');
+  if (index != std::string::npos) {
+    // Check for the closing bracket.
+    if (name.at(name.length() - 1) != ']') {
+      return Error("Malformed array subscript, expecting ']'");
+    }
+
+    // Now remove the closing bracket (last character) and everything
+    // before and including the opening bracket.
+    std::string s = name.substr(index + 1, name.length() - index - 2);
+
+    // Now numify the subscript.
+    Try<int> i = numify<int>(s);
+
+    if (i.isError()) {
+      return Error("Failed to numify array subscript '" + s + "'");
+    } else if (i.get() < 0) {
+      return Error("Array subscript '" + s + "' must be >= 0");
+    }
+
+    subscript = i.get();
+
+    // And finally remove the array subscript from the name.
+    name = name.substr(0, index);
+  }
+
+  std::map<std::string, Value>::const_iterator entry = values.find(name);
 
   if (entry == values.end()) {
     return None();
   }
 
-  const Value& value = entry->second;
+  Value value = entry->second;
+
+  if (value.is<Array>() && subscript.isSome()) {
+    Array array = value.as<Array>();
+    if (subscript.get() >= array.values.size()) {
+      return None();
+    }
+    value = array.values[subscript.get()];
+  }
 
   if (names.size() == 1) {
     if (!value.is<T>()) {
@@ -309,115 +346,95 @@ inline bool operator == (const Value& lhs, const Value& rhs)
 }
 
 
-// Implementation of rendering JSON objects built above using standard
-// C++ output streams. The visitor pattern is used thanks to to build
-// a "renderer" with boost::static_visitor and two top-level render
-// routines are provided for rendering JSON objects and arrays.
-
-struct Renderer : boost::static_visitor<>
+inline std::ostream& operator << (std::ostream& out, const String& string)
 {
-  Renderer(std::ostream& _out) : out(_out) {}
-
-  void operator () (const String& string) const
-  {
-    // TODO(benh): This escaping DOES NOT handle unicode, it encodes as ASCII.
-    // See RFC4627 for the JSON string specificiation.
-    out << "\"";
-    foreach (unsigned char c, string.value) {
-      switch (c) {
-        case '"':  out << "\\\""; break;
-        case '\\': out << "\\\\"; break;
-        case '/':  out << "\\/";  break;
-        case '\b': out << "\\b";  break;
-        case '\f': out << "\\f";  break;
-        case '\n': out << "\\n";  break;
-        case '\r': out << "\\r";  break;
-        case '\t': out << "\\t";  break;
-        default:
-          // See RFC4627 for these ranges.
-          if ((c >= 0x20 && c <= 0x21) ||
-              (c >= 0x23 && c <= 0x5B) ||
-              (c >= 0x5D && c < 0x7F)) {
-            out << c;
-          } else {
-            // NOTE: We also escape all bytes > 0x7F since they imply more than
-            // 1 byte in UTF-8. This is why we don't escape UTF-8 properly.
-            // See RFC4627 for the escaping format: \uXXXX (X is a hex digit).
-            // Each byte here will be of the form: \u00XX (this is why we need
-            // setw and the cast to unsigned int).
-            out << "\\u" << std::setfill('0') << std::setw(4)
-                << std::hex << std::uppercase << (unsigned int) c;
-          }
-          break;
-      }
+  // TODO(benh): This escaping DOES NOT handle unicode, it encodes as ASCII.
+  // See RFC4627 for the JSON string specificiation.
+  out << "\"";
+  foreach (unsigned char c, string.value) {
+    switch (c) {
+      case '"':  out << "\\\""; break;
+      case '\\': out << "\\\\"; break;
+      case '/':  out << "\\/";  break;
+      case '\b': out << "\\b";  break;
+      case '\f': out << "\\f";  break;
+      case '\n': out << "\\n";  break;
+      case '\r': out << "\\r";  break;
+      case '\t': out << "\\t";  break;
+      default:
+        // See RFC4627 for these ranges.
+        if ((c >= 0x20 && c <= 0x21) ||
+            (c >= 0x23 && c <= 0x5B) ||
+            (c >= 0x5D && c < 0x7F)) {
+          out << c;
+        } else {
+          // NOTE: We also escape all bytes > 0x7F since they imply more than
+          // 1 byte in UTF-8. This is why we don't escape UTF-8 properly.
+          // See RFC4627 for the escaping format: \uXXXX (X is a hex digit).
+          // Each byte here will be of the form: \u00XX (this is why we need
+          // setw and the cast to unsigned int).
+          out << "\\u" << std::setfill('0') << std::setw(4)
+              << std::hex << std::uppercase << (unsigned int) c;
+        }
+        break;
     }
-    out << "\"";
   }
-
-  void operator () (const Number& number) const
-  {
-    // Use the guaranteed accurate precision, see:
-    // http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2006/n2005.pdf
-    out << std::setprecision(std::numeric_limits<double>::digits10)
-        << number.value;
-  }
-
-  void operator () (const Object& object) const
-  {
-    out << "{";
-    std::map<std::string, Value>::const_iterator iterator;
-    iterator = object.values.begin();
-    while (iterator != object.values.end()) {
-      out << "\"" << (*iterator).first << "\":";
-      boost::apply_visitor(Renderer(out), (*iterator).second);
-      if (++iterator != object.values.end()) {
-        out << ",";
-      }
-    }
-    out << "}";
-  }
-
-  void operator () (const Array& array) const
-  {
-    out << "[";
-    std::list<Value>::const_iterator iterator;
-    iterator = array.values.begin();
-    while (iterator != array.values.end()) {
-      boost::apply_visitor(Renderer(out), *iterator);
-      if (++iterator != array.values.end()) {
-        out << ",";
-      }
-    }
-    out << "]";
-  }
-
-  void operator () (const Boolean& boolean) const
-  {
-    out << (boolean.value ? "true" : "false");
-  }
-
-  void operator () (const Null&) const
-  {
-    out << "null";
-  }
-
-private:
-  std::ostream& out;
-};
-
-
-inline void render(std::ostream& out, const Value& value)
-{
-  boost::apply_visitor(Renderer(out), value);
-}
-
-
-inline std::ostream& operator << (std::ostream& out, const Value& value)
-{
-  render(out, value);
+  out << "\"";
   return out;
 }
 
+
+inline std::ostream& operator << (std::ostream& out, const Number& number)
+{
+  // Use the guaranteed accurate precision, see:
+  // http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2006/n2005.pdf
+  return out << std::setprecision(std::numeric_limits<double>::digits10)
+             << number.value;
+}
+
+
+inline std::ostream& operator << (std::ostream& out, const Object& object)
+{
+  out << "{";
+  std::map<std::string, Value>::const_iterator iterator;
+  iterator = object.values.begin();
+  while (iterator != object.values.end()) {
+    out << String((*iterator).first) << ":" << (*iterator).second;
+    if (++iterator != object.values.end()) {
+      out << ",";
+    }
+  }
+  out << "}";
+  return out;
+}
+
+
+inline std::ostream& operator << (std::ostream& out, const Array& array)
+{
+  out << "[";
+  std::vector<Value>::const_iterator iterator;
+  iterator = array.values.begin();
+  while (iterator != array.values.end()) {
+    out << *iterator;
+    if (++iterator != array.values.end()) {
+      out << ",";
+    }
+  }
+  out << "]";
+  return out;
+}
+
+
+inline std::ostream& operator << (std::ostream& out, const Boolean& boolean)
+{
+  return out << (boolean.value ? "true" : "false");
+}
+
+
+inline std::ostream& operator << (std::ostream& out, const Null&)
+{
+  return out << "null";
+}
 
 namespace internal {
 

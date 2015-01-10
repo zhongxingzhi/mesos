@@ -24,7 +24,9 @@
 
 #include <process/future.hpp>
 #include <process/reap.hpp>
+#include <process/subprocess.hpp>
 
+#include <stout/bytes.hpp>
 #include <stout/gtest.hpp>
 #include <stout/json.hpp>
 #include <stout/net.hpp>
@@ -46,6 +48,7 @@
 
 #include "slave/containerizer/isolators/network/port_mapping.hpp"
 
+#include "slave/containerizer/fetcher.hpp"
 #include "slave/containerizer/launcher.hpp"
 #include "slave/containerizer/linux_launcher.hpp"
 
@@ -98,12 +101,14 @@ static void cleanup(const string& eth0, const string& lo)
   // Clean up the ingress qdisc on eth0 and lo if exists.
   Try<bool> hostEth0ExistsQdisc = ingress::exists(eth0);
   ASSERT_SOME(hostEth0ExistsQdisc);
+
   if (hostEth0ExistsQdisc.get()) {
     ASSERT_SOME_TRUE(ingress::remove(eth0));
   }
 
   Try<bool> hostLoExistsQdisc = ingress::exists(lo);
   ASSERT_SOME(hostLoExistsQdisc);
+
   if (hostLoExistsQdisc.get()) {
     ASSERT_SOME_TRUE(ingress::remove(lo));
   }
@@ -111,6 +116,7 @@ static void cleanup(const string& eth0, const string& lo)
   // Clean up all 'veth' devices if exist.
   Try<set<string> > links = net::links();
   ASSERT_SOME(links);
+
   foreach (const string& name, links.get()) {
     if (strings::startsWith(name, slave::VETH_PREFIX)) {
       ASSERT_SOME_TRUE(link::remove(name));
@@ -119,6 +125,7 @@ static void cleanup(const string& eth0, const string& lo)
 
   Try<list<string> > entries = os::ls(slave::BIND_MOUNT_ROOT);
   ASSERT_SOME(entries);
+
   foreach (const string& file, entries.get()) {
     string target = path::join(slave::BIND_MOUNT_ROOT, file);
 
@@ -188,6 +195,7 @@ protected:
 
     // Get host IP address.
     Result<net::IP> _hostIP = net::ip(eth0);
+
     CHECK_SOME(_hostIP)
       << "Failed to retrieve the host public IP from " << eth0 << ": "
       << _hostIP.error();
@@ -355,12 +363,19 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerToContainerTCPTest)
   ContainerID containerId1;
   containerId1.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir1 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir1);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId1, executorInfo);
+    isolator.get()->prepare(containerId1, executorInfo, dir1.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
   ostringstream command1;
+
   // Listen to 'localhost' and 'port'.
   command1 << "nc -l localhost " << port << " > " << trafficViaLoopback << "& ";
 
@@ -409,12 +424,19 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerToContainerTCPTest)
   executorInfo.mutable_resources()->CopyFrom(
       Resources::parse(container2Ports).get());
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir2 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir2);
+
   Future<Option<CommandInfo> > preparation2 =
-    isolator.get()->prepare(containerId2, executorInfo);
+    isolator.get()->prepare(containerId2, executorInfo, dir2.get(), None());
+
   AWAIT_READY(preparation2);
   ASSERT_SOME(preparation2.get());
 
   ostringstream command2;
+
   // Send to 'localhost' and 'port'.
   command2 << "echo -n hello1 | nc localhost " << port << ";";
   // Send to 'localhost' and 'errorPort'. This should fail.
@@ -491,12 +513,19 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerToContainerUDPTest)
   ContainerID containerId1;
   containerId1.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir1 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir1);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId1, executorInfo);
+    isolator.get()->prepare(containerId1, executorInfo, dir1.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
   ostringstream command1;
+
   // Listen to 'localhost' and 'port'.
   command1 << "nc -u -l localhost " << port << " > "
            << trafficViaLoopback << "& ";
@@ -546,12 +575,19 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerToContainerUDPTest)
   executorInfo.mutable_resources()->CopyFrom(
       Resources::parse(container2Ports).get());
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir2 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir2);
+
   Future<Option<CommandInfo> > preparation2 =
-    isolator.get()->prepare(containerId2, executorInfo);
+    isolator.get()->prepare(containerId2, executorInfo, dir2.get(), None());
+
   AWAIT_READY(preparation2);
   ASSERT_SOME(preparation2.get());
 
   ostringstream command2;
+
   // Send to 'localhost' and 'port'.
   command2 << "echo -n hello1 | nc -w1 -u localhost " << port << ";";
   // Send to 'localhost' and 'errorPort'. No data should be sent.
@@ -573,6 +609,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerToContainerUDPTest)
       containerId2,
       command2.str(),
       preparation2.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -629,12 +666,19 @@ TEST_F(PortMappingIsolatorTest, ROOT_HostToContainerUDPTest)
   ContainerID containerId;
   containerId.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId, executorInfo);
+    isolator.get()->prepare(containerId, executorInfo, dir.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
   ostringstream command1;
+
   // Listen to 'localhost' and 'Port'.
   command1 << "nc -u -l localhost " << port << " > "
            << trafficViaLoopback << "&";
@@ -659,6 +703,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_HostToContainerUDPTest)
       containerId,
       command1.str(),
       preparation1.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -738,12 +783,19 @@ TEST_F(PortMappingIsolatorTest, ROOT_HostToContainerTCPTest)
   ContainerID containerId;
   containerId.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId, executorInfo);
+    isolator.get()->prepare(containerId, executorInfo, dir.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
   ostringstream command1;
+
   // Listen to 'localhost' and 'Port'.
   command1 << "nc -l localhost " << port << " > " << trafficViaLoopback << "&";
 
@@ -767,6 +819,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_HostToContainerTCPTest)
       containerId,
       command1.str(),
       preparation1.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -854,8 +907,14 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPExternalTest)
   ContainerID containerId;
   containerId.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId, executorInfo);
+    isolator.get()->prepare(containerId, executorInfo, dir.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
@@ -878,6 +937,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPExternalTest)
       containerId,
       command1.str(),
       preparation1.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -927,14 +987,22 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPInternalTest)
   ContainerID containerId;
   containerId.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId, executorInfo);
+    isolator.get()->prepare(containerId, executorInfo, dir.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
   ostringstream command1;
+
   command1 << "ping -c1 127.0.0.1 && ping -c1 "
            << stringify(net::IP(hostIP.get().address()));
+
   command1 << "; echo -n $? > " << exitStatus << "; sync";
 
   int pipes[2];
@@ -946,6 +1014,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerICMPInternalTest)
       containerId,
       command1.str(),
       preparation1.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -1004,8 +1073,14 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerARPExternalTest)
   ContainerID containerId;
   containerId.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId, executorInfo);
+    isolator.get()->prepare(containerId, executorInfo, dir.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
@@ -1029,6 +1104,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_ContainerARPExternalTest)
       containerId,
       command1.str(),
       preparation1.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -1086,8 +1162,14 @@ TEST_F(PortMappingIsolatorTest, ROOT_DNSTest)
   ContainerID containerId;
   containerId.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId, executorInfo);
+    isolator.get()->prepare(containerId, executorInfo, dir.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
@@ -1110,6 +1192,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_DNSTest)
       containerId,
       command1.str(),
       preparation1.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -1164,8 +1247,14 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainersTest)
   ContainerID containerId1;
   containerId1.set_value("container1");
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir1 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir1);
+
   Future<Option<CommandInfo> > preparation1 =
-    isolator.get()->prepare(containerId1, executorInfo);
+    isolator.get()->prepare(containerId1, executorInfo, dir1.get(), None());
+
   AWAIT_READY(preparation1);
   ASSERT_SOME(preparation1.get());
 
@@ -1181,6 +1270,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainersTest)
       containerId1,
       command1.str(),
       preparation1.get());
+
   ASSERT_SOME(pid);
 
   // Reap the forked child.
@@ -1203,8 +1293,14 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainersTest)
   executorInfo.mutable_resources()->CopyFrom(
       Resources::parse(container2Ports).get());
 
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir2 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir2);
+
   Future<Option<CommandInfo> > preparation2 =
-    isolator.get()->prepare(containerId2, executorInfo);
+    isolator.get()->prepare(containerId2, executorInfo, dir2.get(), None());
+
   AWAIT_FAILED(preparation2);
 
   // Ensure all processes are killed.
@@ -1212,6 +1308,264 @@ TEST_F(PortMappingIsolatorTest, ROOT_TooManyContainersTest)
 
   // Let the isolator clean up.
   AWAIT_READY(isolator.get()->cleanup(containerId1));
+
+  delete isolator.get();
+  delete launcher.get();
+}
+
+
+// Test the scenario where PortMappingIsolator uses a very small
+// egress rate limit.
+TEST_F(PortMappingIsolatorTest, ROOT_SmallEgressLimitTest)
+{
+  // Note that the underlying rate limiting mechanism usually has a
+  // small allowance for burst. Empirically, as least 10x of the rate
+  // limit amount of data is required to make sure the burst is an
+  // insignificant factor of the transmission time.
+
+  // To-be-tested egress rate limit, in Bytes/s.
+  const Bytes rate = 2000;
+  // Size of the data to send, in Bytes.
+  const Bytes size = 20480;
+
+  // Use a very small egress limit.
+  flags.egress_rate_limit_per_container = rate;
+
+  Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
+  CHECK_SOME(isolator);
+
+  Try<Launcher*> launcher = LinuxLauncher::create(flags);
+  CHECK_SOME(launcher);
+
+  // Open a nc server on the host side. Note that 'errorPort' is in
+  // neither 'ports' nor 'ephemeral_ports', which makes it a good port
+  // to use on the host.
+  Try<Subprocess> s = subprocess(
+      "nc -l localhost " + stringify(errorPort) + " > /devnull");
+
+  CHECK_SOME(s);
+
+  // Set the executor's resources.
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse(container1Ports).get());
+
+  ContainerID containerId;
+  containerId.set_value("container1");
+
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
+  Future<Option<CommandInfo> > preparation1 =
+    isolator.get()->prepare(containerId, executorInfo, dir.get(), None());
+
+  AWAIT_READY(preparation1);
+  ASSERT_SOME(preparation1.get());
+
+  // Fill 'size' bytes of data. The actual content does not matter.
+  string data(size.bytes(), 'a');
+
+  ostringstream command1;
+  const string transmissionTime = path::join(os::getcwd(), "transmission_time");
+
+  command1 << "echo 'Sending " << size.bytes()
+           << " bytes of data under egress rate limit " << rate.bytes()
+           << "Bytes/s...';";
+
+  command1 << "{ time -p echo " << data  << " | nc localhost "
+           << errorPort << " ; } 2> " << transmissionTime << " && ";
+
+  // Touch the guard file.
+  command1 << "touch " << container1Ready;
+
+  int pipes[2];
+  ASSERT_NE(-1, ::pipe(pipes));
+
+  Try<pid_t> pid = launchHelper(
+      launcher.get(),
+      pipes,
+      containerId,
+      command1.str(),
+      preparation1.get());
+
+  ASSERT_SOME(pid);
+
+  // Reap the forked child.
+  Future<Option<int> > reap = process::reap(pid.get());
+
+  // Continue in the parent.
+  ::close(pipes[0]);
+
+  // Isolate the forked child.
+  AWAIT_READY(isolator.get()->isolate(containerId, pid.get()));
+
+  // Now signal the child to continue.
+  char dummy;
+  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
+  ::close(pipes[1]);
+
+  // Wait for the command to finish.
+  while (!os::exists(container1Ready));
+
+  Try<string> read = os::read(transmissionTime);
+  CHECK_SOME(read);
+
+  // Get the real elapsed time from `time` output. Sample output:
+  // real 12.37
+  // user 0.00
+  // sys 0.00
+  vector<string> lines = strings::split(strings::trim(read.get()), "\n");
+  ASSERT_EQ(3u, lines.size());
+
+  vector<string> split = strings::split(lines[0], " ");
+  ASSERT_EQ(2u, split.size());
+
+  Try<float> time = numify<float>(split[1]);
+  ASSERT_SOME(time);
+  ASSERT_GT(time.get(), (size.bytes() / rate.bytes()));
+
+  // Make sure the nc server exits normally.
+  Future<Option<int> > status = s.get().status();
+  AWAIT_READY(status);
+  EXPECT_SOME_EQ(0, status.get());
+
+  // Ensure all processes are killed.
+  AWAIT_READY(launcher.get()->destroy(containerId));
+
+  // Let the isolator clean up.
+  AWAIT_READY(isolator.get()->cleanup(containerId));
+
+  delete isolator.get();
+  delete launcher.get();
+}
+
+
+// Test that RTT can be returned properly from usage(). This test is
+// very similar to SmallEgressLimitTest in its set up.
+TEST_F(PortMappingIsolatorTest, ROOT_ExportRTTTest)
+{
+  // To-be-tested egress rate limit, in Bytes/s.
+  const Bytes rate = 2000;
+  // Size of the data to send, in Bytes.
+  const Bytes size = 20480;
+
+  // Use a very small egress limit.
+  flags.egress_rate_limit_per_container = rate;
+  flags.network_enable_socket_statistics = true;
+
+  Try<Isolator*> isolator = PortMappingIsolatorProcess::create(flags);
+  CHECK_SOME(isolator);
+
+  Try<Launcher*> launcher = LinuxLauncher::create(flags);
+  CHECK_SOME(launcher);
+
+  // Open a nc server on the host side. Note that 'errorPort' is in
+  // neither 'ports' nor 'ephemeral_ports', which makes it a good port
+  // to use on the host. We use this host's public IP because
+  // connections to the localhost IP are filtered out when retrieving
+  // the RTT information inside containers.
+  Try<Subprocess> s = subprocess(
+      "nc -l " + stringify(net::IP(hostIP.get().address())) + " " +
+      stringify(errorPort) + " > /devnull");
+
+  CHECK_SOME(s);
+
+  // Set the executor's resources.
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse(container1Ports).get());
+
+  ContainerID containerId;
+  containerId.set_value("container1");
+
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir1 = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir1);
+
+  Future<Option<CommandInfo> > preparation1 =
+    isolator.get()->prepare(containerId, executorInfo, dir1.get(), None());
+
+  AWAIT_READY(preparation1);
+  ASSERT_SOME(preparation1.get());
+
+  // Fill 'size' bytes of data. The actual content does not matter.
+  string data(size.bytes(), 'a');
+
+  ostringstream command1;
+  const string transmissionTime = path::join(os::getcwd(), "transmission_time");
+
+  command1 << "echo 'Sending " << size.bytes()
+           << " bytes of data under egress rate limit " << rate.bytes()
+           << "Bytes/s...';";
+
+  command1 << "{ time -p echo " << data  << " | nc "
+           << stringify(net::IP(hostIP.get().address())) << " "
+           << errorPort << " ; } 2> " << transmissionTime << " && ";
+
+  // Touch the guard file.
+  command1 << "touch " << container1Ready;
+
+  int pipes[2];
+  ASSERT_NE(-1, ::pipe(pipes));
+
+  Try<pid_t> pid = launchHelper(
+      launcher.get(),
+      pipes,
+      containerId,
+      command1.str(),
+      preparation1.get());
+
+  ASSERT_SOME(pid);
+
+  // Reap the forked child.
+  Future<Option<int> > reap = process::reap(pid.get());
+
+  // Continue in the parent.
+  ::close(pipes[0]);
+
+  // Isolate the forked child.
+  AWAIT_READY(isolator.get()->isolate(containerId, pid.get()));
+
+  // Now signal the child to continue.
+  char dummy;
+  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
+  ::close(pipes[1]);
+
+  // Test that RTT can be returned while transmission is going. It is
+  // possible that the first few statistics returned don't have a RTT
+  // value because it takes a few round-trips to actually establish a
+  // tcp connection and start sending data. Nevertheless, we should
+  // see a meaningful result well within seconds.
+  Duration waited = Duration::zero();
+  do {
+    os::sleep(Milliseconds(200));
+    waited += Milliseconds(200);
+
+    Future<ResourceStatistics> usage = isolator.get()->usage(containerId);
+    AWAIT_READY(usage);
+
+    if (usage.get().has_net_tcp_rtt_microsecs_p50()) {
+      break;
+    }
+  } while (waited < Seconds(5));
+  ASSERT_LT(waited, Seconds(5));
+
+  // Wait for the command to finish.
+  while (!os::exists(container1Ready));
+
+  // Make sure the nc server exits normally.
+  Future<Option<int> > status = s.get().status();
+  AWAIT_READY(status);
+  EXPECT_SOME_EQ(0, status.get());
+
+  // Ensure all processes are killed.
+  AWAIT_READY(launcher.get()->destroy(containerId));
+
+  // Let the isolator clean up.
+  AWAIT_READY(isolator.get()->cleanup(containerId));
 
   delete isolator.get();
   delete launcher.get();
@@ -1267,6 +1621,8 @@ public:
 
   slave::Flags flags;
 
+  Fetcher fetcher;
+
   // Name of the host eth0 and lo.
   string eth0;
   string lo;
@@ -1300,13 +1656,15 @@ TEST_F(PortMappingMesosTest, ROOT_RecoverMixedContainersTest)
   ASSERT_SOME(master);
 
   Try<MesosContainerizer*> containerizer1 =
-    MesosContainerizer::create(flagsNoNetworkIsolator, true);
+    MesosContainerizer::create(flagsNoNetworkIsolator, true, &fetcher);
+
   ASSERT_SOME(containerizer1);
 
   // Start the first slave without network isolator and start a task.
   Try<PID<Slave> > slave = StartSlave(
       containerizer1.get(),
       flagsNoNetworkIsolator);
+
   ASSERT_SOME(slave);
 
   MockScheduler sched1;
@@ -1364,7 +1722,8 @@ TEST_F(PortMappingMesosTest, ROOT_RecoverMixedContainersTest)
   // Restart the slave with a new containerizer that uses network
   // isolator.
   Try<MesosContainerizer*> containerizer2 =
-    MesosContainerizer::create(flags, true);
+    MesosContainerizer::create(flags, true, &fetcher);
+
   ASSERT_SOME(containerizer2);
 
   // Start the second slave with network isolator, recover the first
@@ -1394,7 +1753,7 @@ TEST_F(PortMappingMesosTest, ROOT_RecoverMixedContainersTest)
   TaskInfo task2 = createTask(offer2, "sleep 1000");
 
   vector<TaskInfo> tasks2;
-  tasks2.push_back(task2); // Long-running task
+  tasks2.push_back(task2); // Long-running task.
 
   EXPECT_CALL(sched1, statusUpdate(_, _));
 
@@ -1419,7 +1778,8 @@ TEST_F(PortMappingMesosTest, ROOT_RecoverMixedContainersTest)
   // without network isolator and another task is running with network
   // isolator.
   Try<MesosContainerizer*> containerizer3 =
-    MesosContainerizer::create(flags, true);
+    MesosContainerizer::create(flags, true, &fetcher);
+
   ASSERT_SOME(containerizer3);
 
   slave = StartSlave(containerizer3.get(), flags);
@@ -1442,11 +1802,11 @@ TEST_F(PortMappingMesosTest, ROOT_RecoverMixedContainersTest)
   Future<hashset<ContainerID> > containers = containerizer3.get()->containers();
   AWAIT_READY(containers);
   EXPECT_EQ(2u, containers.get().size());
+
   foreach (ContainerID containerId, containers.get()) {
     // Do some basic checks to make sure the network isolator can
     // handle mixed types of containers correctly.
-    Future<ResourceStatistics> usage =
-      containerizer3.get()->usage(containerId);
+    Future<ResourceStatistics> usage = containerizer3.get()->usage(containerId);
     AWAIT_READY(usage);
 
     // TODO(chzhcn): write a more thorough test for update.
@@ -1455,6 +1815,7 @@ TEST_F(PortMappingMesosTest, ROOT_RecoverMixedContainersTest)
 
     Future<Nothing> update =
       containerizer3.get()->update(containerId, resources.get());
+
     AWAIT_READY(update);
   }
 
@@ -1474,7 +1835,8 @@ TEST_F(PortMappingMesosTest, ROOT_CleanUpOrphanTest)
   ASSERT_SOME(master);
 
   Try<MesosContainerizer*> containerizer1 =
-    MesosContainerizer::create(flags, true);
+    MesosContainerizer::create(flags, true, &fetcher);
+
   ASSERT_SOME(containerizer1);
 
   Try<PID<Slave> > slave = StartSlave(containerizer1.get(), flags);
@@ -1547,7 +1909,8 @@ TEST_F(PortMappingMesosTest, ROOT_CleanUpOrphanTest)
 
   // Restart the slave (use same flags) with a new containerizer.
   Try<MesosContainerizer*> containerizer2 =
-    MesosContainerizer::create(flags, true);
+    MesosContainerizer::create(flags, true, &fetcher);
+
   ASSERT_SOME(containerizer2);
 
   slave = StartSlave(containerizer2.get(), flags);

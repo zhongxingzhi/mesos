@@ -36,18 +36,27 @@ namespace protobuf {
 
 bool isTerminalState(const TaskState& state);
 
+
 StatusUpdate createStatusUpdate(
     const FrameworkID& frameworkId,
     const Option<SlaveID>& slaveId,
     const TaskID& taskId,
     const TaskState& state,
+    const TaskStatus::Source& source,
     const std::string& message = "",
-    const Option<ExecutorID>& executorId = None());
+    const Option<TaskStatus::Reason>& reason = None(),
+    const Option<ExecutorID>& executorId = None(),
+    const Option<bool>& healthy = None());
 
-Task createTask(const TaskInfo& task,
-                const TaskState& state,
-                const ExecutorID& executorId,
-                const FrameworkID& frameworkId);
+
+Task createTask(
+    const TaskInfo& task,
+    const TaskState& state,
+    const FrameworkID& frameworkId);
+
+
+Option<bool> getTaskHealth(const Task& task);
+
 
 // Helper function that creates a MasterInfo from UPID.
 MasterInfo createMasterInfo(const process::UPID& pid);

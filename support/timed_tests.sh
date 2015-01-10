@@ -6,7 +6,7 @@ cat <<EOF
 
 Run Mesos tests within a duration and attach gdb if the tests time out. This
 script will run the test command under the current work directory. To put the
-time limit only on tests, compile the project before runing the script. This
+time limit only on tests, compile the project before running the script. This
 script works only on Linux.
 
 Usage: $0 [-h] <test_cmd> <duration>
@@ -45,7 +45,11 @@ while [ $(($(date +"%s") - $start)) -lt $duration ]; do
   running=`ps p $test_cmd_pid h | wc -l`
   if [ $running -eq 0 ]; then
     echo "Test finished"
-    exit 0
+    # Get the exit status.
+    wait $test_cmd_pid
+    exit_status=$?
+    echo "Exit status: $exit_status"
+    exit $exit_status
   fi
 
   sleep 5

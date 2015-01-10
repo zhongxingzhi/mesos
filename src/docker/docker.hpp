@@ -25,6 +25,7 @@
 #include <process/future.hpp>
 #include <process/subprocess.hpp>
 
+#include <stout/duration.hpp>
 #include <stout/json.hpp>
 #include <stout/none.hpp>
 #include <stout/nothing.hpp>
@@ -40,7 +41,9 @@ class Docker
 {
 public:
   // Create Docker abstraction and optionally validate docker.
-  static Try<Docker> create(const std::string& path, bool validate = true);
+  static Try<Docker*> create(const std::string& path, bool validate = true);
+
+  virtual ~Docker() {}
 
   class Container
   {
@@ -65,8 +68,21 @@ public:
       : id(_id), name(_name), pid(_pid) {}
   };
 
+  class Image
+  {
+  public:
+    static Try<Image> create(const JSON::Object& json);
+
+    Option<std::vector<std::string> > entrypoint;
+
+  private:
+    Image(const Option<std::vector<std::string> >& _entrypoint)
+      : entrypoint(_entrypoint) {}
+  };
+
+
   // Performs 'docker run IMAGE'.
-  process::Future<Nothing> run(
+  virtual process::Future<Nothing> run(
       const mesos::ContainerInfo& containerInfo,
       const mesos::CommandInfo& commandInfo,
       const std::string& name,
@@ -75,23 +91,28 @@ public:
       const Option<mesos::Resources>& resources = None(),
       const Option<std::map<std::string, std::string> >& env = None()) const;
 
-  // Performs 'docker kill CONTAINER'. If remove is true then a rm -f
-  // will be called when kill failed, otherwise a failure is returned.
-  process::Future<Nothing> kill(
+  // Performs 'docker stop -t TIMEOUT CONTAINER'. If remove is true then a rm -f
+  // will be called when stop failed, otherwise a failure is returned. The
+  // timeout parameter will be passed through to docker and is the amount of
+  // time for docker to wait after stopping a container before killing it.
+  // A value of zero (the default value) is the same as issuing a
+  // 'docker kill CONTAINER'.
+  process::Future<Nothing> stop(
       const std::string& container,
+      const Duration& timeout = Seconds(0),
       bool remove = false) const;
 
   // Performs 'docker rm (-f) CONTAINER'.
-  process::Future<Nothing> rm(
+  virtual process::Future<Nothing> rm(
       const std::string& container,
       bool force = false) const;
 
   // Performs 'docker inspect CONTAINER'.
-  process::Future<Container> inspect(
+  virtual process::Future<Container> inspect(
       const std::string& container) const;
 
   // Performs 'docker ps (-a)'.
-  process::Future<std::list<Container> > ps(
+  virtual process::Future<std::list<Container> > ps(
       bool all = false,
       const Option<std::string>& prefix = None()) const;
 
@@ -100,15 +121,21 @@ public:
   //
   // TODO(benh): Return the file descriptors, or some struct around
   // them so others can do what they want with stdout/stderr.
-  process::Future<Nothing> logs(
+  virtual process::Future<Nothing> logs(
       const std::string& container,
-      const std::string& directory);
+      const std::string& directory) const;
 
-private:
+  virtual process::Future<Image> pull(
+      const std::string& directory,
+      const std::string& image,
+      bool force = false) const;
+
+protected:
   // Uses the specified path to the Docker CLI tool.
   Docker(const std::string& _path) : path(_path) {};
 
-  static process::Future<Nothing> _kill(
+private:
+  static process::Future<Nothing> _stop(
       const Docker& docker,
       const std::string& container,
       const std::string& cmd,
@@ -126,12 +153,40 @@ private:
       const Docker& docker,
       const std::string& cmd,
       const process::Subprocess& s,
-      const Option<std::string>& prefix);
+      const Option<std::string>& prefix,
+      process::Future<std::string> output);
 
   static process::Future<std::list<Container> > __ps(
       const Docker& docker,
       const Option<std::string>& prefix,
       const std::string& output);
+
+  static process::Future<Image> _pull(
+      const Docker& docker,
+      const process::Subprocess& s,
+      const std::string& directory,
+      const std::string& image,
+      const std::string& path);
+
+  static process::Future<Image> __pull(
+      const Docker& docker,
+      const std::string& directory,
+      const std::string& image,
+      const std::string& path);
+
+  static process::Future<Image> ___pull(
+      const Docker& docker,
+      const process::Subprocess& s,
+      const std::string& cmd,
+      const std::string& directory,
+      const std::string& image);
+
+  static process::Future<Image> ____pull(
+      const std::string& output);
+
+  static void pullDiscarded(
+      const process::Subprocess& s,
+      const std::string& cmd);
 
   const std::string path;
 };

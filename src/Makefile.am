@@ -26,6 +26,8 @@ include ../3rdparty/libprocess/3rdparty/versions.am
 # TODO(charles): Move these into an included automakefile and have
 # them include $(top_builddir) as appropriate.
 DISTRIBUTE = 3rdparty/distribute-$(DISTRIBUTE_VERSION)
+PIP = 3rdparty/pip-$(PIP_VERSION)
+WHEEL = 3rdparty/wheel-$(WHEEL_VERSION)
 LEVELDB = 3rdparty/leveldb
 ZOOKEEPER = 3rdparty/zookeeper-$(ZOOKEEPER_VERSION)/src/c
 ZOOKEEPER_JAR = 3rdparty/zookeeper-$(ZOOKEEPER_VERSION)/zookeeper-$(ZOOKEEPER_VERSION).jar
@@ -39,11 +41,11 @@ PROTOBUF = $(LIBPROCESS)/3rdparty/protobuf-$(PROTOBUF_VERSION)
 PICOJSON = $(LIBPROCESS)/3rdparty/picojson-$(PICOJSON_VERSION)
 
 
-# Unfortunatley, 'pkglibexecdir' and 'pkglocalstatedir' are not set
+# Unfortunatley, 'pkglibexecdir' and 'pkgsysconfdir' are not set
 # before automake 1.11, so we need to set them manually (until we in
 # the future assume an automake version).
 pkglibexecdir = $(libexecdir)/$(PACKAGE)
-pkglocalstatedir = $(localstatedir)/$(PACKAGE)
+pkgsysconfdir = $(sysconfdir)/$(PACKAGE)
 
 if WITH_BUNDLED_PROTOBUF
   # Protocol buffer compiler.
@@ -64,7 +66,7 @@ dist_bin_SCRIPTS =
 dist_pkglibexec_SCRIPTS =
 nobase_dist_pkgdata_DATA =
 nodist_sbin_SCRIPTS =
-nobase_pkglocalstate_DATA =
+pkgsysconf_DATA =
 check_PROGRAMS =
 dist_check_SCRIPTS =
 check_SCRIPTS =
@@ -132,6 +134,9 @@ MESOS_PROTO = $(top_srcdir)/include/mesos/mesos.proto
 CONTAINERIZER_PROTO =							\
   $(top_srcdir)/include/mesos/containerizer/containerizer.proto
 
+FETCHER_PROTO =								\
+  $(top_srcdir)/include/mesos/fetcher/fetcher.proto
+
 SCHEDULER_PROTO =							\
   $(top_srcdir)/include/mesos/scheduler/scheduler.proto
 
@@ -140,6 +145,8 @@ CXX_PROTOS =								\
   ../include/mesos/mesos.pb.h						\
   containerizer/containerizer.pb.cc					\
   ../include/mesos/containerizer/containerizer.pb.h			\
+  fetcher/fetcher.pb.cc							\
+  ../include/mesos/fetcher/fetcher.pb.h					\
   scheduler/scheduler.pb.cc						\
   ../include/mesos/scheduler/scheduler.pb.h
 
@@ -188,6 +195,12 @@ containerizer/%.pb.cc ../include/mesos/containerizer/%.pb.h: $(CONTAINERIZER_PRO
 	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include $^
 	mv ../include/mesos/containerizer/*.pb.cc $(@D)
 
+fetcher/%.pb.cc ../include/mesos/fetcher/%.pb.h: $(FETCHER_PROTO)
+	$(MKDIR_P) $(@D)
+	$(MKDIR_P) ../include/mesos/fetcher
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include $^
+	mv ../include/mesos/fetcher/*.pb.cc $(@D)
+
 scheduler/%.pb.cc ../include/mesos/scheduler/%.pb.h: $(SCHEDULER_PROTO)
 	$(MKDIR_P) $(@D)
 	$(MKDIR_P) ../include/mesos/scheduler
@@ -207,6 +220,10 @@ java/generated/org/apache/mesos/containerizer/Protos.java:		\
 	$(MKDIR_P)  $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
 
+java/generated/org/apache/mesos/fetcher/Protos.java: $(FETCHER_PROTO)
+	$(MKDIR_P)  $(@D)
+	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
+
 java/generated/org/apache/mesos/scheduler/Protos.java: $(SCHEDULER_PROTO)
 	$(MKDIR_P)  $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
@@ -216,15 +233,24 @@ python/interface/src/mesos/interface/mesos_pb2.py: $(MESOS_PROTO)
 	$(PROTOC) -I$(top_srcdir)/include/mesos				\
 		$(PROTOCFLAGS) --python_out=python/interface/src/mesos/interface $^
 
-python/interface/src/mesos/interface/containerizer_pb2.py: $(CONTAINERIZER_PROTO)
+# All python protocol buffer code that imports from mesos.proto has
+# to get patched using sed, removing the leading 'mesos.' namespace
+# qualifier due to the flat hierachy in the resulting mesos.interface
+# egg. See MESOS-1750 for more.
+python/interface/src/mesos/interface/containerizer_pb2.py:		\
+		$(CONTAINERIZER_PROTO)
 	$(MKDIR_P) $(@D)
 	$(PROTOC) -I$(top_srcdir)/include/mesos/containerizer		\
-		$(PROTOCFLAGS) --python_out=python/interface/src/mesos/interface $^
+		$(PROTOCFLAGS)						\
+		--python_out=python/interface/src/mesos/interface $^
+	sed -e 's/mesos\.mesos_pb2/mesos_pb2/' <$@ >$@
 
 python/interface/src/mesos/interface/scheduler_pb2.py: $(SCHEDULER_PROTO)
 	$(MKDIR_P) $(@D)
 	$(PROTOC) -I$(top_srcdir)/include/mesos/scheduler		\
-		$(PROTOCFLAGS) --python_out=python/interface/src/mesos/interface $^
+		$(PROTOCFLAGS)						\
+		--python_out=python/interface/src/mesos/interface $^
+	sed -e 's/mesos\.mesos_pb2/mesos_pb2/' <$@ >$@
 
 # We even use a convenience library for most of Mesos so that we can
 # exclude third party libraries so setuptools/distribute can build a
@@ -237,7 +263,10 @@ nodist_libmesos_no_3rdparty_la_SOURCES =				\
   $(MESSAGES_PROTOS)							\
   $(REGISTRY_PROTOS)
 
+# TODO(tillt): Remove authentication/cram_md5/* which will enable us to
+# lose the immediate cyrus-sasl2 dependency.
 libmesos_no_3rdparty_la_SOURCES =					\
+	authentication/cram_md5/auxprop.cpp				\
 	authorizer/authorizer.cpp					\
 	common/attributes.cpp						\
 	common/date_utils.cpp						\
@@ -248,8 +277,8 @@ libmesos_no_3rdparty_la_SOURCES =					\
 	common/thread.cpp						\
 	common/type_utils.cpp						\
 	common/values.cpp						\
-	docker/docker.hpp					        \
-	docker/docker.cpp					        \
+	docker/docker.hpp						\
+	docker/docker.cpp						\
 	exec/exec.cpp							\
 	files/files.cpp							\
 	local/local.cpp							\
@@ -260,20 +289,22 @@ libmesos_no_3rdparty_la_SOURCES =					\
 	master/drf_sorter.cpp						\
 	master/http.cpp							\
 	master/master.cpp						\
+	master/metrics.cpp						\
 	master/registry.hpp						\
-	master/registry.proto                                           \
+	master/registry.proto						\
 	master/registrar.cpp						\
 	master/repairer.cpp						\
-	sasl/authenticatee.hpp						\
-	sasl/authenticator.hpp						\
-	sasl/auxprop.hpp						\
-	sasl/auxprop.cpp						\
+	module/manager.cpp						\
+	sched/constants.cpp						\
 	sched/sched.cpp							\
 	scheduler/scheduler.cpp						\
 	slave/constants.cpp						\
 	slave/gc.cpp							\
+	slave/graceful_shutdown.cpp					\
 	slave/http.cpp							\
+	slave/metrics.cpp						\
 	slave/monitor.cpp						\
+	slave/paths.cpp							\
 	slave/state.cpp							\
 	slave/slave.cpp							\
 	slave/containerizer/containerizer.cpp				\
@@ -282,12 +313,14 @@ libmesos_no_3rdparty_la_SOURCES =					\
 	slave/containerizer/docker.cpp					\
 	slave/containerizer/docker.hpp					\
 	slave/containerizer/external_containerizer.cpp			\
+	slave/containerizer/fetcher.cpp					\
 	slave/containerizer/isolator.cpp				\
 	slave/containerizer/launcher.cpp				\
 	slave/containerizer/mesos/containerizer.cpp			\
 	slave/containerizer/mesos/launch.cpp				\
 	slave/status_update_manager.cpp					\
 	usage/usage.cpp							\
+	watcher/whitelist_watcher.cpp					\
 	zookeeper/contender.cpp						\
 	zookeeper/detector.cpp						\
 	zookeeper/zookeeper.cpp						\
@@ -297,13 +330,15 @@ libmesos_no_3rdparty_la_SOURCES =					\
 
 pkginclude_HEADERS =							\
   $(top_srcdir)/include/mesos/executor.hpp				\
-  $(top_srcdir)/include/mesos/scheduler.hpp				\
+  $(top_srcdir)/include/mesos/mesos.hpp					\
+  $(top_srcdir)/include/mesos/module.hpp				\
   $(top_srcdir)/include/mesos/resources.hpp				\
+  $(top_srcdir)/include/mesos/scheduler.hpp				\
   $(top_srcdir)/include/mesos/values.hpp				\
   $(top_srcdir)/include/mesos/mesos.proto
 
 nodist_pkginclude_HEADERS =						\
-  ../include/mesos/mesos.hpp						\
+  ../include/mesos/version.hpp						\
   ../include/mesos/mesos.pb.h
 
 containerizerdir = $(pkgincludedir)/containerizer
@@ -313,6 +348,14 @@ containerizer_HEADERS =							\
   $(top_srcdir)/include/mesos/containerizer/containerizer.proto
 
 nodist_containerizer_HEADERS = ../include/mesos/containerizer/containerizer.pb.h
+
+fetcherdir = $(pkgincludedir)/fetcher
+
+fetcher_HEADERS =							\
+  $(top_srcdir)/include/mesos/fetcher/fetcher.hpp			\
+  $(top_srcdir)/include/mesos/fetcher/fetcher.proto
+
+nodist_fetcher_HEADERS = ../include/mesos/fetcher/fetcher.pb.h
 
 schedulerdir = $(pkgincludedir)/scheduler
 
@@ -329,6 +372,8 @@ if OS_LINUX
   libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/cpushare.cpp
   libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/mem.cpp
   libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/cgroups/perf_event.cpp
+  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/namespaces/pid.cpp
+  libmesos_no_3rdparty_la_SOURCES += slave/containerizer/isolators/filesystem/shared.cpp
   libmesos_no_3rdparty_la_SOURCES += slave/containerizer/linux_launcher.cpp
 else
   EXTRA_DIST += linux/cgroups.cpp
@@ -339,6 +384,7 @@ if WITH_NETWORK_ISOLATOR
   libmesos_no_3rdparty_la_SOURCES +=					\
 	linux/routing/route.cpp						\
 	linux/routing/utils.cpp						\
+	linux/routing/diagnosis/diagnosis.cpp				\
 	linux/routing/filter/arp.cpp					\
 	linux/routing/filter/icmp.cpp					\
 	linux/routing/filter/ip.cpp					\
@@ -350,9 +396,11 @@ if WITH_NETWORK_ISOLATOR
 	linux/routing/internal.hpp					\
 	linux/routing/route.hpp						\
 	linux/routing/utils.hpp						\
+	linux/routing/diagnosis/diagnosis.hpp				\
 	linux/routing/filter/action.hpp					\
 	linux/routing/filter/arp.hpp					\
 	linux/routing/filter/filter.hpp					\
+	linux/routing/filter/handle.hpp					\
 	linux/routing/filter/icmp.hpp					\
 	linux/routing/filter/internal.hpp				\
 	linux/routing/filter/ip.hpp					\
@@ -369,6 +417,11 @@ if WITH_NETWORK_ISOLATOR
 endif
 
 libmesos_no_3rdparty_la_SOURCES +=					\
+	authentication/authenticatee.hpp				\
+	authentication/authenticator.hpp				\
+	authentication/cram_md5/authenticatee.hpp			\
+	authentication/cram_md5/authenticator.hpp			\
+	authentication/cram_md5/auxprop.hpp				\
 	authorizer/authorizer.hpp					\
 	common/attributes.hpp						\
 	common/build.hpp						\
@@ -383,10 +436,12 @@ libmesos_no_3rdparty_la_SOURCES +=					\
 	common/thread.hpp						\
 	credentials/credentials.hpp					\
 	examples/utils.hpp						\
+	examples/test_module.hpp					\
 	files/files.hpp							\
 	hdfs/hdfs.hpp							\
 	linux/cgroups.hpp						\
 	linux/fs.hpp							\
+	linux/ns.hpp							\
 	linux/perf.hpp							\
 	local/flags.hpp							\
 	local/local.hpp							\
@@ -400,28 +455,43 @@ libmesos_no_3rdparty_la_SOURCES +=					\
 	master/flags.hpp						\
 	master/hierarchical_allocator_process.hpp			\
 	master/master.hpp						\
+	master/metrics.hpp						\
 	master/repairer.hpp						\
 	master/registrar.hpp						\
 	master/sorter.hpp						\
 	messages/messages.hpp						\
+	module/authenticatee.hpp					\
+	module/authenticator.hpp					\
+	module/isolator.hpp						\
+	module/manager.hpp						\
+	sched/constants.hpp						\
+	sched/flags.hpp							\
 	slave/constants.hpp						\
 	slave/flags.hpp							\
 	slave/gc.hpp							\
+	slave/graceful_shutdown.hpp					\
+	slave/metrics.hpp						\
 	slave/monitor.hpp						\
 	slave/paths.hpp							\
 	slave/slave.hpp							\
 	slave/state.hpp							\
 	slave/status_update_manager.hpp					\
 	slave/containerizer/containerizer.hpp				\
+	slave/containerizer/fetcher.hpp					\
 	slave/containerizer/external_containerizer.hpp			\
 	slave/containerizer/isolator.hpp				\
 	slave/containerizer/launcher.hpp				\
 	slave/containerizer/linux_launcher.hpp				\
+	slave/containerizer/mesos/containerizer.hpp			\
+	slave/containerizer/mesos/launch.hpp				\
 	slave/containerizer/isolators/posix.hpp				\
+	slave/containerizer/isolators/cgroups/constants.hpp		\
 	slave/containerizer/isolators/cgroups/cpushare.hpp		\
 	slave/containerizer/isolators/cgroups/mem.hpp			\
 	slave/containerizer/isolators/cgroups/perf_event.hpp		\
+	slave/containerizer/isolators/namespaces/pid.hpp		\
 	slave/containerizer/mesos/containerizer.hpp			\
+	slave/containerizer/isolators/filesystem/shared.hpp		\
 	slave/containerizer/mesos/launch.hpp				\
 	tests/cluster.hpp						\
 	tests/containerizer.hpp						\
@@ -429,11 +499,14 @@ libmesos_no_3rdparty_la_SOURCES +=					\
 	tests/flags.hpp							\
 	tests/isolator.hpp						\
 	tests/mesos.hpp							\
+	tests/module.hpp						\
 	tests/script.hpp						\
+	tests/setns_test_helper.hpp					\
 	tests/utils.hpp							\
 	tests/zookeeper.hpp						\
 	tests/zookeeper_test_server.hpp					\
 	usage/usage.hpp							\
+	watcher/whitelist_watcher.hpp					\
 	zookeeper/authentication.hpp					\
 	zookeeper/contender.hpp						\
 	zookeeper/detector.hpp						\
@@ -550,7 +623,8 @@ libmesos_no_3rdparty_la_LIBADD += libstate.la
 lib_LTLIBRARIES += libmesos.la
 
 # Include as part of the distribution.
-libmesos_la_SOURCES = $(MESOS_PROTO) $(CONTAINERIZER_PROTO) $(SCHEDULER_PROTO)
+libmesos_la_SOURCES = 							\
+  $(MESOS_PROTO) $(CONTAINERIZER_PROTO) $(FETCHER_PROTO) $(SCHEDULER_PROTO)
 
 libmesos_la_LDFLAGS = -release $(PACKAGE_VERSION)
 
@@ -559,7 +633,13 @@ libmesos_la_LDFLAGS = -release $(PACKAGE_VERSION)
 libmesos_la_LIBTOOLFLAGS = --tag=CXX
 
 # Add the convenience library.
-libmesos_la_LIBADD = libmesos_no_3rdparty.la
+libmesos_la_LIBADD = 							\
+  libmesos_no_3rdparty.la						\
+  -lsvn_subr-1								\
+  -lsvn_delta-1								\
+  -lapr-1
+
+libmesos_la_LIBADD += ../$(LIBPROCESS)/libprocess.la
 
 # For non-convenience libraries we need to link them in to make the shared
 # library each time. (Currently, we don't support platforms where this is not
@@ -592,7 +672,6 @@ else
   libmesos_la_LIBADD += -lprotobuf
 endif
 
-libmesos_la_LIBADD += ../$(LIBPROCESS)/libprocess.la
 
 # Binaries.
 sbin_PROGRAMS += mesos-master
@@ -684,7 +763,7 @@ dist_mesospythonpkglibexec_SCRIPTS =					\
 # package name (i.e., 'mesos') as part of the path (i.e.,
 # /path/to/mesos/webui versus something like /path/to/webui). Note
 # that 'datadir' (e.g., /usr/local/share) is for read-only "data" and
-# 'localstatedir' (e.g., /usr/local/var) is for modifiable "data".
+# 'sysconfdir' (e.g., /usr/local/var) is for modifiable "data".
 nobase_dist_pkgdata_DATA +=						\
   webui/master/static/js/controllers.js					\
   webui/master/static/js/app.js						\
@@ -749,9 +828,9 @@ nodist_sbin_SCRIPTS += deploy/mesos-daemon.sh				\
   deploy/mesos-start-slaves.sh deploy/mesos-stop-cluster.sh		\
   deploy/mesos-stop-masters.sh deploy/mesos-stop-slaves.sh
 
-nobase_pkglocalstate_DATA += deploy/mesos-deploy-env.sh.template	\
-                             deploy/mesos-master-env.sh.template	\
-                             deploy/mesos-slave-env.sh.template
+pkgsysconf_DATA += deploy/mesos-deploy-env.sh.template			\
+                   deploy/mesos-master-env.sh.template			\
+                   deploy/mesos-slave-env.sh.template
 
 # Need to explicitly add this because by default DATA files are not
 # included in distributions.
@@ -775,6 +854,7 @@ MESOS_JAR_SOURCE =							\
 	$(srcdir)/java/src/org/apache/mesos/state/AbstractState.java	\
 	$(srcdir)/java/src/org/apache/mesos/state/InMemoryState.java	\
 	$(srcdir)/java/src/org/apache/mesos/state/LevelDBState.java	\
+	$(srcdir)/java/src/org/apache/mesos/state/LogState.java		\
 	$(srcdir)/java/src/org/apache/mesos/state/State.java		\
 	$(srcdir)/java/src/org/apache/mesos/state/Variable.java		\
 	$(srcdir)/java/src/org/apache/mesos/state/ZooKeeperState.java
@@ -816,6 +896,7 @@ libjava_la_SOURCES =							\
 	java/jni/org_apache_mesos_MesosExecutorDriver.cpp		\
 	java/jni/org_apache_mesos_state_AbstractState.cpp		\
 	java/jni/org_apache_mesos_state_LevelDBState.cpp		\
+	java/jni/org_apache_mesos_state_LogState.cpp			\
 	java/jni/org_apache_mesos_state_Variable.cpp			\
 	java/jni/org_apache_mesos_state_ZooKeeperState.cpp		\
 	jvm/jvm.cpp							\
@@ -852,6 +933,7 @@ nodist_libjava_la_SOURCES =						\
 	java/jni/org_apache_mesos_Log.h					\
 	java/jni/org_apache_mesos_state_AbstractState.h			\
 	java/jni/org_apache_mesos_state_LevelDBState.h			\
+	java/jni/org_apache_mesos_state_LogState.h			\
 	java/jni/org_apache_mesos_state_Variable.h			\
 	java/jni/org_apache_mesos_state_ZooKeeperState.h
 
@@ -881,6 +963,11 @@ java/jni/org_apache_mesos_state_LevelDBState.h: $(MESOS_JAR)
 	$(JAVA_HOME)/bin/javah -d java/jni				\
 	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
 	  org.apache.mesos.state.LevelDBState
+
+java/jni/org_apache_mesos_state_LogState.h: $(MESOS_JAR)
+	$(JAVA_HOME)/bin/javah -d java/jni				\
+	-classpath $(MESOS_JAR):@PROTOBUF_JAR@				\
+	  org.apache.mesos.state.LogState
 
 java/jni/org_apache_mesos_state_Variable.h: $(MESOS_JAR)
 	$(JAVA_HOME)/bin/javah -d java/jni				\
@@ -919,30 +1006,26 @@ PHONY_TARGETS += clean-java
 
 # Python files listed outside HAS_PYTHON so they are included with the
 # distribution unconditionally.
-PYTHON_SOURCE =									\
-	python/src/mesos/__init__.py						\
-	python/interface/src/mesos/__init__.py					\
-	python/interface/src/mesos/interface/__init__.py			\
-	python/native/src/mesos/__init__.py					\
-	python/native/src/mesos/native/__init__.py				\
-	python/native/src/mesos/native/mesos_executor_driver_impl.cpp		\
-	python/native/src/mesos/native/mesos_executor_driver_impl.hpp		\
-	python/native/src/mesos/native/mesos_scheduler_driver_impl.cpp		\
-	python/native/src/mesos/native/mesos_scheduler_driver_impl.hpp		\
-	python/native/src/mesos/native/module.cpp				\
-	python/native/src/mesos/native/module.hpp				\
-	python/native/src/mesos/native/proxy_executor.cpp			\
-	python/native/src/mesos/native/proxy_executor.hpp			\
-	python/native/src/mesos/native/proxy_scheduler.cpp			\
+PYTHON_SOURCE =								\
+	python/src/mesos/__init__.py					\
+	python/interface/src/mesos/__init__.py				\
+	python/interface/src/mesos/interface/__init__.py		\
+	python/native/src/mesos/__init__.py				\
+	python/native/src/mesos/native/__init__.py			\
+	python/native/src/mesos/native/mesos_executor_driver_impl.cpp	\
+	python/native/src/mesos/native/mesos_executor_driver_impl.hpp	\
+	python/native/src/mesos/native/mesos_scheduler_driver_impl.cpp	\
+	python/native/src/mesos/native/mesos_scheduler_driver_impl.hpp	\
+	python/native/src/mesos/native/module.cpp			\
+	python/native/src/mesos/native/module.hpp			\
+	python/native/src/mesos/native/proxy_executor.cpp		\
+	python/native/src/mesos/native/proxy_executor.hpp		\
+	python/native/src/mesos/native/proxy_scheduler.cpp		\
 	python/native/src/mesos/native/proxy_scheduler.hpp
 
 EXTRA_DIST += $(PYTHON_SOURCE)
 
 if HAS_PYTHON
-# Used for building Python eggs.
-DISTRIBUTE_EGG_SUFFIX = $(DISTRIBUTE_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg
-DISTRIBUTE_EGG = \
-  $(abs_top_builddir)/$(DISTRIBUTE)/dist/distribute-$(DISTRIBUTE_EGG_SUFFIX)
 
 if WITH_BUNDLED_PROTOBUF
   # Build a protobuf Python egg.
@@ -953,7 +1036,7 @@ if WITH_BUNDLED_PROTOBUF
 	@echo "Building protobuf Python egg ..."
 	cd ../$(PROTOBUF)/python && \
           CC="$(CC)" CXX="$(CXX)" CFLAGS="$(CFLAGS)" CXXFLAGS="$(CXXFLAGS)" \
-	  PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) setup.py build bdist_egg
+          PYTHONPATH=$(abs_top_builddir)/$(DISTRIBUTE) $(PYTHON) setup.py build bdist_egg
 
   CLEANFILES += $(PROTOBUF_EGG)
 endif
@@ -976,26 +1059,78 @@ endif
 PHONY_TARGETS += $(PYTHON_SOURCE)
 
 $(PYTHON_SOURCE):
-	test "$(top_srcdir)" = "$(top_builddir)" ||				\
+	test "$(top_srcdir)" = "$(top_builddir)" ||			\
 		($(MKDIR_P) $(@D) && cp -pf $(srcdir)/$@ $@)
 
+# We currently require both eggs and wheels to be built. Eggs can be added to
+# the PYTHONPATH and imported. These end up being used for the tests. Wheels
+# can be easily uninstalled. They end up being what gets installed/uninstalled.
 MESOS_EGGS =										\
-	python/dist/mesos-$(PACKAGE_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg		\
-	python/interface/dist/mesos.interface-$(PACKAGE_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg	\
-	python/native/dist/mesos.native-$(PACKAGE_VERSION)$(PYTHON_EGG_POSTFIX).egg
+	python/dist/mesos.interface-$(PACKAGE_VERSION)$(PYTHON_EGG_PUREPY_POSTFIX).egg	\
+	python/dist/mesos.native-$(PACKAGE_VERSION)$(PYTHON_EGG_POSTFIX).egg
 
-$(MESOS_EGGS):									\
-		$(PYTHON_PROTOS)						\
-		$(PYTHON_SOURCE)						\
-		libmesos_no_3rdparty.la						\
+MESOS_WHLS =										\
+	python/dist/mesos.interface-$(PACKAGE_VERSION)$(PYTHON_WHL_PUREPY_POSTFIX).whl	\
+	python/dist/mesos.native-$(PACKAGE_VERSION)$(PYTHON_WHL_POSTFIX).whl
+
+# The python source is in directories of the form: python/interface. The make
+# target is of the form: python/dist/mesos.interface-0.20.0-py2.7.egg. To build
+# this, we must first cd into it. The first line of this takes the make target
+# and converts it into the correct directory path.
+$(MESOS_EGGS) $(MESOS_WHLS):								\
+		$(PYTHON_PROTOS)							\
+		$(PYTHON_SOURCE)							\
+		libmesos_no_3rdparty.la							\
 		$(PROTOBUF_EGG)
-	@cd `echo $@ | awk -F"dist" '{print $$1}'` &&				\
-	LIBS="$(LIBS)" CC="$(CC)" CXX="$(CXX)"					\
-	CFLAGS="$(PYTHON_CFLAGS)" CPPFLAGS="$(PYTHON_CPPFLAGS)"			\
-	LDFLAGS="$(PYTHON_LDFLAGS)"						\
-	PYTHONPATH=$(DISTRIBUTE_EGG) $(PYTHON) setup.py bdist_egg
+	@cd python/`echo $@ | awk -F"mesos[.]?" '{print $$2}' | cut -d- -f1` &&		\
+	LIBS="$(LIBS)" CC="$(CC)" CXX="$(CXX)"						\
+	CFLAGS="$(PYTHON_CFLAGS)" CPPFLAGS="$(PYTHON_CPPFLAGS)"				\
+	LDFLAGS="$(PYTHON_LDFLAGS)"							\
+	PYTHONPATH=$(abs_top_builddir)/$(DISTRIBUTE):$(abs_top_builddir)/$(WHEEL)	\
+	$(PYTHON) setup.py bdist_egg --dist-dir=../dist					\
+	bdist_wheel --dist-dir=../dist
 
-CLEANFILES += $(MESOS_EGGS) python/*/build python/*/dist $(PYTHON_SOURCE)
+CLEANFILES += $(MESOS_EGGS) $(MESOS_WHLS) python/*/build python/*/dist $(PYTHON_SOURCE)
+
+pippythonpath=$(DESTDIR)$(pythondir):$(abs_top_builddir)/$(DISTRIBUTE):$(abs_top_builddir)/$(PIP):$(abs_top_builddir)/$(WHEEL)
+
+# Some python installations create their own distutils.cfg (homebrew, redhat).
+# This includes `prefix=` which overrides anything set via. pip during install.
+# The file is required to ensure the python packages get installed to the right
+# location. It only affects files installed from the python/dist directory.
+python/dist/setup.cfg:
+	printf "[install]\nprefix=\n" > $@
+
+# See the comment next to AM_DISTCHECK_CONFIGURE_FLAGS in the top level
+# Makefile.am for an explanation of this variable.
+pipinstallargs=
+
+if WITHOUT_PYTHON_DEPS
+
+  pipinstallargs += --no-deps
+
+endif
+
+# We are using the 3rdparty bundled pip instead of relying on what might exist
+# on the system. Because the actual pip scripts have not been created, we just
+# use the standard entry point.
+install-exec-local:
+	cd python/dist &&							\
+	for whl in $(MESOS_WHLS); do						\
+		PYTHONPATH=$(pippythonpath)					\
+		PYTHONUSERBASE=$(DESTDIR)$(prefix)				\
+		$(PYTHON) -c "import pip; pip.main()" install			\
+		--user $(pipinstallargs)					\
+		--find-links=file://$(abs_top_builddir)/src/python/dist		\
+		$(abs_top_builddir)/src/$$whl;					\
+	done
+
+uninstall-local:
+	for whl in $(MESOS_WHLS); do						\
+		PYTHONPATH=$(DESTDIR)$(pythondir):$(pippythonpath)		\
+		$(PYTHON) -c "import pip; pip.main()" uninstall			\
+		--yes $$(echo $$whl | cut -d/ -f3 | cut -d- -f1);		\
+	done
 
 # Make sure the egg gets built via 'make all'.
 all-local: $(MESOS_EGGS)
@@ -1063,15 +1198,50 @@ load_generator_framework_SOURCES = examples/load_generator_framework.cpp
 load_generator_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
 load_generator_framework_LDADD = libmesos.la
 
+if OS_LINUX
+  check_PROGRAMS += setns-test-helper
+  setns_test_helper_SOURCES = tests/setns_test_helper.cpp
+  setns_test_helper_CPPFLAGS = $(MESOS_CPPFLAGS)
+  setns_test_helper_LDADD = libmesos.la
+endif
+
+check_PROGRAMS += active-user-test-helper
+active_user_test_helper_SOURCES = tests/active_user_test_helper.cpp
+active_user_test_helper_CPPFLAGS = $(MESOS_CPPFLAGS)
+active_user_test_helper_LDADD = libmesos.la
+
 check_PROGRAMS += mesos-tests
 
+# Library containing an example module.
+lib_LTLIBRARIES += libexamplemodule.la
+libexamplemodule_la_SOURCES = examples/example_module_impl.cpp
+libexamplemodule_la_CPPFLAGS = $(MESOS_CPPFLAGS)
+libexamplemodule_la_LDFLAGS = -release $(PACKAGE_VERSION) -shared
+
+# Library containing test CPU and memory isolator modules.
+lib_LTLIBRARIES += libtestisolator.la
+libtestisolator_la_SOURCES = examples/test_isolator_module.cpp
+libtestisolator_la_CPPFLAGS = $(MESOS_CPPFLAGS)
+libtestisolator_la_LDFLAGS = -release $(PACKAGE_VERSION) -shared
+
+# Library containing the test CRAM-MD5 authentication modules.
+# TODO(tillt): Add cyrus-sasl2 dependency while removing it from libmesos.
+# TODO(tillt): Enable optional building of this module library.
+# TODO(tillt): Make this module library installable. See MESOS-1940.
+lib_LTLIBRARIES += libtestauthentication.la
+libtestauthentication_la_SOURCES = examples/test_authentication_modules.cpp
+libtestauthentication_la_CPPFLAGS = $(MESOS_CPPFLAGS)
+libtestauthentication_la_LDFLAGS = -release $(PACKAGE_VERSION) -shared
+
 mesos_tests_SOURCES =				\
-  tests/allocator_tests.cpp			\
   tests/attributes_tests.cpp			\
   tests/authentication_tests.cpp		\
   tests/authorization_tests.cpp		        \
+  tests/common/http_tests.cpp			\
+  tests/composing_containerizer_tests.cpp       \
   tests/containerizer.cpp			\
   tests/containerizer_tests.cpp			\
+  tests/cram_md5_authentication_tests.cpp	\
   tests/credentials_tests.cpp			\
   tests/docker_containerizer_tests.cpp          \
   tests/docker_tests.cpp			\
@@ -1085,15 +1255,22 @@ mesos_tests_SOURCES =				\
   tests/files_tests.cpp				\
   tests/flags.cpp				\
   tests/gc_tests.cpp				\
+  tests/hierarchical_allocator_tests.cpp	\
   tests/isolator_tests.cpp			\
   tests/log_tests.cpp				\
   tests/logging_tests.cpp			\
   tests/main.cpp				\
+  tests/master_allocator_tests.cpp		\
   tests/master_authorization_tests.cpp		\
   tests/master_contender_detector_tests.cpp	\
+  tests/master_slave_reconciliation_tests.cpp	\
   tests/master_tests.cpp			\
   tests/mesos.cpp				\
+  tests/metrics_tests.cpp			\
+  tests/module.cpp				\
+  tests/module_tests.cpp			\
   tests/monitor_tests.cpp			\
+  tests/partition_tests.cpp			\
   tests/paths_tests.cpp				\
   tests/protobuf_io_tests.cpp			\
   tests/rate_limiting_tests.cpp			\
@@ -1102,7 +1279,6 @@ mesos_tests_SOURCES =				\
   tests/repair_tests.cpp			\
   tests/resource_offers_tests.cpp		\
   tests/resources_tests.cpp			\
-  tests/sasl_tests.cpp				\
   tests/scheduler_tests.cpp			\
   tests/script.cpp				\
   tests/shutdown_tests.cpp			\
@@ -1113,8 +1289,7 @@ mesos_tests_SOURCES =				\
   tests/status_update_manager_tests.cpp		\
   tests/utils.cpp				\
   tests/values_tests.cpp			\
-  tests/zookeeper_url_tests.cpp			\
-  tests/common/http_tests.cpp
+  tests/zookeeper_url_tests.cpp
 
 mesos_tests_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_tests_CPPFLAGS += -DSOURCE_DIR=\"$(abs_top_srcdir)\"
@@ -1122,7 +1297,7 @@ mesos_tests_CPPFLAGS += -DBUILD_DIR=\"$(abs_top_builddir)\"
 mesos_tests_CPPFLAGS += -I../$(GTEST)/include
 mesos_tests_CPPFLAGS += -I../$(GMOCK)/include
 
-mesos_tests_LDADD = ../$(LIBPROCESS)/3rdparty/libgmock.la libmesos.la
+mesos_tests_LDADD = ../$(LIBPROCESS)/3rdparty/libgmock.la libmesos.la -ldl
 
 mesos_tests_DEPENDENCIES = # Initialized to allow += below.
 
@@ -1130,6 +1305,7 @@ if OS_LINUX
   mesos_tests_SOURCES += tests/cgroups_isolator_tests.cpp
   mesos_tests_SOURCES += tests/cgroups_tests.cpp
   mesos_tests_SOURCES += tests/fs_tests.cpp
+  mesos_tests_SOURCES += tests/ns_tests.cpp
   mesos_tests_SOURCES += tests/perf_tests.cpp
 endif
 

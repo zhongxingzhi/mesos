@@ -33,11 +33,18 @@
 
 #include "logging/logging.hpp"
 
+#include "messages/messages.hpp"
+
+#include "module/manager.hpp"
+
+#include "slave/gc.hpp"
 #include "slave/slave.hpp"
+#include "slave/status_update_manager.hpp"
 
 using namespace mesos::internal;
 using namespace mesos::internal::slave;
 
+using mesos::modules::ModuleManager;
 using mesos::SlaveInfo;
 
 using std::cerr;
@@ -112,6 +119,15 @@ int main(int argc, char** argv)
     EXIT(1) << "Missing required option --master";
   }
 
+  // Initialize modules. Note that since other subsystems may depend
+  // upon modules, we should initialize modules before anything else.
+  if (flags.modules.isSome()) {
+    Try<Nothing> result = ModuleManager::load(flags.modules.get());
+    if (result.isError()) {
+      EXIT(1) << "Error loading modules: " << result.error();
+    }
+  }
+
   // Initialize libprocess.
   if (ip.isSome()) {
     os::setenv("LIBPROCESS_IP", ip.get());
@@ -135,13 +151,18 @@ int main(int argc, char** argv)
     LOG(INFO) << "Git SHA: " << build::GIT_SHA.get();
   }
 
-  Try<Containerizer*> containerizer = Containerizer::create(flags, false);
+  Fetcher fetcher;
+
+  Try<Containerizer*> containerizer =
+    Containerizer::create(flags, false, &fetcher);
+
   if (containerizer.isError()) {
     EXIT(1) << "Failed to create a containerizer: "
             << containerizer.error();
   }
 
   Try<MasterDetector*> detector = MasterDetector::create(master.get());
+
   if (detector.isError()) {
     EXIT(1) << "Failed to create a master detector: " << detector.error();
   }
@@ -149,7 +170,17 @@ int main(int argc, char** argv)
   LOG(INFO) << "Starting Mesos slave";
 
   Files files;
-  Slave* slave = new Slave(flags, detector.get(), containerizer.get(), &files);
+  GarbageCollector gc;
+  StatusUpdateManager statusUpdateManager(flags);
+
+  Slave* slave = new Slave(
+      flags,
+      detector.get(),
+      containerizer.get(),
+      &files,
+      &gc,
+      &statusUpdateManager);
+
   process::spawn(slave);
 
   process::wait(slave->self());

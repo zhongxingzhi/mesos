@@ -18,12 +18,13 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [0.21.0])
+AC_INIT([mesos], [0.22.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
 AC_CANONICAL_BUILD
 AC_CANONICAL_TARGET
+AC_DISABLE_STATIC
 
 AC_LANG([C++])
 
@@ -43,14 +44,6 @@ LT_PREREQ([2.2])
 LT_INIT
 LT_LANG([C++])
 LT_OUTPUT
-
-# The default CFLAGS/CXXFLAGS from autoconf when using gcc usually
-# includes "-O2". These really slow down compiling our tests, so we
-# turn them off and enable them (where desired) directly in the
-# Makefile. Note that this should not have an impact on users setting
-# CFLAGS/CXXFLAGS directly at configure time, or when running make.
-AS_IF([test "x${ac_cv_env_CFLAGS_set}" = "x"], [CFLAGS="-g"])
-AS_IF([test "x${ac_cv_env_CXXFLAGS_set}" = "x"], [CXXFLAGS="-g"])
 
 # Save the configure arguments so we can pass them to any third-party
 # libraries that we might run configure on (see 3rdparty/Makefile.am).
@@ -116,7 +109,7 @@ AC_CONFIG_FILES([src/deploy/mesos-stop-cluster.sh])
 AC_CONFIG_FILES([src/deploy/mesos-stop-masters.sh])
 AC_CONFIG_FILES([src/deploy/mesos-stop-slaves.sh])
 
-AC_CONFIG_FILES([include/mesos/mesos.hpp])
+AC_CONFIG_FILES([include/mesos/version.hpp])
 
 AC_CONFIG_FILES([src/java/generated/org/apache/mesos/MesosNativeLibrary.java])
 
@@ -133,10 +126,17 @@ AC_ARG_ENABLE([python],
                              [don't build Python bindings]),
               [], [enable_python=yes])
 
+AC_ARG_ENABLE([debug],
+              AS_HELP_STRING([--enable-debug],
+                             [enable debugging. If CFLAGS/CXXFLAGS are set, this
+                              option won't change them default: no]),
+              [enable_debug=yes], [])
+
 AC_ARG_ENABLE([optimize],
-              AS_HELP_STRING([--disable-optimize],
-                             [don't try to compile with optimizations]),
-              [], [enable_optimize=yes])
+              AS_HELP_STRING([--enable-optimize],
+                             [enable optimizations. If CFLAGS/CXXFLAGS are set,
+                              this option won't change them default: no]),
+              [enable_optimize=yes], [])
 
 AC_ARG_ENABLE([bundled],
               AS_HELP_STRING([--disable-bundled],
@@ -179,17 +179,61 @@ AC_ARG_WITH([gmock],
                             location prefixed by the given path]),
             [without_bundled_gmock=yes], [])
 
+AC_ARG_WITH([curl],
+            AS_HELP_STRING([--with-curl=@<:@=DIR@:>@],
+                           [specify where to locate the curl library]),
+            [], [])
+
+AC_ARG_WITH([sasl],
+            AS_HELP_STRING([--with-sasl=@<:@=DIR@:>@],
+                           [specify where to locate the sasl2 library]),
+            [], [])
+
+AC_ARG_WITH([zlib],
+            AS_HELP_STRING([--with-zlib=@<:@=DIR@:>@],
+                           [specify where to locate the zlib library]),
+            [], [])
+
+AC_ARG_WITH([apr],
+            AS_HELP_STRING([--with-apr=@<:@=DIR@:>@],
+                           [specify where to locate the apr-1 library]),
+            [], [])
+
+AC_ARG_WITH([svn],
+            AS_HELP_STRING([--with-svn=@<:@=DIR@:>@],
+                           [specify where to locate the svn-1 library]),
+            [], [])
+
 AC_ARG_ENABLE([bundled-distribute],
               AS_HELP_STRING([--disable-bundled-distribute],
                              [excludes building and using the bundled distribute
                               package in lieu of an installed version in
-                              in PYTHONPATH]),
+                              PYTHONPATH]),
               [without_bundled_distribute=yes], [])
 
-AC_ARG_WITH([cxx11],
-            AS_HELP_STRING([--without-cxx11],
-                           [builds Mesos without C++11 support (deprecated)]),
-            [], [with_cxx11=yes])
+AC_ARG_ENABLE([bundled-pip],
+              AS_HELP_STRING([--disable-bundled-pip],
+                             [excludes building and using the bundled pip
+                              package in lieu of an installed version in
+                              PYTHONPATH]),
+              [without_bundled_pip=yes], [])
+
+AC_ARG_ENABLE([bundled-wheel],
+              AS_HELP_STRING([--disable-bundled-wheel],
+                             [excludes building and using the bundled wheel
+                              package in lieu of an installed version in
+                              PYTHONPATH]),
+              [without_bundled_wheel=yes], [])
+
+# This is used to make distcheck and python install work together. For more
+# information, see the comment above AM_DISTCHECK_CONFIGURE_FLAGS in
+# Makefile.am.
+AC_ARG_ENABLE([python-dependency-install],
+              AS_HELP_STRING([--disable-python-dependency-install],
+                             [when the python packages are installed during
+                              make install, no external dependencies are
+                              downloaded or installed]),
+              [without_python_deps=yes], [])
 
 AC_ARG_WITH([network-isolator],
             AS_HELP_STRING([--with-network-isolator],
@@ -232,14 +276,29 @@ AM_CONDITIONAL([OS_LINUX], [test "x$OS_NAME" = "xlinux"])
 AC_PROG_CXX([g++])
 AC_PROG_CC([gcc])
 
+# Check if we should enable debugging, optimization. Note we only
+# update CFLAGS and CXXFLAGS if none are provided.
+AM_CONDITIONAL([DEBUG], [test x"$enable_debug" = "xyes"])
+AM_CONDITIONAL([OPTIMIZE], [test x"$enable_optimize" = "xyes"])
 
-# Check if we should try and enable optimizations.
-if test "x$enable_optimize" = "xyes"; then
-  # For now, we only turn on optimizations for gcc.
-  if test "x$GCC" = "xyes"; then
-    CXXFLAGS="$CXXFLAGS -g2 -O2"
-  fi
+
+debug_flags="-g1"
+if test "x$enable_debug" = "xyes"; then
+  debug_flags="-g"
+elif test "x$enable_optimize" = "xyes"; then
+  debug_flags=""
 fi
+
+if test "x$enable_optimize" = "xyes"; then
+  optimize_flags="-O2"
+else
+  optimize_flags="-O0"
+fi
+
+AS_IF([test "x${ac_cv_env_CFLAGS_set}" = "x"],
+      [CFLAGS="$debug_flags $optimize_flags"])
+AS_IF([test "x${ac_cv_env_CXXFLAGS_set}" = "x"],
+      [CXXFLAGS="$debug_flags $optimize_flags"])
 
 
 # Attempt to use preinstalled dependencies instead of the bundled
@@ -404,9 +463,12 @@ if test "x$without_bundled_protobuf" = "xyes" || \
   fi
 
   # Check for protobuf.
-  PKG_CHECK_MODULES([PROTOBUFPREFIX],
-                    [protobuf],
-                    [found_protobuf=yes])
+  # TODO(jieyu): Symbol _init is not available for libs on OS X.
+  # Consider checking lib using AX_CXX_CHECK_LIB.
+  AC_CHECK_HEADERS([google/protobuf/message.h],
+                   [AC_CHECK_LIB([protobuf],
+                                 [_init],
+                                 [found_protobuf=yes])])
 
   if test "x$found_protobuf" = "xyes"; then
     with_bundled_protobuf=no
@@ -471,14 +533,7 @@ AC_LANG_POP([C++])
 AC_MSG_RESULT([$CLANG])
 AC_SUBST([CLANG])
 
-# Force enable C++11 if compiling with clang.
-# Force disable C++11 if compiling with g++-4.7.
-if test "x$CLANG" = "xyes"; then
-  if test "x$with_cxx11" != "xyes"; then
-    AC_MSG_WARN([Force enabling C++11 for Clang build])
-  fi
-  with_cxx11=yes
-else
+if test "x$CLANG" = "xno"; then
   # Check the version of gcc and add any flags as appropriate. Note
   # that '-dumpversion' works for clang as well but as of clang 3.3 it
   # reports version 4.2.1 (for gcc backwards compatibility).
@@ -497,11 +552,11 @@ else
     CXXFLAGS="$CXXFLAGS -fno-strict-aliasing"
   fi
 
-  # Check for GCC version 4.8.
-  AX_COMPARE_VERSION([$GCC_VERSION], [eq2], [4.8],
-                     [is_gxx48=yes], [is_gxx48=no])
-  if test "x$is_gxx48" = "xyes"; then
-    AC_MSG_NOTICE([Setting up CXXFLAGS for g++-4.8])
+  # Check for GCC version >= 4.8.
+  AX_COMPARE_VERSION([$GCC_VERSION], [ge], [4.8],
+                     [is_ge_gxx48=yes], [is_ge_gxx48=no])
+  if test "x$is_ge_gxx48" = "xyes"; then
+    AC_MSG_NOTICE([Setting up CXXFLAGS for g++ version >= 4.8])
     # Boost 1.53.0 fails to compile with GCC 4.8 without
     # -Wno-unused-local-typedefs, and automake does not recognize the
     # flag.
@@ -510,40 +565,39 @@ else
     CXXFLAGS="${CXXFLAGS} -Wno-unused-local-typedefs"
   fi
 
-  # Check for GCC version == 4.7 and disable C++11. The C++11 version
-  # of libprocess' Future uses features that 4.7 doesn't support. The
-  # non-C++11 version of libprocess' Future uses std::tr1 code that is
-  # only available without-cxx11.
+  # Check for GCC version == 4.7 and fail. Starting with 4.7 the '#if
+  # __cplusplus >= 201103L' will evaluate to true which means the
+  # C++11 code paths will be compiled but certain C++11 features that
+  # we use are not supported by 4.7. Since we're requiring C++11 going
+  # forward we can't support this compiler.
   AX_COMPARE_VERSION([$GCC_VERSION], [eq2], [4.7],
                      [is_gxx47=yes], [is_gxx47=no])
   if test "x$is_gxx47" = "xyes"; then
-    AC_MSG_WARN([Force disabling C++11 for g++-4.7 build])
-    with_cxx11=no
+    AC_MSG_ERROR([Unable to build with g++-4.7 due to missing C++11 features])
   fi
 fi
 
 
-# Check if we should/can build with C++11.
-if test "x$with_cxx11" = "xyes"; then
-  AX_CXX_COMPILE_STDCXX_11([noext], [mandatory])
+# Ensure we can build the C++11 features we expect, and set the std
+# CXXFLAG as appropriate.
+AX_CXX_COMPILE_STDCXX_11([noext], [mandatory])
 
-  case "$host_os" in
+case "$host_os" in
   darwin* )
-    # If we're using clang, we need to pass -stdlib=libc++ too.
+   # If we're using clang, we need to pass -stdlib=libc++ too.
     if test "x$CLANG" = "xyes"; then
       CXXFLAGS="$CXXFLAGS -stdlib=libc++"
     fi
 
     # GTEST on OSX needs its own tr1 tuple.
-    # TODO(dhamon): Update to gmock 1.7 and pass GTEST_LANG_CXX11 when in
-    # c++11 mode.
+    # TODO(dhamon): Update to gmock 1.7 and pass GTEST_LANG_CXX11 when
+    # in C++11 mode.
     CXXFLAGS="$CXXFLAGS -DGTEST_USE_OWN_TR1_TUPLE=1"
     ;;
-  esac
+esac
 
-  # Also pass the flags to 3rdparty libraries.
-  CONFIGURE_ARGS="$CONFIGURE_ARGS CXXFLAGS='$CXXFLAGS'"
-fi
+# Also pass the flags to 3rdparty libraries.
+CONFIGURE_ARGS="$CONFIGURE_ARGS CXXFLAGS='$CXXFLAGS'"
 
 
 # Check for pthreads (uses m4/acx_pthread.m4).
@@ -554,6 +608,15 @@ ACX_PTHREAD([], [AC_MSG_ERROR([failed to find pthreads])])
 AC_CHECK_LIB(unwind, backtrace, LIBS="$LIBS -lunwind")
 
 
+# Check if zlib prefix path was provided, and if so, add it to
+# the CPPFLAGS and LDFLAGS with respective /include and /lib path
+# suffixes.
+if test -n "`echo $with_zlib`" ; then
+    CPPFLAGS="-I${with_zlib}/include $CPPFLAGS"
+    LDFLAGS="-L${with_zlib}/lib $LDFLAGS"
+fi
+
+
 AC_CHECK_LIB([z], [gzread], [],
              [AC_MSG_ERROR([cannot find libz
 -------------------------------------------------------------------
@@ -562,6 +625,14 @@ libz is required for mesos to build.
 ])])
 
 
+# Check if Libcurl prefix path was provided, and if so, add it to
+# the CPPFLAGS and LDFLAGS with respective /include and /lib path
+# suffixes.
+if test -n "`echo $with_curl`" ; then
+    CPPFLAGS="-I${with_curl}/include $CPPFLAGS"
+    LDFLAGS="-L${with_curl}/lib $LDFLAGS"
+fi
+
 AC_CHECK_LIB([curl], [curl_global_init], [],
              [AC_MSG_ERROR([cannot find libcurl
 -------------------------------------------------------------------
@@ -569,6 +640,81 @@ libcurl is required for mesos to build.
 -------------------------------------------------------------------
 ])])
 
+
+# Check if libapr-1 prefix path was provided, and if so, add it to
+# the CPPFLAGS and LDFLAGS with respective /include/apr-1 and /lib path
+# suffixes. We include /include/apr-1 because we include <apr*>
+# headers directly.
+if test -n "`echo $with_apr`" ; then
+    CPPFLAGS="-I${with_apr}/include/apr-1 -I${with_apr}/include/apr-1.0 $CPPFLAGS"
+    LDFLAGS="-L${with_apr}/lib $LDFLAGS"
+else
+    CPPFLAGS="-I/usr/include/apr-1 -I/usr/include/apr-1.0 $CPPFLAGS"
+fi
+
+AC_CHECK_HEADERS([apr_pools.h],
+                 [AC_CHECK_LIB([apr-1], [apr_initialize], [],
+                               [AC_MSG_ERROR([cannot find libapr-1
+-------------------------------------------------------------------
+libapr-1 is required for mesos to build.
+-------------------------------------------------------------------
+                        ])])], [AC_MSG_ERROR([cannot find libapr-1 headers
+-------------------------------------------------------------------
+libapr-1 is required for mesos to build.
+-------------------------------------------------------------------
+])])
+
+
+# Check if libsvn-1 prefix path was provided, and if so, add it to
+# the CPPFLAGS and LDFLAGS with respective /include and /lib path
+# suffixes. We include /include/subversion-1 because we include
+# <svn_*> directly.
+if test -z "`echo $with_svn`" &&
+   test "$OS_NAME" = "darwin" &&
+   test -n "`command -v brew`" &&
+   test -n "`brew list --versions subversion`"; then
+    with_svn=`brew --prefix subversion`
+fi
+
+if test -n "`echo $with_svn`"; then
+    CPPFLAGS="-I${with_svn}/include/subversion-1 $CPPFLAGS"
+    LDFLAGS="-L${with_svn}/lib $LDFLAGS"
+else
+    CPPFLAGS="-I/usr/include/subversion-1 $CPPFLAGS"
+fi
+
+AC_CHECK_HEADERS([svn_version.h],
+                 [AC_CHECK_LIB([svn_subr-1], [svn_stringbuf_create_ensure], [],
+                               [AC_MSG_ERROR([cannot find libsvn_subr-1
+-------------------------------------------------------------------
+libsubversion-1 is required for mesos to build.
+-------------------------------------------------------------------
+                        ])])], [AC_MSG_ERROR([cannot find libsvn_subr-1 headers
+-------------------------------------------------------------------
+libsubversion-1 is required for mesos to build.
+-------------------------------------------------------------------
+])])
+
+AC_CHECK_HEADERS([svn_delta.h],
+                 [AC_CHECK_LIB([svn_delta-1], [svn_txdelta], [],
+                               [AC_MSG_ERROR([cannot find libsvn_delta-1
+-------------------------------------------------------------------
+libsubversion-1 is required for mesos to build.
+-------------------------------------------------------------------
+                        ])])], [AC_MSG_ERROR([cannot find libsvn_delta-1 headers
+-------------------------------------------------------------------
+libsubversion-1 is required for mesos to build.
+-------------------------------------------------------------------
+])])
+
+
+# Check if Sasl2  prefix path was provided, and if so, add it to
+# the CPPFLAGS and LDFLAGS with respective /include and /lib path
+# suffixes.
+if test -n "`echo $with_sasl`" ; then
+    CPPFLAGS="-I${with_sasl}/include $CPPFLAGS"
+    LDFLAGS="-L${with_sasl}/lib $LDFLAGS"
+fi
 
 # TODO(benh): Also check for md5 support so we can use the CRAM-MD5
 # mechanism. We can likely do a AC_CHECK_LIB looking for a particular
@@ -579,7 +725,6 @@ AC_CHECK_LIB([sasl2], [sasl_done], [],
 We need libsasl2 for authentication!
 -------------------------------------------------------------------
 ])])
-
 
 # Perform necessary configuration for network isolator.
 if test "x$with_network_isolator" = "xyes"; then
@@ -630,6 +775,17 @@ http://www.infradead.org/~tgr/libnl/
                    [AC_MSG_ERROR([cannot find libnl-route-3 headers
 -------------------------------------------------------------------
 We need libnl-route-3 headers for building network isolator!
+
+Please install libnl3 (version 3.2.24 or higher):
+http://www.infradead.org/~tgr/libnl/
+-------------------------------------------------------------------
+  ])])
+
+  # Check for libnl-idiag-3 (both headers and libraries).
+  AC_CHECK_LIB([nl-idiag-3], [idiagnl_msg_alloc_cache], [],
+               [AC_MSG_ERROR([cannot find libnl-idiag-3
+-------------------------------------------------------------------
+We need libnl-idiag-3 for building network isolator!
 
 Please install libnl3 (version 3.2.24 or higher):
 http://www.infradead.org/~tgr/libnl/
@@ -1014,6 +1170,16 @@ There are two possible workarounds for this issue:
      from distutils.util import get_platform; \
      print "-py" + sys.version[[0:3]]'`
 
+  PYTHON_WHL_POSTFIX=`$PYTHON -c \
+    'import sys; \
+     from distutils.util import get_platform; \
+     print "-cp" + sys.version[[0:3]].replace(".", "") + "-none-" \
+       + get_platform().replace(".", "_").replace("-", "_")'`
+
+  PYTHON_WHL_PUREPY_POSTFIX=`$PYTHON -c \
+    'import sys; \
+     print "-py" + sys.version[[0]] + "-none-any"'`
+
   AC_CONFIG_FILES([src/examples/python/test-executor],
                   [chmod +x src/examples/python/test-executor])
   AC_CONFIG_FILES([src/examples/python/test-framework],
@@ -1040,6 +1206,8 @@ There are two possible workarounds for this issue:
   AC_SUBST([PYTHON_CFLAGS])
   AC_SUBST([PYTHON_EGG_POSTFIX])
   AC_SUBST([PYTHON_EGG_PUREPY_POSTFIX])
+  AC_SUBST([PYTHON_WHL_POSTFIX])
+  AC_SUBST([PYTHON_WHL_PUREPY_POSTFIX])
   AC_SUBST([PYTHON]) # Used by the example shell scripts and src/Makefile.am.
 
   AC_DEFINE([MESOS_HAS_PYTHON])
@@ -1085,6 +1253,54 @@ correct if you're already doing this.
     with_bundled_distribute=yes
   fi
 
+  # Check if user has asked us to use a preinstalled pip, or if
+  # they asked us to ignore all bundled libraries while compiling and linking.
+  if test "x$without_bundled_pip" = "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+
+    AC_PYTHON_MODULE([pip], [no])
+    if test "x$HAVE_PYMOD_pip" = "xno"; then
+      AC_MSG_ERROR([cannot find pip
+-------------------------------------------------------------------
+You have requested the use of a non-bundled pip but no suitable
+pip could be found.
+
+You may want specify the location of pip by providing a prefix
+path via --with-pip=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+    else
+      with_bundled_pip=no
+    fi
+  else
+    with_bundled_pip=yes
+  fi
+
+  # Check if user has asked us to use a preinstalled wheel, or if
+  # they asked us to ignore all bundled libraries while compiling and linking.
+  if test "x$without_bundled_wheel" = "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+
+    AC_PYTHON_MODULE([wheel], [no])
+    if test "x$HAVE_PYMOD_wheel" = "xno"; then
+      AC_MSG_ERROR([cannot find wheel
+-------------------------------------------------------------------
+You have requested the use of a non-bundled wheel but no suitable
+wheel could be found.
+
+You may want specify the location of wheel by providing a prefix
+path via --with-wheel=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+    else
+      with_bundled_wheel=no
+    fi
+  else
+    with_bundled_wheel=yes
+  fi
+
   has_python=yes
 fi
 
@@ -1092,6 +1308,13 @@ AM_CONDITIONAL([HAS_PYTHON], [test "x$has_python" = "xyes"])
 
 AM_CONDITIONAL([WITH_BUNDLED_DISTRIBUTE],
     [test "x$with_bundled_distribute" = "xyes"])
+AM_CONDITIONAL([WITH_BUNDLED_PIP],
+    [test "x$with_bundled_pip" = "xyes"])
+AM_CONDITIONAL([WITH_BUNDLED_WHEEL],
+    [test "x$with_bundled_wheel" = "xyes"])
+
+AM_CONDITIONAL([WITHOUT_PYTHON_DEPS],
+    [test "x$without_python_deps" = "xyes"])
 
 AM_CONDITIONAL([GIT_REPO], [test -d ${srcdir}"/.git"])
 

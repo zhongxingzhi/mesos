@@ -15,15 +15,16 @@
 #define __STOUT_RESULT_HPP__
 
 #include <assert.h>
-#include <stdlib.h> // For abort.
 
 #include <iostream>
 #include <string>
 
+#include <stout/abort.hpp>
 #include <stout/error.hpp>
 #include <stout/none.hpp>
 #include <stout/option.hpp>
 #include <stout/some.hpp>
+#include <stout/try.hpp>
 
 template <typename T>
 class Result
@@ -69,11 +70,14 @@ public:
     : state(ERROR), t(NULL), message(error.message) {}
 
   Result(const Result<T>& that)
-  {
-    state = that.state;
-    t = (that.t == NULL ? NULL : new T(*that.t));
-    message = that.message;
-  }
+    : state(that.state),
+      t(that.t == NULL ? NULL : new T(*that.t)),
+      message(that.message) {}
+
+  Result(const Try<T>& _try)
+    : state(_try.isSome() ? SOME : ERROR),
+      t(_try.isSome() ? new T(_try.get()) : NULL),
+      message(_try.isSome() ? "" : _try.error()) {}
 
   ~Result()
   {
@@ -98,15 +102,14 @@ public:
 
   const T& get() const
   {
-    // TODO(dhamon): Switch this to fatal() once that calls abort().
     if (state != SOME) {
+      std::string errorMessage = "Result::get() but state == ";
       if (state == ERROR) {
-        std::cerr << "Result::get() but state == ERROR: "
-                  << error() << std::endl;
+        errorMessage += "ERROR: " + message;
       } else if (state == NONE) {
-        std::cerr << "Result::get() but state == NONE" << std::endl;
+        errorMessage += "NONE";
       }
-      abort();
+      ABORT(errorMessage);
     }
     return *t;
   }

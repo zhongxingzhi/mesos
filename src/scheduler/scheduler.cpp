@@ -47,20 +47,20 @@
 #include <stout/error.hpp>
 #include <stout/flags.hpp>
 #include <stout/lambda.hpp>
+#include <stout/net.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/uuid.hpp>
 
-#include "sasl/authenticatee.hpp"
+#include "authentication/authenticatee.hpp"
+#include "authentication/cram_md5/authenticatee.hpp"
 
 #include "common/type_utils.hpp"
 
 #include "master/detector.hpp"
 
 #include "local/local.hpp"
-
-#include "master/detector.hpp"
 
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
@@ -126,6 +126,15 @@ public:
     // Initialize libprocess (done here since at some point we might
     // want to use flags to initialize libprocess).
     process::initialize();
+
+    if (stringify(net::IP(ntohl(self().node.ip))) == "127.0.0.1") {
+      LOG(WARNING) << "\n**************************************************\n"
+                   << "Scheduler driver bound to loopback interface!"
+                   << " Cannot communicate with remote master(s)."
+                   << " You might want to set 'LIBPROCESS_IP' environment"
+                   << " variable to use a routable IP address.\n"
+                   << "**************************************************";
+    }
 
     // Initialize logging.
     if (flags.initialize_driver_logging) {
@@ -457,7 +466,7 @@ protected:
     CHECK_SOME(credential);
 
     CHECK(authenticatee == NULL);
-    authenticatee = new sasl::Authenticatee(credential.get(), self());
+    authenticatee = new cram_md5::CRAMMD5Authenticatee();
 
     // NOTE: We do not pass 'Owned<Authenticatee>' here because doing
     // so could make 'AuthenticateeProcess' responsible for deleting
@@ -472,8 +481,9 @@ protected:
     //     'Authenticatee'.
     // --> '~Authenticatee()' is invoked by 'AuthenticateeProcess'.
     // TODO(vinod): Consider using 'Shared' to 'Owned' upgrade.
-    authenticating = authenticatee->authenticate(master.get())
-      .onAny(defer(self(), &Self::_authenticate));
+    authenticating =
+      authenticatee->authenticate(master.get(), self(), credential.get())
+        .onAny(defer(self(), &Self::_authenticate));
 
     delay(Seconds(5),
           self(),
@@ -800,7 +810,7 @@ private:
 
   Option<UPID> master;
 
-  sasl::Authenticatee* authenticatee;
+  Authenticatee* authenticatee;
 
   // Indicates if an authentication attempt is in progress.
   Option<Future<bool> > authenticating;

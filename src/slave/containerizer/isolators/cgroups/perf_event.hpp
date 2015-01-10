@@ -21,19 +21,13 @@
 
 #include <set>
 
-#include "linux/perf.hpp"
-
-#include <mesos/resources.hpp>
-
-#include <process/future.hpp>
 #include <process/time.hpp>
 
 #include <stout/hashmap.hpp>
-#include <stout/try.hpp>
+
+#include "linux/perf.hpp"
 
 #include "slave/containerizer/isolator.hpp"
-
-#include "slave/flags.hpp"
 
 namespace mesos {
 namespace internal {
@@ -51,7 +45,9 @@ public:
 
   virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo);
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user);
 
   virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,

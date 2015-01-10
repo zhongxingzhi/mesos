@@ -35,14 +35,10 @@
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
 
-#include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
-
 #include <stout/bytes.hpp>
 #include <stout/linkedhashmap.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
-#include <stout/multihashmap.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
@@ -54,6 +50,7 @@
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
+#include "slave/metrics.hpp"
 #include "slave/monitor.hpp"
 #include "slave/paths.hpp"
 #include "slave/state.hpp"
@@ -71,9 +68,7 @@ namespace internal {
 
 class MasterDetector; // Forward declaration.
 
-namespace sasl {
 class Authenticatee;
-} // namespace sasl {
 
 namespace slave {
 
@@ -90,24 +85,33 @@ public:
   Slave(const Flags& flags,
         MasterDetector* detector,
         Containerizer* containerizer,
-        Files* files);
+        Files* files,
+        GarbageCollector* gc,
+        StatusUpdateManager* statusUpdateManager);
 
   virtual ~Slave();
 
   void shutdown(const process::UPID& from, const std::string& message);
 
   void registered(const process::UPID& from, const SlaveID& slaveId);
-  void reregistered(const process::UPID& from, const SlaveID& slaveId);
-  void doReliableRegistration(const Duration& duration);
 
-  void runTask(
+  void reregistered(
+      const process::UPID& from,
+      const SlaveID& slaveId,
+      const std::vector<ReconcileTasksMessage>& reconciliations);
+
+  void doReliableRegistration(Duration maxBackoff);
+
+  // Made 'virtual' for Slave mocking.
+  virtual void runTask(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       const FrameworkID& frameworkId,
       const std::string& pid,
       const TaskInfo& task);
 
-  void _runTask(
+  // Made 'virtual' for Slave mocking.
+  virtual void _runTask(
       const process::Future<bool>& future,
       const FrameworkInfo& frameworkInfo,
       const FrameworkID& frameworkId,
@@ -116,7 +120,8 @@ public:
 
   process::Future<bool> unschedule(const std::string& path);
 
-  void killTask(
+  // Made 'virtual' for Slave mocking.
+  virtual void killTask(
       const process::UPID& from,
       const FrameworkID& frameworkId,
       const TaskID& taskId);
@@ -155,7 +160,13 @@ public:
       const ExecutorID& executorId,
       const std::string& data);
 
-  void ping(const process::UPID& from, const std::string& body);
+  // TODO(vinod): Remove this in 0.23.0.
+  void pingOld(const process::UPID& from, const std::string& body);
+
+  // NOTE: This handler is added to make it easy for upgrading slaves
+  // and masters to 0.22.0. A 0.22.0 master will send PingSlaveMessage
+  // which will call this method.
+  void ping(const process::UPID& from, bool connected);
 
   // Handles the status update.
   // NOTE: If 'pid' is a valid UPID an ACK is sent to this pid
@@ -181,6 +192,11 @@ public:
       const process::Future<Nothing>& future,
       const StatusUpdate& update,
       const process::UPID& pid);
+
+  // This is called by status update manager to forward a status
+  // update to the master. Note that the latest state of the task is
+  // added to the update before forwarding.
+  void forward(StatusUpdate update);
 
   void statusUpdateAcknowledgement(
       const process::UPID& from,
@@ -285,7 +301,7 @@ public:
   void checkDiskUsage();
 
   // Recovers the slave, status update manager and isolator.
-  process::Future<Nothing> recover(const Result<state::SlaveState>& state);
+  process::Future<Nothing> recover(const Result<state::State>& state);
 
   // This is called after 'recover()'. If 'flags.reconnect' is
   // 'reconnect', the slave attempts to reconnect to any old live
@@ -308,7 +324,8 @@ public:
   void removeExecutor(Framework* framework, Executor* executor);
 
   // Removes and garbage collects the framework.
-  void removeFramework(Framework* framework);
+  // Made 'virtual' for Slave mocking.
+  virtual void removeFramework(Framework* framework);
 
   // Schedules a 'path' for gc based on its modification time.
   Future<Nothing> garbageCollect(const std::string& path);
@@ -347,6 +364,7 @@ private:
 
   friend struct Framework;
   friend struct Executor;
+  friend struct Metrics;
 
   Slave(const Slave&);              // No copying.
   Slave& operator = (const Slave&); // No assigning.
@@ -375,14 +393,17 @@ private:
   double _executors_running();
   double _executors_terminating();
 
+  void sendExecutorTerminatedStatusUpdate(
+      const TaskID& taskId,
+      const Future<containerizer::Termination>& termination,
+      const FrameworkID& frameworkId,
+      const Executor* executor);
+
   const Flags flags;
 
   SlaveInfo info;
 
   Option<process::UPID> master;
-
-  Resources resources;
-  Attributes attributes;
 
   hashmap<FrameworkID, Framework*> frameworks;
 
@@ -404,42 +425,15 @@ private:
     uint64_t invalidFrameworkMessages;
   } stats;
 
-  struct Metrics
-  {
-    Metrics(const Slave& slave);
+  Metrics metrics;
 
-    ~Metrics();
-
-    process::metrics::Gauge uptime_secs;
-    process::metrics::Gauge registered;
-
-    process::metrics::Counter recovery_errors;
-
-    process::metrics::Gauge frameworks_active;
-
-    process::metrics::Gauge tasks_staging;
-    process::metrics::Gauge tasks_starting;
-    process::metrics::Gauge tasks_running;
-    process::metrics::Counter tasks_finished;
-    process::metrics::Counter tasks_failed;
-    process::metrics::Counter tasks_killed;
-    process::metrics::Counter tasks_lost;
-
-    process::metrics::Gauge executors_registering;
-    process::metrics::Gauge executors_running;
-    process::metrics::Gauge executors_terminating;
-    process::metrics::Counter executors_terminated;
-
-    process::metrics::Counter valid_status_updates;
-    process::metrics::Counter invalid_status_updates;
-
-    process::metrics::Counter valid_framework_messages;
-    process::metrics::Counter invalid_framework_messages;
-  } metrics;
+  double _resources_total(const std::string& name);
+  double _resources_used(const std::string& name);
+  double _resources_percent(const std::string& name);
 
   process::Time startTime;
 
-  GarbageCollector gc;
+  GarbageCollector* gc;
   ResourceMonitor monitor;
 
   StatusUpdateManager* statusUpdateManager;
@@ -463,7 +457,10 @@ private:
 
   Option<Credential> credential;
 
-  sasl::Authenticatee* authenticatee;
+  // Authenticatee name as supplied via flags.
+  std::string authenticateeName;
+
+  Authenticatee* authenticatee;
 
   // Indicates if an authentication attempt is in progress.
   Option<Future<bool> > authenticating;
@@ -492,12 +489,16 @@ struct Executor
   Task* addTask(const TaskInfo& task);
   void terminateTask(const TaskID& taskId, const mesos::TaskState& state);
   void completeTask(const TaskID& taskId);
+  void checkpointExecutor();
   void checkpointTask(const TaskInfo& task);
   void recoverTask(const state::TaskState& state);
   void updateTaskState(const TaskStatus& status);
 
   // Returns true if there are any queued/launched/terminated tasks.
   bool incompleteTasks();
+
+  // Returns true if this is a command executor.
+  bool isCommandExecutor() const;
 
   enum State {
     REGISTERING,  // Executor is launched but not (re-)registered yet.
@@ -522,15 +523,10 @@ struct Executor
 
   const bool checkpoint;
 
-  const bool commandExecutor;
-
   process::UPID pid;
 
-  // Currently consumed resources. It is an option type as the
-  // executor info will not be known up-front and the executor
-  // resources therefore cannot be known until after the containerizer
-  // has launched the container.
-  Option<Resources> resources;
+  // Currently consumed resources.
+  Resources resources;
 
   // Tasks can be found in one of the following four data structures:
 
@@ -552,6 +548,8 @@ struct Executor
 private:
   Executor(const Executor&);              // No copying.
   Executor& operator = (const Executor&); // No assigning.
+
+  bool commandExecutor;
 };
 
 
@@ -589,7 +587,8 @@ struct Framework
 
   UPID pid;
 
-  multihashmap<ExecutorID, TaskID> pending; // Executors with pending tasks.
+  // Executors with pending tasks.
+  hashmap<ExecutorID, hashmap<TaskID, TaskInfo> > pending;
 
   // Current running executors.
   hashmap<ExecutorID, Executor*> executors;

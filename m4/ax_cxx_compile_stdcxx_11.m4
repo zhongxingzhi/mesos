@@ -36,22 +36,95 @@
 #serial 3
 
 m4_define([_AX_CXX_COMPILE_STDCXX_11_testbody], [
-  template <typename T>
+  #include <initializer_list>
+  #include <memory>
+  #include <mutex>
+  #include <string>
+  #include <vector>
+
+  template <typename T, typename ...Args>
     struct check
     {
       static_assert(sizeof(int) <= sizeof(T), "not big enough");
     };
 
-    typedef check<check<bool>> right_angle_brackets;
+  typedef check<check<bool>> right_angle_brackets;
 
-    int a;
-    decltype(a) b;
+  int a;
+  decltype(a) b;
 
-    typedef check<int> check_type;
-    check_type c;
-    check_type&& cr = static_cast<check_type&&>(c);
+  typedef check<int> check_type;
+  check_type c;
+  check_type&& cr = static_cast<check_type&&>(c);
 
-    auto d = a;
+  auto d = a;
+
+  struct Foo
+  {
+    void bar() const {}
+  };
+
+  void f(const Foo& foo) { foo.bar(); }
+
+  void baz() {
+    std::unique_ptr<Foo> p1(new Foo);  // p1 owns Foo.
+    p1->bar();
+
+    {
+      std::unique_ptr<Foo> p2(std::move(p1));  // Now p2 owns Foo.
+      f(*p2);
+
+      p1 = std::move(p2);  // Ownership returns to p1.
+    }
+
+    p1->bar();
+  }
+
+  std::shared_ptr<int> k = std::make_shared<int>(2);
+
+  void mutexTest()
+  {
+    std::mutex _mutex;
+    {
+      // scope of lockGuard.
+      std::lock_guard<std::mutex> lockGuard(_mutex);
+      // end scope of lockGuard.
+    }
+
+    {
+      // scope of uniqueLock.
+      std::unique_lock<std::mutex> uniqueLock(_mutex);
+      // end scope of uniqueLock.
+    }
+  }
+
+  // check for std::enable_shared_from_this.
+  struct SharedStruct : public std::enable_shared_from_this<SharedStruct>
+  {
+    std::shared_ptr<SharedStruct> get()
+    {
+      return shared_from_this();
+    }
+  };
+
+  // construct a new shared_ptr using shared_from_this().
+  std::shared_ptr<SharedStruct> object =
+    std::shared_ptr<SharedStruct>(new SharedStruct())->get();
+
+  // initializer lists.
+  std::vector<std::string> g = {"hello", "world"};
+
+  struct InitializerList
+  {
+    InitializerList(std::initializer_list<int>) {}
+    void doSomething(std::initializer_list<int>) {}
+  };
+
+  void initializerListClassTest()
+  {
+    InitializerList il{1,2,3,4};
+    il.doSomething({5,6,7,8});
+  }
 ])
 
 AC_DEFUN([AX_CXX_COMPILE_STDCXX_11], [

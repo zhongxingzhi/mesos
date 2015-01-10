@@ -35,10 +35,6 @@
 #include <process/protobuf.hpp>
 #include <process/timer.hpp>
 
-#include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
-#include <process/metrics/metrics.hpp>
-
 #include <stout/cache.hpp>
 #include <stout/foreach.hpp>
 #include <stout/hashmap.hpp>
@@ -47,6 +43,7 @@
 #include <stout/multihashmap.hpp>
 #include <stout/option.hpp>
 
+#include "common/protobuf_utils.hpp"
 #include "common/type_utils.hpp"
 
 #include "files/files.hpp"
@@ -55,6 +52,7 @@
 #include "master/contender.hpp"
 #include "master/detector.hpp"
 #include "master/flags.hpp"
+#include "master/metrics.hpp"
 #include "master/registrar.hpp"
 
 #include "messages/messages.hpp"
@@ -71,11 +69,9 @@ namespace registry {
 class Slaves;
 }
 
-namespace sasl {
 class Authenticator;
-}
-
 class Authorizer;
+class WhitelistWatcher;
 
 namespace master {
 
@@ -86,13 +82,11 @@ class Allocator;
 
 class Repairer;
 class SlaveObserver;
-class WhitelistWatcher;
 
 struct Framework;
-struct OfferVisitor;
+struct OfferValidator;
 struct Role;
 struct Slave;
-struct TaskInfoVisitor;
 
 class Master : public ProtobufProcess<Master>
 {
@@ -156,14 +150,15 @@ public:
       const std::string& data);
   void registerSlave(
       const process::UPID& from,
-      const SlaveInfo& slaveInfo);
+      const SlaveInfo& slaveInfo,
+      const std::string& version);
   void reregisterSlave(
       const process::UPID& from,
-      const SlaveID& slaveId,
       const SlaveInfo& slaveInfo,
       const std::vector<ExecutorInfo>& executorInfos,
       const std::vector<Task>& tasks,
-      const std::vector<Archive::Framework>& completedFrameworks);
+      const std::vector<Archive::Framework>& completedFrameworks,
+      const std::string& version);
 
   void unregisterSlave(
       const process::UPID& from,
@@ -206,7 +201,7 @@ public:
 
   // Invoked when there is a newly elected leading master.
   // Made public for testing purposes.
-  void detected(const process::Future<Option<MasterInfo> >& pid);
+  void detected(const process::Future<Option<MasterInfo>>& pid);
 
   // Invoked when the contender has lost the candidacy.
   // Made public for testing purposes.
@@ -227,6 +222,7 @@ public:
       const std::vector<ExecutorInfo>& executorInfos,
       const std::vector<Task>& tasks,
       const std::vector<Archive::Framework>& completedFrameworks,
+      const std::string& version,
       const process::Future<bool>& readmit);
 
   MasterInfo info() const
@@ -267,6 +263,7 @@ protected:
   void _registerSlave(
       const SlaveInfo& slaveInfo,
       const process::UPID& pid,
+      const std::string& version,
       const process::Future<bool>& admit);
 
   void __reregisterSlave(
@@ -277,23 +274,25 @@ protected:
   // 'future' is the future returned by the authenticator.
   void _authenticate(
       const process::UPID& pid,
-      const process::Owned<process::Promise<Nothing> >& promise,
-      const process::Future<Option<std::string> >& future);
+      const process::Owned<process::Promise<Nothing>>& promise,
+      const process::Future<Option<std::string>>& future);
 
-  void authenticationTimeout(process::Future<Option<std::string> > future);
+  void authenticationTimeout(process::Future<Option<std::string>> future);
 
   void fileAttached(const process::Future<Nothing>& result,
                     const std::string& path);
 
-  // Return connected frameworks that are not in the process of being removed
-  std::vector<Framework*> getActiveFrameworks() const;
-
   // Invoked when the contender has entered the contest.
-  void contended(const process::Future<process::Future<Nothing> >& candidacy);
+  void contended(const process::Future<process::Future<Nothing>>& candidacy);
 
-  // Reconciles a re-registering slave's tasks / executors and sends
-  // TASK_LOST updates for tasks known to the master but unknown to
-  // the slave.
+  // Task reconciliation, split from the message handler
+  // to allow re-use.
+  void _reconcileTasks(
+      Framework* framework,
+      const std::vector<TaskStatus>& statuses);
+
+  // Handles a known re-registering slave by reconciling the master's
+  // view of the slave's tasks and executors.
   void reconcile(
       Slave* slave,
       const std::vector<ExecutorInfo>& executors,
@@ -303,14 +302,14 @@ protected:
   void _registerFramework(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
-      const process::Future<Option<Error> >& validationError);
+      const process::Future<Option<Error>>& validationError);
 
   // 'reregisterFramework()' continuation.
   void _reregisterFramework(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       bool failover,
-      const process::Future<Option<Error> >& validationError);
+      const process::Future<Option<Error>>& validationError);
 
   // Add a framework.
   void addFramework(Framework* framework);
@@ -327,17 +326,17 @@ protected:
   // executors and recover the resources.
   void removeFramework(Slave* slave, Framework* framework);
 
+  void disconnect(Framework* framework);
   void deactivate(Framework* framework);
+
   void disconnect(Slave* slave);
+  void deactivate(Slave* slave);
 
   // Add a slave.
-  void addSlave(Slave* slave, bool reregister = false);
-
-  void readdSlave(
+  void addSlave(
       Slave* slave,
-      const std::vector<ExecutorInfo>& executorInfos,
-      const std::vector<Task>& tasks,
-      const std::vector<Archive::Framework>& completedFrameworks);
+      const std::vector<Archive::Framework>& completedFrameworks =
+        std::vector<Archive::Framework>());
 
   // Remove the slave from the registrar and from the master's state.
   void removeSlave(Slave* slave);
@@ -346,18 +345,23 @@ protected:
       const std::vector<StatusUpdate>& updates,
       const process::Future<bool>& removed);
 
-  // Validates the task including authorization.
+  // Validates the task.
   // Returns None if the task is valid.
   // Returns Error if the task is invalid.
-  // Returns Failure if authorization returns 'Failure'.
-  process::Future<Option<Error> > validateTask(
+  Option<Error> validateTask(
       const TaskInfo& task,
       Framework* framework,
       Slave* slave,
-      const Resources& totalResources);
+      const Resources& totalResources,
+      const Resources& usedResources);
 
-  // Launch a task from a task description.
-  void launchTask(const TaskInfo& task, Framework* framework, Slave* slave);
+  // Authorizes the task.
+  // Returns true if task is authorized.
+  // Returns false if task is not authorized.
+  // Returns failure for transient authorization failures.
+  process::Future<bool> authorizeTask(
+      const TaskInfo& task,
+      Framework* framework);
 
   // 'launchTasks()' continuation.
   void _launchTasks(
@@ -366,16 +370,35 @@ protected:
       const std::vector<TaskInfo>& tasks,
       const Resources& totalResources,
       const Filters& filters,
-      const process::Future<std::list<process::Future<Option<Error> > > >& f);
+      const process::Future<std::list<process::Future<bool>>>& authorizations);
 
-  // Remove a task.
+  // Add the task and its executor (if not already running) to the
+  // framework and slave. Returns the resources consumed as a result,
+  // which includes resources for the task and its executor
+  // (if not already running).
+  Resources addTask(const TaskInfo& task, Framework* framework, Slave* slave);
+
+  // Transitions the task, and recovers resources if the task becomes
+  // terminal.
+  void updateTask(Task* task, const StatusUpdate& update);
+
+  // Removes the task.
   void removeTask(Task* task);
+
+  // Remove an executor and recover its resources.
+  void removeExecutor(
+      Slave* slave,
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId);
 
   // Forwards the update to the framework.
   void forward(
       const StatusUpdate& update,
       const process::UPID& acknowledgee,
       Framework* framework);
+
+  // Remove an offer after specified timeout
+  void offerTimeout(const OfferID& offerId);
 
   // Remove an offer and optionally rescind the offer as well.
   void removeOffer(Offer* offer, bool rescind = false);
@@ -453,7 +476,8 @@ private:
   Master(const Master&);              // No copying.
   Master& operator = (const Master&); // No assigning.
 
-  friend struct OfferVisitor;
+  friend struct OfferValidator;
+  friend struct Metrics;
 
   const Flags flags;
 
@@ -480,7 +504,7 @@ private:
 
   // Indicates when recovery is complete. Recovery begins once the
   // master is elected as a leader.
-  Option<process::Future<Nothing> > recovered;
+  Option<process::Future<Nothing>> recovered;
 
   struct Slaves
   {
@@ -539,7 +563,7 @@ private:
     Frameworks() : completed(MAX_COMPLETED_FRAMEWORKS) {}
 
     hashmap<FrameworkID, Framework*> registered;
-    boost::circular_buffer<memory::shared_ptr<Framework> > completed;
+    boost::circular_buffer<memory::shared_ptr<Framework>> completed;
 
     // Principals of frameworks keyed by PID.
     // NOTE: Multiple PIDs can map to the same principal. The
@@ -550,19 +574,23 @@ private:
     // 2) This map includes unauthenticated frameworks (when Master
     //    allows them) if they have principals specified in
     //    FrameworkInfo.
-    hashmap<process::UPID, Option<std::string> > principals;
+    hashmap<process::UPID, Option<std::string>> principals;
   } frameworks;
 
   hashmap<OfferID, Offer*> offers;
+  hashmap<OfferID, process::Timer> offerTimers;
 
   hashmap<std::string, Role*> roles;
+
+  // Authenticator names as supplied via flags.
+  std::vector<std::string> authenticatorNames;
 
   // Frameworks/slaves that are currently in the process of authentication.
   // 'authenticating' future for an authenticatee is ready when it is
   // authenticated.
-  hashmap<process::UPID, process::Future<Nothing> > authenticating;
+  hashmap<process::UPID, process::Future<Nothing>> authenticating;
 
-  hashmap<process::UPID, process::Owned<sasl::Authenticator> > authenticators;
+  hashmap<process::UPID, process::Owned<Authenticator>> authenticators;
 
   // Principals of authenticated frameworks/slaves keyed by PID.
   hashmap<process::UPID, std::string> authenticated;
@@ -582,127 +610,7 @@ private:
     uint64_t invalidFrameworkMessages;
   } stats;
 
-  struct Metrics
-  {
-    Metrics(const Master& master);
-
-    ~Metrics();
-
-    process::metrics::Gauge uptime_secs;
-    process::metrics::Gauge elected;
-
-    process::metrics::Gauge slaves_active;
-    process::metrics::Gauge slaves_inactive;
-
-    process::metrics::Gauge frameworks_active;
-    process::metrics::Gauge frameworks_inactive;
-
-    process::metrics::Gauge outstanding_offers;
-
-    // Task state metrics.
-    process::metrics::Gauge tasks_staging;
-    process::metrics::Gauge tasks_starting;
-    process::metrics::Gauge tasks_running;
-    process::metrics::Counter tasks_finished;
-    process::metrics::Counter tasks_failed;
-    process::metrics::Counter tasks_killed;
-    process::metrics::Counter tasks_lost;
-
-    // Message counters.
-    process::metrics::Counter dropped_messages;
-
-    // Metrics specific to frameworks of a common principal.
-    // These metrics have names prefixed by "frameworks/<principal>/".
-    struct Frameworks
-    {
-      // Counters for messages from all frameworks of this principal.
-      // Note: We only count messages from active scheduler
-      // *instances* while they are *registered*. i.e., messages
-      // prior to the completion of (re)registration
-      // (AuthenticateMessage and (Re)RegisterFrameworkMessage) and
-      // messages from an inactive scheduler instance (after the
-      // framework has failed over) are not counted.
-
-      // Framework messages received (before processing).
-      process::metrics::Counter messages_received;
-
-      // Framework messages processed.
-      // NOTE: This doesn't include dropped messages. Processing of
-      // a message may be throttled by a RateLimiter if one is
-      // configured for this principal. Also due to Master's
-      // asynchronous nature, this doesn't necessarily mean the work
-      // requested by this message has finished.
-      process::metrics::Counter messages_processed;
-
-      explicit Frameworks(const std::string& principal)
-        : messages_received("frameworks/" + principal + "/messages_received"),
-          messages_processed("frameworks/" + principal + "/messages_processed")
-      {
-        process::metrics::add(messages_received);
-        process::metrics::add(messages_processed);
-      }
-
-      ~Frameworks()
-      {
-        process::metrics::remove(messages_received);
-        process::metrics::remove(messages_processed);
-      }
-    };
-
-    // Per-framework-principal metrics keyed by the framework
-    // principal.
-    hashmap<std::string, process::Owned<Frameworks> > frameworks;
-
-    // Messages from schedulers.
-    process::metrics::Counter messages_register_framework;
-    process::metrics::Counter messages_reregister_framework;
-    process::metrics::Counter messages_unregister_framework;
-    process::metrics::Counter messages_deactivate_framework;
-    process::metrics::Counter messages_kill_task;
-    process::metrics::Counter messages_status_update_acknowledgement;
-    process::metrics::Counter messages_resource_request;
-    process::metrics::Counter messages_launch_tasks;
-    process::metrics::Counter messages_revive_offers;
-    process::metrics::Counter messages_reconcile_tasks;
-    process::metrics::Counter messages_framework_to_executor;
-
-    // Messages from slaves.
-    process::metrics::Counter messages_register_slave;
-    process::metrics::Counter messages_reregister_slave;
-    process::metrics::Counter messages_unregister_slave;
-    process::metrics::Counter messages_status_update;
-    process::metrics::Counter messages_exited_executor;
-
-    // Messages from both schedulers and slaves.
-    process::metrics::Counter messages_authenticate;
-
-    process::metrics::Counter valid_framework_to_executor_messages;
-    process::metrics::Counter invalid_framework_to_executor_messages;
-
-    process::metrics::Counter valid_status_updates;
-    process::metrics::Counter invalid_status_updates;
-
-    process::metrics::Counter valid_status_update_acknowledgements;
-    process::metrics::Counter invalid_status_update_acknowledgements;
-
-    // Recovery counters.
-    process::metrics::Counter recovery_slave_removals;
-
-    // Process metrics.
-    process::metrics::Gauge event_queue_messages;
-    process::metrics::Gauge event_queue_dispatches;
-    process::metrics::Gauge event_queue_http_requests;
-
-    // Successful registry operations.
-    process::metrics::Counter slave_registrations;
-    process::metrics::Counter slave_reregistrations;
-    process::metrics::Counter slave_removals;
-
-    // Resource metrics.
-    std::vector<process::metrics::Gauge> resources_total;
-    std::vector<process::metrics::Gauge> resources_used;
-    std::vector<process::metrics::Gauge> resources_percent;
-  } metrics;
+  Metrics metrics;
 
   // Gauge handlers.
   double _uptime_secs()
@@ -715,19 +623,15 @@ private:
     return elected() ? 1 : 0;
   }
 
+  double _slaves_connected();
+  double _slaves_disconnected();
   double _slaves_active();
-
   double _slaves_inactive();
 
-  double _frameworks_active()
-  {
-    return getActiveFrameworks().size();
-  }
-
-  double _frameworks_inactive()
-  {
-    return frameworks.registered.size() - _frameworks_active();
-  }
+  double _frameworks_connected();
+  double _frameworks_disconnected();
+  double _frameworks_active();
+  double _frameworks_inactive();
 
   double _outstanding_offers()
   {
@@ -765,7 +669,7 @@ private:
   // Returns None if the framework is valid.
   // Returns Error if the framework is invalid.
   // Returns Failure if authorization returns 'Failure'.
-  process::Future<Option<Error> > validate(
+  process::Future<Option<Error>> validate(
       const FrameworkInfo& frameworkInfo,
       const process::UPID& from);
 
@@ -788,26 +692,44 @@ private:
   // BoundedRateLimiters keyed by the framework principal.
   // Like Metrics::Frameworks, all frameworks of the same principal
   // are throttled together at a common rate limit.
-  hashmap<std::string, Option<process::Owned<BoundedRateLimiter> > > limiters;
+  hashmap<std::string, Option<process::Owned<BoundedRateLimiter>>> limiters;
 
   // The default limiter is for frameworks not specified in
   // 'flags.rate_limits'.
-  Option<process::Owned<BoundedRateLimiter> > defaultLimiter;
+  Option<process::Owned<BoundedRateLimiter>> defaultLimiter;
 };
 
 
 struct Slave
 {
   Slave(const SlaveInfo& _info,
-        const SlaveID& _id,
         const process::UPID& _pid,
-        const process::Time& time)
-    : id(_id),
+        const Option<std::string> _version,
+        const process::Time& _registeredTime,
+        const std::vector<ExecutorInfo> executorInfos =
+          std::vector<ExecutorInfo>(),
+        const std::vector<Task> tasks =
+          std::vector<Task>())
+    : id(_info.id()),
       info(_info),
       pid(_pid),
-      registeredTime(time),
-      disconnected(false),
-      observer(NULL) {}
+      version(_version),
+      registeredTime(_registeredTime),
+      connected(true),
+      active(true),
+      observer(NULL)
+  {
+    CHECK(_info.has_id());
+
+    foreach (const ExecutorInfo& executorInfo, executorInfos) {
+      CHECK(executorInfo.has_framework_id());
+      addExecutor(executorInfo.framework_id(), executorInfo);
+    }
+
+    foreach (const Task& task, tasks) {
+      addTask(new Task(task));
+    }
+  }
 
   ~Slave() {}
 
@@ -821,53 +743,79 @@ struct Slave
 
   void addTask(Task* task)
   {
-    CHECK(!tasks[task->framework_id()].contains(task->task_id()))
-      << "Duplicate task " << task->task_id()
-      << " of framework " << task->framework_id();
+    const TaskID& taskId = task->task_id();
+    const FrameworkID& frameworkId = task->framework_id();
 
-    tasks[task->framework_id()][task->task_id()] = task;
-    LOG(INFO) << "Adding task " << task->task_id()
+    CHECK(!tasks[frameworkId].contains(taskId))
+      << "Duplicate task " << taskId << " of framework " << frameworkId;
+
+    tasks[frameworkId][taskId] = task;
+
+    if (!protobuf::isTerminalState(task->state())) {
+      usedResources[frameworkId] += task->resources();
+    }
+
+    LOG(INFO) << "Adding task " << taskId
               << " with resources " << task->resources()
               << " on slave " << id << " (" << info.hostname() << ")";
-    resourcesInUse += task->resources();
+  }
+
+  // Notification of task termination, for resource accounting.
+  // TODO(bmahler): This is a hack for performance. We need to
+  // maintain resource counters because computing task resources
+  // functionally for all tasks is expensive, for now.
+  void taskTerminated(Task* task)
+  {
+    const TaskID& taskId = task->task_id();
+    const FrameworkID& frameworkId = task->framework_id();
+
+    CHECK(protobuf::isTerminalState(task->state()));
+    CHECK(tasks[frameworkId].contains(taskId))
+      << "Unknown task " << taskId << " of framework " << frameworkId;
+
+    usedResources[frameworkId] -= task->resources();
+    if (!tasks.contains(frameworkId) && !executors.contains(frameworkId)) {
+      usedResources.erase(frameworkId);
+    }
   }
 
   void removeTask(Task* task)
   {
-    CHECK(tasks[task->framework_id()].contains(task->task_id()))
-      << "Unknown task " << task->task_id()
-      << " of framework " << task->framework_id();
+    const TaskID& taskId = task->task_id();
+    const FrameworkID& frameworkId = task->framework_id();
 
-    tasks[task->framework_id()].erase(task->task_id());
-    if (tasks[task->framework_id()].empty()) {
-      tasks.erase(task->framework_id());
+    CHECK(tasks[frameworkId].contains(taskId))
+      << "Unknown task " << taskId << " of framework " << frameworkId;
+
+    if (!protobuf::isTerminalState(task->state())) {
+      usedResources[frameworkId] -= task->resources();
+      if (!tasks.contains(frameworkId) && !executors.contains(frameworkId)) {
+        usedResources.erase(frameworkId);
+      }
     }
 
-    killedTasks.remove(task->framework_id(), task->task_id());
-    LOG(INFO) << "Removing task " << task->task_id()
-              << " with resources " << task->resources()
-              << " on slave " << id << " (" << info.hostname() << ")";
-    resourcesInUse -= task->resources();
+    tasks[frameworkId].erase(taskId);
+    if (tasks[frameworkId].empty()) {
+      tasks.erase(frameworkId);
+    }
+
+    killedTasks.remove(frameworkId, taskId);
   }
 
   void addOffer(Offer* offer)
   {
     CHECK(!offers.contains(offer)) << "Duplicate offer " << offer->id();
+
     offers.insert(offer);
-    VLOG(1) << "Adding offer " << offer->id()
-            << " with resources " << offer->resources()
-            << " on slave " << id << " (" << info.hostname() << ")";
-    resourcesOffered += offer->resources();
+    offeredResources += offer->resources();
   }
 
   void removeOffer(Offer* offer)
   {
     CHECK(offers.contains(offer)) << "Unknown offer " << offer->id();
+
+    offeredResources -= offer->resources();
     offers.erase(offer);
-    VLOG(1) << "Removing offer " << offer->id()
-            << " with resources " << offer->resources()
-            << " on slave " << id << " (" << info.hostname() << ")";
-    resourcesOffered -= offer->resources();
   }
 
   bool hasExecutor(const FrameworkID& frameworkId,
@@ -885,22 +833,23 @@ struct Slave
       << " of framework " << frameworkId;
 
     executors[frameworkId][executorInfo.executor_id()] = executorInfo;
-
-    // Update the resources in use to reflect running this executor.
-    resourcesInUse += executorInfo.resources();
+    usedResources[frameworkId] += executorInfo.resources();
   }
 
   void removeExecutor(const FrameworkID& frameworkId,
                       const ExecutorID& executorId)
   {
-    if (hasExecutor(frameworkId, executorId)) {
-      // Update the resources in use to reflect removing this executor.
-      resourcesInUse -= executors[frameworkId][executorId].resources();
+    CHECK(hasExecutor(frameworkId, executorId))
+      << "Unknown executor " << executorId << " of framework " << frameworkId;
 
-      executors[frameworkId].erase(executorId);
-      if (executors[frameworkId].size() == 0) {
-        executors.erase(frameworkId);
-      }
+    usedResources[frameworkId] -=
+      executors[frameworkId][executorId].resources();
+
+    // XXX Remove.
+
+    executors[frameworkId].erase(executorId);
+    if (executors[frameworkId].empty()) {
+      executors.erase(frameworkId);
     }
   }
 
@@ -909,24 +858,30 @@ struct Slave
 
   process::UPID pid;
 
+  // The Mesos version of the slave. If set, the slave is >= 0.21.0.
+  // TODO(bmahler): Use stout's Version when it can parse labels, etc.
+  // TODO(bmahler): Make this required once it is always set.
+  const Option<std::string> version;
+
   process::Time registeredTime;
   Option<process::Time> reregisteredTime;
 
-  // We mark a slave 'disconnected' when it has checkpointing
-  // enabled because we expect it reregister after recovery.
-  bool disconnected;
+  // Slave becomes disconnected when the socket closes.
+  bool connected;
 
-  Resources resourcesOffered; // Resources offered.
-  Resources resourcesInUse;   // Resources used by tasks and executors.
+  // Slave becomes deactivated when it gets disconnected. In the
+  // future this might also happen via HTTP endpoint.
+  // No offers will be made for a deactivated slave.
+  bool active;
 
   // Executors running on this slave.
-  hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo> > executors;
+  hashmap<FrameworkID, hashmap<ExecutorID, ExecutorInfo>> executors;
 
   // Tasks present on this slave.
   // TODO(bmahler): The task pointer ownership complexity arises from the fact
   // that we own the pointer here, but it's shared with the Framework struct.
   // We should find a way to eliminate this.
-  hashmap<FrameworkID, hashmap<TaskID, Task*> > tasks;
+  hashmap<FrameworkID, hashmap<TaskID, Task*>> tasks;
 
   // Tasks that were asked to kill by frameworks.
   // This is used for reconciliation when the slave re-registers.
@@ -934,6 +889,9 @@ struct Slave
 
   // Active offers on this slave.
   hashset<Offer*> offers;
+
+  hashmap<FrameworkID, Resources> usedResources;  // Active task / executors.
+  Resources offeredResources; // Offers.
 
   SlaveObserver* observer;
 
@@ -951,6 +909,8 @@ inline std::ostream& operator << (std::ostream& stream, const Slave& slave)
 
 
 // Information about a connected or completed framework.
+// TODO(bmahler): Keeping the task and executor information in sync
+// across the Slave and Framework structs is error prone!
 struct Framework
 {
   Framework(const FrameworkInfo& _info,
@@ -960,6 +920,7 @@ struct Framework
     : id(_id),
       info(_info),
       pid(_pid),
+      connected(true),
       active(true),
       registeredTime(time),
       reregisteredTime(time),
@@ -983,7 +944,24 @@ struct Framework
       << " of framework " << task->framework_id();
 
     tasks[task->task_id()] = task;
-    resources += task->resources();
+
+    if (!protobuf::isTerminalState(task->state())) {
+      usedResources += task->resources();
+    }
+  }
+
+  // Notification of task termination, for resource accounting.
+  // TODO(bmahler): This is a hack for performance. We need to
+  // maintain resource counters because computing task resources
+  // functionally for all tasks is expensive, for now.
+  void taskTerminated(Task* task)
+  {
+    CHECK(protobuf::isTerminalState(task->state()));
+    CHECK(tasks.contains(task->task_id()))
+      << "Unknown task " << task->task_id()
+      << " of framework " << task->framework_id();
+
+    usedResources -= task->resources();
   }
 
   void addCompletedTask(const Task& task)
@@ -998,17 +976,20 @@ struct Framework
       << "Unknown task " << task->task_id()
       << " of framework " << task->framework_id();
 
+    if (!protobuf::isTerminalState(task->state())) {
+      usedResources -= task->resources();
+    }
+
     addCompletedTask(*task);
 
     tasks.erase(task->task_id());
-    resources -= task->resources();
   }
 
   void addOffer(Offer* offer)
   {
     CHECK(!offers.contains(offer)) << "Duplicate offer " << offer->id();
     offers.insert(offer);
-    resources += offer->resources();
+    offeredResources += offer->resources();
   }
 
   void removeOffer(Offer* offer)
@@ -1016,8 +997,8 @@ struct Framework
     CHECK(offers.find(offer) != offers.end())
       << "Unknown offer " << offer->id();
 
+    offeredResources -= offer->resources();
     offers.erase(offer);
-    resources -= offer->resources();
   }
 
   bool hasExecutor(const SlaveID& slaveId,
@@ -1035,22 +1016,21 @@ struct Framework
       << " on slave " << slaveId;
 
     executors[slaveId][executorInfo.executor_id()] = executorInfo;
-
-    // Update our resources to reflect running this executor.
-    resources += executorInfo.resources();
+    usedResources += executorInfo.resources();
   }
 
   void removeExecutor(const SlaveID& slaveId,
                       const ExecutorID& executorId)
   {
-    if (hasExecutor(slaveId, executorId)) {
-      // Update our resources to reflect removing this executor.
-      resources -= executors[slaveId][executorId].resources();
+    CHECK(hasExecutor(slaveId, executorId))
+      << "Unknown executor " << executorId
+      << " of framework " << id
+      << " of slave " << slaveId;
 
-      executors[slaveId].erase(executorId);
-      if (executors[slaveId].size() == 0) {
-        executors.erase(slaveId);
-      }
+    usedResources -= executors[slaveId][executorId].resources();
+    executors[slaveId].erase(executorId);
+    if (executors[slaveId].empty()) {
+      executors.erase(slaveId);
     }
   }
 
@@ -1060,13 +1040,20 @@ struct Framework
 
   process::UPID pid;
 
-  bool active; // Turns false when framework is being removed.
+  // Framework becomes disconnected when the socket closes.
+  bool connected;
+
+  // Framework becomes deactivated when it is disconnected or
+  // the master receives a DeactivateFrameworkMessage.
+  // No offers will be made to a deactivated framework.
+  bool active;
+
   process::Time registeredTime;
   process::Time reregisteredTime;
   process::Time unregisteredTime;
 
-  // Tasks that have not yet been launched because they are being
-  // validated (e.g., authorized).
+  // Tasks that have not yet been launched because they are currently
+  // being authorized.
   hashmap<TaskID, TaskInfo> pendingTasks;
 
   hashmap<TaskID, Task*> tasks;
@@ -1074,18 +1061,32 @@ struct Framework
   // NOTE: We use a shared pointer for Task because clang doesn't like
   // Boost's implementation of circular_buffer with Task (Boost
   // attempts to do some memset's which are unsafe).
-  boost::circular_buffer<memory::shared_ptr<Task> > completedTasks;
+  boost::circular_buffer<memory::shared_ptr<Task>> completedTasks;
 
   hashset<Offer*> offers; // Active offers for framework.
 
-  Resources resources; // Total resources (tasks + offers + executors).
+  hashmap<SlaveID, hashmap<ExecutorID, ExecutorInfo>> executors;
 
-  hashmap<SlaveID, hashmap<ExecutorID, ExecutorInfo> > executors;
+  // TODO(bmahler): Summing set and ranges resources across slaves
+  // does not yield meaningful totals.
+  Resources usedResources;    // Active task / executor resources.
+  Resources offeredResources; // Offered resources.
 
 private:
   Framework(const Framework&);              // No copying.
   Framework& operator = (const Framework&); // No assigning.
 };
+
+
+inline std::ostream& operator << (
+    std::ostream& stream,
+    const Framework& framework)
+{
+  // TODO(vinod): Also log the hostname once FrameworkInfo is properly
+  // updated on framework failover (MESOS-1784).
+  return stream << framework.id << " (" << framework.info.name()
+                << ") at " << framework.pid;
+}
 
 
 // Information about an active role.
@@ -1108,7 +1109,8 @@ struct Role
   {
     Resources resources;
     foreachvalue (Framework* framework, frameworks) {
-      resources += framework->resources;
+      resources += framework->usedResources;
+      resources += framework->offeredResources;
     }
 
     return resources;

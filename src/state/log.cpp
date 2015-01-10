@@ -12,11 +12,17 @@
 #include <process/mutex.hpp>
 #include <process/process.hpp>
 
+#include <process/metrics/metrics.hpp>
+#include <process/metrics/timer.hpp>
+
+#include <stout/bytes.hpp>
+#include <stout/duration.hpp>
 #include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
+#include <stout/svn.hpp>
 #include <stout/uuid.hpp>
 
 #include "log/log.hpp"
@@ -54,7 +60,7 @@ namespace state {
 class LogStorageProcess : public Process<LogStorageProcess>
 {
 public:
-  LogStorageProcess(Log* log);
+  LogStorageProcess(Log* log, size_t diffsBetweenSnapshots);
 
   virtual ~LogStorageProcess();
 
@@ -91,7 +97,8 @@ private:
   Future<bool> __set(const state::Entry& entry, const UUID& uuid);
   Future<bool> ___set(
       const state::Entry& entry,
-      const Option<Log::Position>& position);
+      size_t diff,
+      Option<Log::Position> position);
 
   Future<bool> _expunge(const state::Entry& entry);
   Future<bool> __expunge(const state::Entry& entry);
@@ -103,6 +110,8 @@ private:
 
   Log::Reader reader;
   Log::Writer writer;
+
+  const size_t diffsBetweenSnapshots;
 
   // Used to serialize Log::Writer::append/truncate operations.
   Mutex mutex;
@@ -122,27 +131,77 @@ private:
   // actual appending of the data.
   struct Snapshot
   {
-    Snapshot(const Log::Position& position, const state::Entry& entry)
-      : position(position), entry(entry) {}
+    Snapshot(const Log::Position& position,
+             const state::Entry& entry,
+             size_t diffs = 0)
+      : position(position),
+        entry(entry),
+        diffs(diffs) {}
 
+    // Returns a snapshot after having applied the specified diff.
+    Try<Snapshot> patch(const Operation::Diff& diff) const
+    {
+      if (diff.entry().name() != entry.name()) {
+        return Error("Attempted to patch the wrong snapshot");
+      }
+
+      Try<string> patch = svn::patch(
+          entry.value(),
+          svn::Diff(diff.entry().value()));
+
+      if (patch.isError()) {
+        return Error(patch.error());
+      }
+
+      Entry entry(diff.entry());
+      entry.set_value(patch.get());
+
+      return Snapshot(position, entry, diffs + 1);
+    }
+
+    // Position in the log where this snapshot is located. NOTE: if
+    // 'diffs' is greater than 0 this still represents the location of
+    // the snapshot, not the last DIFF record in the log.
     const Log::Position position;
 
     // TODO(benh): Rather than storing the entire state::Entry we
     // should just store the position, name, and UUID and cache the
     // data so we don't use too much memory.
     const state::Entry entry;
+
+    // This value represents the number of Operation::DIFFs in the
+    // underlying log that make up this "snapshot". If this snapshot
+    // is actually represented in the log this value is 0.
+    const size_t diffs;
   };
 
   // All known snapshots indexed by name. Note that 'hashmap::get'
   // must be used instead of 'operator []' since Snapshot doesn't have
   // a default/empty constructor.
   hashmap<string, Snapshot> snapshots;
+
+  struct Metrics
+  {
+    Metrics()
+      : diff("log_storage/diff")
+    {
+      process::metrics::add(diff);
+    }
+
+    ~Metrics()
+    {
+      process::metrics::remove(diff);
+    }
+
+    process::metrics::Timer<Milliseconds> diff;
+  } metrics;
 };
 
 
-LogStorageProcess::LogStorageProcess(Log* log)
+LogStorageProcess::LogStorageProcess(Log* log, size_t diffsBetweenSnapshots)
   : reader(log),
-    writer(log) {}
+    writer(log),
+    diffsBetweenSnapshots(diffsBetweenSnapshots) {}
 
 
 LogStorageProcess::~LogStorageProcess() {}
@@ -162,6 +221,8 @@ Future<Nothing> LogStorageProcess::start()
     return starting.get();
   }
 
+  VLOG(2) << "Starting the writer";
+
   starting = writer.start()
     .then(defer(self(), &Self::_start, lambda::_1));
 
@@ -175,9 +236,14 @@ Future<Nothing> LogStorageProcess::_start(
   CHECK_SOME(starting);
 
   if (position.isNone()) {
+    VLOG(2) << "Writer failed to get elected, retrying";
+
     starting = None(); // Reset 'starting' so we try again.
     return start(); // TODO(benh): Don't try again forever?
   }
+
+  VLOG(2) << "Writer got elected at position "
+          << position.get().identity();
 
   // Now read and apply log entries. Since 'start' can be called
   // multiple times (i.e., since we reset 'starting' after getting a
@@ -218,6 +284,8 @@ Future<Nothing> LogStorageProcess::__start(
 
 Future<Nothing> LogStorageProcess::apply(const list<Log::Entry>& entries)
 {
+  VLOG(2) << "Applying operations (" << entries.size() << " entries)";
+
   // Only read and apply entries past our index.
   foreach (const Log::Entry& entry, entries) {
     if (index.isNone() || index.get() < entry.position) {
@@ -236,9 +304,28 @@ Future<Nothing> LogStorageProcess::apply(const list<Log::Entry>& entries)
         case Operation::SNAPSHOT: {
           CHECK(operation.has_snapshot());
 
-          // Add or update the snapshot.
+          // Add or update (override) the snapshot.
           Snapshot snapshot(entry.position, operation.snapshot().entry());
           snapshots.put(snapshot.entry.name(), snapshot);
+          break;
+        }
+
+        case Operation::DIFF: {
+          CHECK(operation.has_diff());
+
+          Option<Snapshot> snapshot =
+            snapshots.get(operation.diff().entry().name());
+
+          CHECK_SOME(snapshot);
+
+          Try<Snapshot> patched = snapshot.get().patch(operation.diff());
+
+          if (patched.isError()) {
+            return Failure("Failed to apply the diff: " + patched.error());
+          }
+
+          // Replace the snapshot with the patched snapshot.
+          snapshots.put(patched.get().entry.name(), patched.get());
           break;
         }
 
@@ -287,6 +374,13 @@ Future<Nothing> LogStorageProcess::_truncate()
   foreachvalue (const Snapshot& snapshot, snapshots) {
     minimum = min(minimum, snapshot.position);
   }
+
+  // TODO(benh): It's possible that the minimum position we've found
+  // will leave a lot of "unnecessary" entries in the log (e.g., a
+  // snapshot that has been overwritten at a later position). In this
+  // circumstance we should "compact/defrag" the log by writing/moving
+  // snapshots to the end of the log first applying any diffs as
+  // necessary.
 
   CHECK_SOME(truncated);
 
@@ -363,50 +457,101 @@ Future<bool> LogStorageProcess::__set(
     const state::Entry& entry,
     const UUID& uuid)
 {
-  // Check the version first (if we've already got a snapshot).
   Option<Snapshot> snapshot = snapshots.get(entry.name());
 
-  if (snapshot.isSome()) {
-    if (UUID::fromBytes(snapshot.get().entry.uuid()) != uuid) {
-      return false;
+  // Check the version first (if we've already got a snapshot).
+  if (snapshot.isSome() &&
+      UUID::fromBytes(snapshot.get().entry.uuid()) != uuid) {
+    return false;
+  }
+
+  // Check if we should try to compute a diff.
+  if (snapshot.isSome() && snapshot.get().diffs < diffsBetweenSnapshots) {
+    // Keep metrics for the time to calculate diffs.
+    metrics.diff.start();
+
+    // Construct the diff of the last snapshot.
+    Try<svn::Diff> diff = svn::diff(
+        snapshot.get().entry.value(),
+        entry.value());
+
+    Duration elapsed = metrics.diff.stop();
+
+    if (diff.isError()) {
+      // TODO(benh): Fallback and try and write a whole snapshot?
+      return Failure("Failed to construct diff: " + diff.error());
+    }
+
+    VLOG(1) << "Created an SVN diff in " << elapsed
+            << " of size " << Bytes(diff.get().data.size()) << " which is "
+            << (diff.get().data.size() / (double) entry.value().size()) * 100.0
+            << "% the original size (" << Bytes(entry.value().size()) << ")";
+
+    // Only write the diff if it provides a reduction in size.
+    if (diff.get().data.size() < entry.value().size()) {
+      // Append a diff operation.
+      Operation operation;
+      operation.set_type(Operation::DIFF);
+      operation.mutable_diff()->mutable_entry()->CopyFrom(entry);
+      operation.mutable_diff()->mutable_entry()->set_value(diff.get().data);
+
+      string value;
+      if (!operation.SerializeToString(&value)) {
+        return Failure("Failed to serialize DIFF Operation");
+      }
+
+      return writer.append(value)
+        .then(defer(self(),
+                    &Self::___set,
+                    entry,
+                    snapshot.get().diffs + 1,
+                    lambda::_1));
     }
   }
 
-  // Now serialize and append a snapshot operation.
+  // Write the full snapshot.
   Operation operation;
   operation.set_type(Operation::SNAPSHOT);
   operation.mutable_snapshot()->mutable_entry()->CopyFrom(entry);
 
   string value;
   if (!operation.SerializeToString(&value)) {
-    return Failure("Failed to serialize Operation");
+    return Failure("Failed to serialize SNAPSHOT Operation");
   }
 
   return writer.append(value)
-    .then(defer(self(), &Self::___set, entry, lambda::_1));
+    .then(defer(self(), &Self::___set, entry, 0, lambda::_1));
 }
 
 
 Future<bool> LogStorageProcess::___set(
     const state::Entry& entry,
-    const Option<Log::Position>& position)
+    size_t diffs,
+    Option<Log::Position> position)
 {
   if (position.isNone()) {
     starting = None(); // Reset 'starting' so we try again.
     return false;
   }
 
-  // Add (or update) the snapshot for this entry and truncate
-  // the log if possible.
-  CHECK(!snapshots.contains(entry.name()) ||
-        snapshots.get(entry.name()).get().position < position.get());
-
-  Snapshot snapshot(position.get(), entry);
-  snapshots.put(snapshot.entry.name(), snapshot);
-  truncate();
-
-  // Update index so we don't bother with this position again.
+  // Update index so we don't bother reading anything before this
+  // position again (if we don't have to).
   index = max(index, position);
+
+  // Determine the position that represents the snapshot: if we just
+  // wrote a diff then we want to use the existing position of the
+  // snapshot, otherwise we just overwrote the snapshot so we should
+  // use the returned position (i.e., do nothing).
+  if (diffs > 0) {
+    CHECK(snapshots.contains(entry.name()));
+    position = snapshots.get(entry.name()).get().position;
+  }
+
+  Snapshot snapshot(position.get(), entry, diffs);
+  snapshots.put(snapshot.entry.name(), snapshot);
+
+  // And truncate the log if necessary.
+  truncate();
 
   return true;
 }
@@ -488,9 +633,9 @@ Future<std::set<string> > LogStorageProcess::_names()
 }
 
 
-LogStorage::LogStorage(Log* log)
+LogStorage::LogStorage(Log* log, size_t diffsBetweenSnapshots)
 {
-  process = new LogStorageProcess(log);
+  process = new LogStorageProcess(log, diffsBetweenSnapshots);
   spawn(process);
 }
 

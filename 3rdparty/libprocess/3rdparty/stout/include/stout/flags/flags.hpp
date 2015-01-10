@@ -14,8 +14,6 @@
 #ifndef __STOUT_FLAGS_FLAGS_HPP__
 #define __STOUT_FLAGS_FLAGS_HPP__
 
-#include <stdlib.h> // For abort.
-
 #include <map>
 #include <string>
 #include <typeinfo> // For typeid.
@@ -221,9 +219,7 @@ void FlagsBase::add(
 {
   Flags* flags = dynamic_cast<Flags*>(this);
   if (flags == NULL) {
-    std::cerr << "Attempted to add flag '" << name
-              << "' with incompatible type" << std::endl;
-    abort();
+    ABORT("Attempted to add flag '" + name + "' with incompatible type");
   } else {
     flags->*t1 = t2; // Set the default.
   }
@@ -264,9 +260,7 @@ void FlagsBase::add(
 {
   Flags* flags = dynamic_cast<Flags*>(this);
   if (flags == NULL) {
-    std::cerr << "Attempted to add flag '" << name
-              << "' with incompatible type" << std::endl;
-    abort();
+    ABORT("Attempted to add flag '" + name + "' with incompatible type");
   }
 
   Flag flag;
@@ -412,7 +406,7 @@ inline Try<Nothing> FlagsBase::load(
 
     // Stop parsing flags after '--' is encountered.
     if (arg == "--") {
-      // Save the rest of the arguments
+      // Save the rest of the arguments.
       for (int j = i + 1; j < *argc; j++) {
         args.push_back((*argv)[j]);
       }
@@ -551,7 +545,7 @@ inline std::string FlagsBase::usage() const
 
   std::string usage;
 
-  std::map<std::string, std::string> col1; // key -> col 1 string
+  std::map<std::string, std::string> col1; // key -> col 1 string.
 
   // Construct string for the first column and store width of column.
   size_t width = 0;

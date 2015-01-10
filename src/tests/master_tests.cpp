@@ -37,6 +37,7 @@
 #include <process/metrics/metrics.hpp>
 
 #include <stout/json.hpp>
+#include <stout/net.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/try.hpp>
@@ -62,6 +63,7 @@ using namespace mesos::internal::tests;
 using mesos::internal::master::Master;
 
 using mesos::internal::master::allocator::AllocatorProcess;
+using mesos::internal::master::allocator::HierarchicalDRFAllocatorProcess;
 
 using mesos::internal::slave::GarbageCollectorProcess;
 using mesos::internal::slave::Slave;
@@ -163,9 +165,12 @@ TEST_F(MasterTest, TaskRunning)
 }
 
 
+// This test ensures that stopping a scheduler driver triggers
+// executor's shutdown callback and all still running tasks are
+// marked as killed.
 TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
 {
-  Try<PID<Master> > master = StartMaster();
+  Try<PID<Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
@@ -175,7 +180,7 @@ TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
   slave::Flags flags = CreateSlaveFlags();
   flags.executor_shutdown_grace_period = Seconds(0);
 
-  Try<PID<Slave> > slave = StartSlave(&containerizer, flags);
+  Try<PID<Slave>> slave = StartSlave(&containerizer, flags);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -185,7 +190,7 @@ TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
   EXPECT_CALL(sched, registered(&driver, _, _))
     .Times(1);
 
-  Future<vector<Offer> > offers;
+  Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
@@ -194,12 +199,13 @@ TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
 
   AWAIT_READY(offers);
   EXPECT_NE(0u, offers.get().size());
+  Offer offer = offers.get()[0];
 
   TaskInfo task;
   task.set_name("");
   task.mutable_task_id()->set_value("1");
-  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(offer.resources());
   task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
 
   vector<TaskInfo> tasks;
@@ -213,7 +219,7 @@ TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
 
   Future<Nothing> update;
   EXPECT_CALL(containerizer,
-              update(_, Resources(offers.get()[0].resources())))
+              update(_, Resources(offer.resources())))
     .WillOnce(DoAll(FutureSatisfy(&update),
                     Return(Future<Nothing>())));
 
@@ -221,20 +227,59 @@ TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&status));
 
-  driver.launchTasks(offers.get()[0].id(), tasks);
+  driver.launchTasks(offer.id(), tasks);
 
   AWAIT_READY(status);
   EXPECT_EQ(TASK_RUNNING, status.get().state());
 
   AWAIT_READY(update);
 
-  EXPECT_CALL(exec, shutdown(_))
-    .Times(AtMost(1));
+  // Set expectation that Master receives UnregisterFrameworkMessage,
+  // which triggers marking running tasks as killed.
+  UnregisterFrameworkMessage message;
+  message.mutable_framework_id()->MergeFrom(offer.framework_id());
 
+  Future<UnregisterFrameworkMessage> unregisterFrameworkMessage =
+    FUTURE_PROTOBUF(message, _, master.get());
+
+  // Set expectation that Executor's shutdown callback is invoked.
+  Future<Nothing> shutdown;
+  EXPECT_CALL(exec, shutdown(_))
+    .WillOnce(FutureSatisfy(&shutdown));
+
+  // Stop the driver while the task is running.
   driver.stop();
   driver.join();
 
-  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+  // Wait for UnregisterFrameworkMessage message to be dispatched and
+  // executor's shutdown callback to be called.
+  AWAIT_READY(unregisterFrameworkMessage);
+  AWAIT_READY(shutdown);
+
+  // We have to be sure the UnregisterFrameworkMessage is processed
+  // completely and running tasks enter a terminal state before we
+  // request the master state.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
+  // Request master state.
+  Future<process::http::Response> response =
+    process::http::get(master.get(), "state.json");
+  AWAIT_READY(response);
+
+  // These checks are not essential for the test, but may help
+  // understand what went wrong.
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  ASSERT_SOME(parse);
+
+  // Make sure the task landed in completed and marked as killed.
+  Result<JSON::String> state = parse.get().find<JSON::String>(
+      "completed_frameworks[0].completed_tasks[0].state");
+
+  ASSERT_SOME_EQ(JSON::String("TASK_KILLED"), state);
+
+  Shutdown();  // Must shutdown before 'containerizer' gets deallocated.
 }
 
 
@@ -920,8 +965,8 @@ TEST_F(MasterTest, MasterInfo)
   driver.start();
 
   AWAIT_READY(masterInfo);
-  EXPECT_EQ(master.get().port, masterInfo.get().port());
-  EXPECT_EQ(master.get().ip, masterInfo.get().ip());
+  EXPECT_EQ(master.get().node.port, masterInfo.get().port());
+  EXPECT_EQ(master.get().node.ip, masterInfo.get().ip());
 
   driver.stop();
   driver.join();
@@ -978,8 +1023,8 @@ TEST_F(MasterTest, MasterInfoOnReElection)
   AWAIT_READY(disconnected);
 
   AWAIT_READY(masterInfo);
-  EXPECT_EQ(master.get().port, masterInfo.get().port());
-  EXPECT_EQ(master.get().ip, masterInfo.get().ip());
+  EXPECT_EQ(master.get().node.port, masterInfo.get().port());
+  EXPECT_EQ(master.get().node.ip, masterInfo.get().ip());
 
   // The re-registered framework should get offers.
   AWAIT_READY(resourceOffers2);
@@ -1009,7 +1054,7 @@ protected:
 TEST_F(WhitelistTest, WhitelistSlave)
 {
   // Add some hosts to the white list.
-  Try<string> hostname = os::hostname();
+  Try<string> hostname = net::hostname();
   ASSERT_SOME(hostname);
 
   string hosts = hostname.get() + "\n" + "dummy-slave";
@@ -1182,7 +1227,8 @@ TEST_F(MasterTest, LaunchCombinedOfferTest)
 
   Future<vector<Offer> > offers3;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers3));
+    .WillOnce(FutureArg<1>(&offers3))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Kill 1st task.
   TaskID taskId1 = task1.task_id();
@@ -1275,7 +1321,8 @@ TEST_F(MasterTest, LaunchAcrossSlavesTest)
   // Test that offers cannot span multiple slaves.
   Future<vector<Offer> > offers2;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers2));
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   Try<PID<Slave> > slave2 = StartSlave(&containerizer, flags);
   ASSERT_SOME(slave2);
@@ -1303,16 +1350,17 @@ TEST_F(MasterTest, LaunchAcrossSlavesTest)
   combinedOffers.push_back(offers1.get()[0].id());
   combinedOffers.push_back(offers2.get()[0].id());
 
-  Future<Nothing> resourcesRecovered =
-    FUTURE_DISPATCH(_, &AllocatorProcess::resourcesRecovered);
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &AllocatorProcess::recoverResources);
 
   driver.launchTasks(combinedOffers, tasks);
 
   AWAIT_READY(status);
   EXPECT_EQ(TASK_LOST, status.get().state());
+  EXPECT_EQ(TaskStatus::REASON_INVALID_OFFERS, status.get().reason());
 
   // The resources of the invalid offers should be recovered.
-  AWAIT_READY(resourcesRecovered);
+  AWAIT_READY(recoverResources);
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -1353,7 +1401,8 @@ TEST_F(MasterTest, LaunchDuplicateOfferTest)
   // Kill 2nd task and get offer for full slave.
   Future<vector<Offer> > offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers));
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
@@ -1381,16 +1430,17 @@ TEST_F(MasterTest, LaunchDuplicateOfferTest)
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&status));
 
-  Future<Nothing> resourcesRecovered =
-    FUTURE_DISPATCH(_, &AllocatorProcess::resourcesRecovered);
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &AllocatorProcess::recoverResources);
 
   driver.launchTasks(combinedOffers, tasks);
 
   AWAIT_READY(status);
   EXPECT_EQ(TASK_LOST, status.get().state());
+  EXPECT_EQ(TaskStatus::REASON_INVALID_OFFERS, status.get().reason());
 
   // The resources of the invalid offers should be recovered.
-  AWAIT_READY(resourcesRecovered);
+  AWAIT_READY(recoverResources);
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -1430,9 +1480,13 @@ TEST_F(MasterTest, MetricsInStatsEndpoint)
   EXPECT_EQ(1, stats.values["elected"]);
   EXPECT_EQ(1, stats.values["master/elected"]);
 
+  EXPECT_EQ(1u, stats.values.count("master/slaves_connected"));
+  EXPECT_EQ(1u, stats.values.count("master/slaves_disconnected"));
   EXPECT_EQ(1u, stats.values.count("master/slaves_active"));
   EXPECT_EQ(1u, stats.values.count("master/slaves_inactive"));
 
+  EXPECT_EQ(1u, stats.values.count("master/frameworks_connected"));
+  EXPECT_EQ(1u, stats.values.count("master/frameworks_disconnected"));
   EXPECT_EQ(1u, stats.values.count("master/frameworks_active"));
   EXPECT_EQ(1u, stats.values.count("master/frameworks_inactive"));
 
@@ -1458,6 +1512,7 @@ TEST_F(MasterTest, MetricsInStatsEndpoint)
       "master/messages_status_update_acknowledgement"));
   EXPECT_EQ(1u, stats.values.count("master/messages_resource_request"));
   EXPECT_EQ(1u, stats.values.count("master/messages_launch_tasks"));
+  EXPECT_EQ(1u, stats.values.count("master/messages_decline_offers"));
   EXPECT_EQ(1u, stats.values.count("master/messages_revive_offers"));
   EXPECT_EQ(1u, stats.values.count("master/messages_reconcile_tasks"));
   EXPECT_EQ(1u, stats.values.count("master/messages_framework_to_executor"));
@@ -1770,6 +1825,10 @@ class MasterZooKeeperTest : public MesosZooKeeperTest {};
 TEST_F(MasterZooKeeperTest, LostZooKeeperCluster)
 {
   ASSERT_SOME(StartMaster());
+
+  Future<process::Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
   ASSERT_SOME(StartSlave());
 
   MockScheduler sched;
@@ -1784,8 +1843,6 @@ TEST_F(MasterZooKeeperTest, LostZooKeeperCluster)
 
   Future<process::Message> frameworkRegisteredMessage =
     FUTURE_MESSAGE(Eq(FrameworkRegisteredMessage().GetTypeName()), _, _);
-  Future<process::Message> slaveRegisteredMessage =
-    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
 
   driver.start();
 
@@ -2082,8 +2139,8 @@ TEST_F(MasterTest, MaxExecutorsPerSlave)
   driver.start();
 
   AWAIT_READY(masterInfo);
-  EXPECT_EQ(master.get().port, masterInfo.get().port());
-  EXPECT_EQ(master.get().ip, masterInfo.get().ip());
+  EXPECT_EQ(master.get().node.port, masterInfo.get().port());
+  EXPECT_EQ(master.get().node.ip, masterInfo.get().ip());
 
   driver.stop();
   driver.join();
@@ -2091,3 +2148,788 @@ TEST_F(MasterTest, MaxExecutorsPerSlave)
   Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
 }
 #endif  // WITH_NETWORK_ISOLATOR
+
+
+// This test verifies that when the Framework has not responded to
+// an offer within the default timeout, the offer is rescinded.
+TEST_F(MasterTest, OfferTimeout)
+{
+  master::Flags masterFlags = MesosTest::CreateMasterFlags();
+  masterFlags.offer_timeout = Seconds(30);
+  Try<PID<Master> > master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Try<PID<Slave> > slave = StartSlave();
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+    &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  Future<vector<Offer> > offers1;
+  Future<vector<Offer> > offers2;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillOnce(FutureArg<1>(&offers2));
+
+  // Expect offer rescinded.
+  Future<Nothing> offerRescinded;
+  EXPECT_CALL(sched, offerRescinded(&driver, _))
+    .WillOnce(FutureSatisfy(&offerRescinded));
+
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &AllocatorProcess::recoverResources);
+
+  driver.start();
+
+  AWAIT_READY(registered);
+  AWAIT_READY(offers1);
+  ASSERT_EQ(1u, offers1.get().size());
+
+  // Now advance the clock, we need to resume it afterwards to
+  // allow the allocator to make a new allocation decision.
+  Clock::pause();
+  Clock::advance(masterFlags.offer_timeout.get());
+  Clock::resume();
+
+  AWAIT_READY(offerRescinded);
+
+  AWAIT_READY(recoverResources);
+
+  // Expect that the resources are re-offered to the framework after
+  // the rescind.
+  AWAIT_READY(offers2);
+  ASSERT_EQ(1u, offers2.get().size());
+
+  EXPECT_EQ(offers1.get()[0].resources(), offers2.get()[0].resources());
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// Offer should not be rescinded if it's accepted.
+TEST_F(MasterTest, OfferNotRescindedOnceUsed)
+{
+  master::Flags masterFlags = MesosTest::CreateMasterFlags();
+  masterFlags.offer_timeout = Seconds(30);
+  Try<PID<Master> > master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Try<PID<Slave> > slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+    &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 64, "*"))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  // We don't expect any rescinds if the offer has been accepted.
+  EXPECT_CALL(sched, offerRescinded(&driver, _))
+    .Times(0);
+
+  driver.start();
+  AWAIT_READY(registered);
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  // Now advance to the offer timeout, we need to settle the clock to
+  // ensure that the offer rescind timeout would be processed
+  // if triggered.
+  Clock::pause();
+  Clock::advance(masterFlags.offer_timeout.get());
+  Clock::settle();
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// Offer should not be rescinded if it has been declined.
+TEST_F(MasterTest, OfferNotRescindedOnceDeclined)
+{
+  master::Flags masterFlags = MesosTest::CreateMasterFlags();
+  masterFlags.offer_timeout = Seconds(30);
+  Try<PID<Master> > master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Try<PID<Slave> > slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+    &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillRepeatedly(DeclineOffers()); // Decline all offers.
+
+  Future<LaunchTasksMessage> launchTasksMessage =
+    FUTURE_PROTOBUF(LaunchTasksMessage(), _, _);
+
+  EXPECT_CALL(sched, offerRescinded(&driver, _))
+    .Times(0);
+
+  driver.start();
+  AWAIT_READY(registered);
+
+  // Wait for the framework to decline the offers.
+  AWAIT_READY(launchTasksMessage);
+
+  // Now advance to the offer timeout, we need to settle the clock to
+  // ensure that the offer rescind timeout would be processed
+  // if triggered.
+  Clock::pause();
+  Clock::advance(masterFlags.offer_timeout.get());
+  Clock::settle();
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// This test ensures that the master releases resources for tasks
+// when they terminate, even if no acknowledgements occur.
+TEST_F(MasterTest, UnacknowledgedTerminalTask)
+{
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<PID<Master> > master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.resources = "cpus:1;mem:64";
+  Try<PID<Slave> > slave = StartSlave(&containerizer, slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Launch a framework and get a task into a terminal state.
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer> > offers1;
+  Future<vector<Offer> > offers2;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(DoAll(FutureArg<1>(&offers1),
+                    LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 64, "*")))
+    .WillOnce(FutureArg<1>(&offers2)); // Ignore subsequent offers.
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_FINISHED));
+
+  // Capture the status update message from the slave to the master.
+  Future<StatusUpdateMessage> update =
+    FUTURE_PROTOBUF(StatusUpdateMessage(), _, master.get());
+
+  // Drop the status updates forwarded to the framework to ensure
+  // that the task remains terminal and unacknowledged in the master.
+  DROP_PROTOBUFS(StatusUpdateMessage(), master.get(), _);
+
+  driver.start();
+
+  // Wait until the framework is registered.
+  AWAIT_READY(frameworkId);
+  AWAIT_READY(offers1);
+
+  // Once the update is sent, the master should re-offer the
+  // resources consumed by the task.
+  AWAIT_READY(update);
+
+  // Don't wait around for the allocation interval.
+  Clock::pause();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
+
+  AWAIT_READY(offers2);
+
+  EXPECT_FALSE(offers1.get().empty());
+  EXPECT_FALSE(offers2.get().empty());
+
+  // Ensure we get all of the resources back.
+  EXPECT_EQ(offers1.get()[0].resources(), offers2.get()[0].resources());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// This test ensures that the master releases resources for a
+// terminated task even when it receives a non-terminal update (with
+// latest state set).
+TEST_F(MasterTest, ReleaseResourcesForTerminalTaskWithPendingUpdates)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.resources = "cpus:1;mem:64";
+  Try<PID<Slave> > slave = StartSlave(&containerizer, slaveFlags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 64, "*"))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  ExecutorDriver* execDriver;
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .WillOnce(SaveArg<0>(&execDriver));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  // Drop all the updates from master to scheduler.
+  DROP_PROTOBUFS(StatusUpdateMessage(), master.get(), _);
+
+  Future<StatusUpdateMessage> statusUpdateMessage =
+    FUTURE_PROTOBUF(StatusUpdateMessage(), _, master.get());
+
+  Future<Nothing> __statusUpdate = FUTURE_DISPATCH(_, &Slave::__statusUpdate);
+
+  driver.start();
+
+  // Wait until TASK_RUNNING is sent to the master.
+  AWAIT_READY(statusUpdateMessage);
+
+  // Ensure status update manager handles TASK_RUNNING update.
+  AWAIT_READY(__statusUpdate);
+
+  Future<Nothing> __statusUpdate2 = FUTURE_DISPATCH(_, &Slave::__statusUpdate);
+
+  // Now send TASK_FINISHED update.
+  TaskStatus finishedStatus;
+  finishedStatus = statusUpdateMessage.get().update().status();
+  finishedStatus.set_state(TASK_FINISHED);
+  execDriver->sendStatusUpdate(finishedStatus);
+
+  // Ensure status update manager handles TASK_FINISHED update.
+  AWAIT_READY(__statusUpdate2);
+
+  Future<Nothing> recoverResources = FUTURE_DISPATCH(
+      _, &AllocatorProcess::recoverResources);
+
+  // Advance the clock so that the status update manager resends
+  // TASK_RUNNING update with 'latest_state' as TASK_FINISHED.
+  Clock::pause();
+  Clock::advance(slave::STATUS_UPDATE_RETRY_INTERVAL_MIN);
+  Clock::resume();
+
+  // Ensure the resources are recovered.
+  AWAIT_READY(recoverResources);
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// This test ensures that the web UI of a framework is included in the
+// state.json endpoint, if provided by the framework.
+TEST_F(MasterTest, FrameworkWebUIUrl)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
+  framework.set_webui_url("http://localhost:8080/");
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, framework, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  driver.start();
+
+  AWAIT_READY(registered);
+
+  Future<process::http::Response> masterState =
+    process::http::get(master.get(), "state.json");
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, masterState);
+
+  Try<JSON::Object> masterStateObject =
+    JSON::parse<JSON::Object>(masterState.get().body);
+  ASSERT_SOME(masterStateObject);
+
+  // We need a mutable copy of masterStateObject to use [].
+  JSON::Object masterStateObject_ = masterStateObject.get();
+
+  EXPECT_EQ(1u, masterStateObject_.values.count("frameworks"));
+  JSON::Array frameworks =
+    masterStateObject_.values["frameworks"].as<JSON::Array>();
+
+  EXPECT_EQ(1u, frameworks.values.size());
+  JSON::Object framework_ = frameworks.values.front().as<JSON::Object>();
+
+  EXPECT_EQ(1u, framework_.values.count("webui_url"));
+  JSON::String webui_url =
+    framework_.values["webui_url"].as<JSON::String>();
+
+  EXPECT_EQ("http://localhost:8080/", webui_url.value);
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// This test verifies that label values are exposed over the master
+// state endpoint.
+TEST_F(MasterTest, TaskLabels)
+{
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Try<PID<Slave>> slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  // Add three labels to the task (two of which share the same key).
+  Labels* labels = task.mutable_labels();
+
+  Label* label1 = labels->add_labels();
+  label1->set_key("foo");
+  label1->set_value("bar");
+
+  Label* label2 = labels->add_labels();
+  label2->set_key("bar");
+  label2->set_value("baz");
+
+  Label* label3 = labels->add_labels();
+  label3->set_key("bar");
+  label3->set_value("qux");
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<Nothing> update;
+  EXPECT_CALL(containerizer,
+              update(_, Resources(offers.get()[0].resources())))
+    .WillOnce(DoAll(FutureSatisfy(&update),
+                    Return(Future<Nothing>())));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  AWAIT_READY(update);
+
+  // Verify label key and value in master state.json.
+  Future<process::http::Response> response =
+    process::http::get(master.get(), "state.json");
+  AWAIT_READY(response);
+
+  EXPECT_SOME_EQ(
+      "application/json",
+      response.get().headers.get("Content-Type"));
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::Array> labelsObject = parse.get().find<JSON::Array>(
+      "frameworks[0].tasks[0].labels");
+  EXPECT_SOME(labelsObject);
+
+  JSON::Array labelsObject_ = labelsObject.get();
+
+  // Verify the content of 'foo:bar' pair.
+  Try<JSON::Value> expected = JSON::parse(
+      "{"
+      "  \"key\":\"foo\","
+      "  \"value\":\"bar\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[0], expected.get());
+
+
+  // Verify the content of 'bar:baz' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"bar\","
+      "  \"value\":\"baz\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[1], expected.get());
+
+
+  // Verify the content of 'bar:qux' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"bar\","
+      "  \"value\":\"qux\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[2], expected.get());
+
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// This tests the 'active' field in slave entries from state.json. We
+// first verify an active slave, deactivate it and verify that the
+// 'active' field is false.
+TEST_F(MasterTest, SlaveActiveEndpoint)
+{
+  // Start a master.
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Future<process::Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  // Start a checkpointing slave.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.checkpoint = true;
+  Try<PID<Slave>> slave = StartSlave(flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Verify slave is active.
+  Future<process::http::Response> response =
+    process::http::get(master.get(), "state.json");
+  AWAIT_READY(response);
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::Boolean> status = parse.get().find<JSON::Boolean>(
+      "slaves[0].active");
+
+  ASSERT_SOME_EQ(JSON::Boolean(true), status);
+
+  Future<Nothing> deactivateSlave =
+    FUTURE_DISPATCH(_, &AllocatorProcess::deactivateSlave);
+
+  // Inject a slave exited event at the master causing the master
+  // to mark the slave as disconnected.
+  process::inject::exited(slaveRegisteredMessage.get().to, master.get());
+
+  // Wait until master deactivates the slave.
+  AWAIT_READY(deactivateSlave);
+
+  // Verify slave is inactive.
+  response = process::http::get(master.get(), "state.json");
+  AWAIT_READY(response);
+
+  parse = JSON::parse<JSON::Object>(response.get().body);
+  ASSERT_SOME(parse);
+
+  status = parse.get().find<JSON::Boolean>("slaves[0].active");
+
+  ASSERT_SOME_EQ(JSON::Boolean(false), status);
+
+  Shutdown();
+}
+
+
+// This test verifies that service info for tasks is exposed over the
+// master state endpoint.
+TEST_F(MasterTest, TaskDiscoveryInfo)
+{
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Try<PID<Slave>> slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("testtask");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  // An expanded service discovery info to the task.
+  DiscoveryInfo* info = task.mutable_discovery();
+  info->set_visibility(DiscoveryInfo::EXTERNAL);
+  info->set_name("mytask");
+  info->set_environment("mytest");
+  info->set_location("mylocation");
+  info->set_version("v0.1.1");
+  // Add two named ports to the discovery info.
+  Ports* ports = info->mutable_ports();
+  Port* port1 = ports->add_ports();
+  port1->set_number(8888);
+  port1->set_name("myport1");
+  port1->set_protocol("tcp");
+  Port* port2 = ports->add_ports();
+  port2->set_number(9999);
+  port2->set_name("myport2");
+  port2->set_protocol("udp");
+  // Add two labels to the discovery info.
+  Labels* labels = info->mutable_labels();
+  Label* label1 = labels->add_labels();
+  label1->set_key("clearance");
+  label1->set_value("high");
+  Label* label2 = labels->add_labels();
+  label2->set_key("RPC");
+  label2->set_value("yes");
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<Nothing> update;
+  EXPECT_CALL(containerizer,
+              update(_, Resources(offers.get()[0].resources())))
+    .WillOnce(DoAll(FutureSatisfy(&update),
+                    Return(Future<Nothing>())));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  AWAIT_READY(update);
+
+  // Verify label key and value in master state.json.
+  Future<process::http::Response> response =
+    process::http::get(master.get(), "state.json");
+  AWAIT_READY(response);
+
+  EXPECT_SOME_EQ(
+      "application/json",
+      response.get().headers.get("Content-Type"));
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::String> taskName = parse.get().find<JSON::String>(
+      "frameworks[0].tasks[0].name");
+  EXPECT_SOME(taskName);
+  ASSERT_EQ("testtask", taskName.get());
+
+  // Verify basic content for discovery info.
+  Result<JSON::String> visibility = parse.get().find<JSON::String>(
+      "frameworks[0].tasks[0].discovery.visibility");
+  EXPECT_SOME(visibility);
+  DiscoveryInfo::Visibility visibility_value;
+  DiscoveryInfo::Visibility_Parse(visibility.get().value, &visibility_value);
+  ASSERT_EQ(DiscoveryInfo::EXTERNAL, visibility_value);
+
+  Result<JSON::String> discoveryName = parse.get().find<JSON::String>(
+      "frameworks[0].tasks[0].discovery.name");
+  EXPECT_SOME(discoveryName);
+  ASSERT_EQ("mytask", discoveryName.get());
+
+  Result<JSON::String> environment = parse.get().find<JSON::String>(
+      "frameworks[0].tasks[0].discovery.environment");
+  EXPECT_SOME(environment);
+  ASSERT_EQ("mytest", environment.get());
+
+  Result<JSON::String> location = parse.get().find<JSON::String>(
+      "frameworks[0].tasks[0].discovery.location");
+  EXPECT_SOME(location);
+  ASSERT_EQ("mylocation", location.get());
+
+  Result<JSON::String> version = parse.get().find<JSON::String>(
+      "frameworks[0].tasks[0].discovery.version");
+  EXPECT_SOME(version);
+  ASSERT_EQ("v0.1.1", version.get());
+
+  // Verify content of two named ports.
+  Result<JSON::Array> portsObject = parse.get().find<JSON::Array>(
+      "frameworks[0].tasks[0].discovery.ports");
+  EXPECT_SOME(portsObject);
+
+  JSON::Array portsObject_ = portsObject.get();
+
+  // Verify the content of '8888:myport1:tcp' port.
+  Try<JSON::Value> expected = JSON::parse(
+      "{"
+      "  \"number\":8888,"
+      "  \"name\":\"myport1\","
+      "  \"protocol\":\"tcp\""
+      "}");
+  ASSERT_SOME(expected);
+  EXPECT_EQ(expected.get(), portsObject_.values[0]);
+
+  // Verify the content of '9999:myport2:udp' port.
+  expected = JSON::parse(
+      "{"
+      "  \"number\":9999,"
+      "  \"name\":\"myport2\","
+      "  \"protocol\":\"udp\""
+      "}");
+  ASSERT_SOME(expected);
+  EXPECT_EQ(expected.get(), portsObject_.values[1]);
+
+  // Verify content of two labels.
+  Result<JSON::Array> labelsObject = parse.get().find<JSON::Array>(
+      "frameworks[0].tasks[0].discovery.labels");
+  EXPECT_SOME(labelsObject);
+
+  JSON::Array labelsObject_ = labelsObject.get();
+
+  // Verify the content of 'clearance:high' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"clearance\","
+      "  \"value\":\"high\""
+      "}");
+  ASSERT_SOME(expected);
+  EXPECT_EQ(expected.get(), labelsObject_.values[0]);
+
+  // Verify the content of 'RPC:yes' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"RPC\","
+      "  \"value\":\"yes\""
+      "}");
+  ASSERT_SOME(expected);
+  EXPECT_EQ(expected.get(), labelsObject_.values[1]);
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}

@@ -95,7 +95,7 @@ extern const uint32_t MAX_COMPLETED_TASKS_PER_FRAMEWORK;
 // Time interval to check for updated watchers list.
 extern const Duration WHITELIST_WATCH_INTERVAL;
 
-// Default number of tasks (limit) for /master/tasks.json endpoint
+// Default number of tasks (limit) for /master/tasks.json endpoint.
 extern const uint32_t TASK_LIMIT;
 
 // Label used by the Leader Contender and Detector.
@@ -104,6 +104,9 @@ extern const std::string MASTER_INFO_LABEL;
 // Timeout used for ZooKeeper related operations.
 // TODO(vinod): Master detector/contender should use this timeout.
 extern const Duration ZOOKEEPER_SESSION_TIMEOUT;
+
+// Name of the default, CRAM-MD5 authenticator.
+extern const std::string DEFAULT_AUTHENTICATOR;
 
 } // namespace master {
 } // namespace internal {

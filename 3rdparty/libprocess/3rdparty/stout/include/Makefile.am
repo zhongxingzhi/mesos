@@ -19,7 +19,6 @@ nobase_include_HEADERS =		\
   stout/foreach.hpp			\
   stout/format.hpp			\
   stout/fs.hpp				\
-  stout/glog.hpp			\
   stout/gtest.hpp			\
   stout/gzip.hpp			\
   stout/hashmap.hpp			\
@@ -38,17 +37,19 @@ nobase_include_HEADERS =		\
   stout/numify.hpp			\
   stout/option.hpp			\
   stout/os.hpp				\
+  stout/os/close.hpp			\
   stout/os/execenv.hpp			\
   stout/os/exists.hpp			\
+  stout/os/fcntl.hpp			\
   stout/os/fork.hpp			\
   stout/os/killtree.hpp			\
   stout/os/linux.hpp			\
   stout/os/ls.hpp			\
+  stout/os/open.hpp			\
   stout/os/osx.hpp			\
   stout/os/process.hpp			\
   stout/os/read.hpp			\
   stout/os/sendfile.hpp			\
-  stout/os/setns.hpp			\
   stout/os/shell.hpp			\
   stout/os/signals.hpp			\
   stout/os/permissions.hpp		\
@@ -65,10 +66,12 @@ nobase_include_HEADERS =		\
   stout/stringify.hpp			\
   stout/strings.hpp			\
   stout/subcommand.hpp			\
+  stout/svn.hpp				\
   stout/tests/utils.hpp			\
   stout/thread.hpp			\
   stout/try.hpp				\
   stout/tuple.hpp			\
   stout/unreachable.hpp			\
   stout/utils.hpp			\
-  stout/uuid.hpp
+  stout/uuid.hpp			\
+  stout/version.hpp

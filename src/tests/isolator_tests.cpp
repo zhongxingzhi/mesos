@@ -35,8 +35,14 @@
 #include <stout/os.hpp>
 #include <stout/path.hpp>
 
+#ifdef __linux__
+#include "linux/ns.hpp"
+#endif // __linux__
+
 #include "master/master.hpp"
 #include "master/detector.hpp"
+
+#include "module/isolator.hpp"
 
 #include "slave/flags.hpp"
 #include "slave/slave.hpp"
@@ -46,18 +52,22 @@
 #include "slave/containerizer/isolators/cgroups/cpushare.hpp"
 #include "slave/containerizer/isolators/cgroups/mem.hpp"
 #include "slave/containerizer/isolators/cgroups/perf_event.hpp"
+#include "slave/containerizer/isolators/filesystem/shared.hpp"
 #endif // __linux__
 #include "slave/containerizer/isolators/posix.hpp"
 
 #include "slave/containerizer/launcher.hpp"
 #ifdef __linux__
+#include "slave/containerizer/fetcher.hpp"
 #include "slave/containerizer/linux_launcher.hpp"
 
 #include "slave/containerizer/mesos/containerizer.hpp"
 #include "slave/containerizer/mesos/launch.hpp"
 #endif // __linux__
 
+#include "tests/flags.hpp"
 #include "tests/mesos.hpp"
+#include "tests/module.hpp"
 #include "tests/utils.hpp"
 
 using namespace mesos;
@@ -72,10 +82,14 @@ using mesos::internal::master::Master;
 using mesos::internal::slave::CgroupsCpushareIsolatorProcess;
 using mesos::internal::slave::CgroupsMemIsolatorProcess;
 using mesos::internal::slave::CgroupsPerfEventIsolatorProcess;
+using mesos::internal::slave::Fetcher;
+using mesos::internal::slave::SharedFilesystemIsolatorProcess;
 #endif // __linux__
 using mesos::internal::slave::Isolator;
 using mesos::internal::slave::IsolatorProcess;
 using mesos::internal::slave::Launcher;
+using mesos::internal::slave::MesosContainerizer;
+using mesos::internal::slave::Slave;
 #ifdef __linux__
 using mesos::internal::slave::LinuxLauncher;
 #endif // __linux__
@@ -119,12 +133,12 @@ static int childSetup(int pipes[2])
 template <typename T>
 class CpuIsolatorTest : public MesosTest {};
 
+typedef ::testing::Types<
+    PosixCpuIsolatorProcess,
 #ifdef __linux__
-typedef ::testing::Types<PosixCpuIsolatorProcess,
-                         CgroupsCpushareIsolatorProcess> CpuIsolatorTypes;
-#else
-typedef ::testing::Types<PosixCpuIsolatorProcess> CpuIsolatorTypes;
+    CgroupsCpushareIsolatorProcess,
 #endif // __linux__
+    tests::Module<Isolator, TestCpuIsolator>> CpuIsolatorTypes;
 
 TYPED_TEST_CASE(CpuIsolatorTest, CpuIsolatorTypes);
 
@@ -145,10 +159,14 @@ TYPED_TEST(CpuIsolatorTest, UserCpuUsage)
   ContainerID containerId;
   containerId.set_value("user_cpu_usage");
 
-  AWAIT_READY(isolator.get()->prepare(containerId, executorInfo));
-
-  Try<string> dir = os::mkdtemp();
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
   ASSERT_SOME(dir);
+
+  AWAIT_READY(
+      isolator.get()->prepare(containerId, executorInfo, dir.get(), None()));
+
   const string& file = path::join(dir.get(), "mesos_isolator_test_ready");
 
   // Max out a single core in userspace. This will run for at most one second.
@@ -227,8 +245,6 @@ TYPED_TEST(CpuIsolatorTest, UserCpuUsage)
 
   delete isolator.get();
   delete launcher.get();
-
-  CHECK_SOME(os::rmdir(dir.get()));
 }
 
 
@@ -249,10 +265,14 @@ TYPED_TEST(CpuIsolatorTest, SystemCpuUsage)
   ContainerID containerId;
   containerId.set_value("system_cpu_usage");
 
-  AWAIT_READY(isolator.get()->prepare(containerId, executorInfo));
-
-  Try<string> dir = os::mkdtemp();
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
   ASSERT_SOME(dir);
+
+  AWAIT_READY(
+      isolator.get()->prepare(containerId, executorInfo, dir.get(), None()));
+
   const string& file = path::join(dir.get(), "mesos_isolator_test_ready");
 
   // Generating random numbers is done by the kernel and will max out a single
@@ -332,8 +352,6 @@ TYPED_TEST(CpuIsolatorTest, SystemCpuUsage)
 
   delete isolator.get();
   delete launcher.get();
-
-  CHECK_SOME(os::rmdir(dir.get()));
 }
 
 
@@ -361,7 +379,13 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Cfs)
   ContainerID containerId;
   containerId.set_value("mesos_test_cfs_cpu_limit");
 
-  AWAIT_READY(isolator.get()->prepare(containerId, executorInfo));
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
+  AWAIT_READY(
+      isolator.get()->prepare(containerId, executorInfo, dir.get(), None()));
 
   // Generate random numbers to max out a single core. We'll run this for 0.5
   // seconds of wall time so it should consume approximately 250 ms of total
@@ -462,7 +486,13 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Cfs_Big_Quota)
   ContainerID containerId;
   containerId.set_value("mesos_test_cfs_big_cpu_limit");
 
-  AWAIT_READY(isolator.get()->prepare(containerId, executorInfo));
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
+  AWAIT_READY(
+      isolator.get()->prepare(containerId, executorInfo, dir.get(), None()));
 
   int pipes[2];
   ASSERT_NE(-1, ::pipe(pipes));
@@ -516,16 +546,15 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Cfs_Big_Quota)
 
 #endif // __linux__
 
-
 template <typename T>
 class MemIsolatorTest : public MesosTest {};
 
+typedef ::testing::Types<
+    PosixMemIsolatorProcess,
 #ifdef __linux__
-typedef ::testing::Types<PosixMemIsolatorProcess,
-                         CgroupsMemIsolatorProcess> MemIsolatorTypes;
-#else
-typedef ::testing::Types<PosixMemIsolatorProcess> MemIsolatorTypes;
+    CgroupsMemIsolatorProcess,
 #endif // __linux__
+    tests::Module<Isolator, TestMemIsolator>> MemIsolatorTypes;
 
 TYPED_TEST_CASE(MemIsolatorTest, MemIsolatorTypes);
 
@@ -592,7 +621,13 @@ TYPED_TEST(MemIsolatorTest, MemUsage)
   ContainerID containerId;
   containerId.set_value("memory_usage");
 
-  AWAIT_READY(isolator.get()->prepare(containerId, executorInfo));
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
+  AWAIT_READY(
+      isolator.get()->prepare(containerId, executorInfo, dir.get(), None()));
 
   int pipes[2];
   ASSERT_NE(-1, ::pipe(pipes));
@@ -679,7 +714,13 @@ TEST_F(PerfEventIsolatorTest, ROOT_CGROUPS_Sample)
   ContainerID containerId;
   containerId.set_value("test");
 
-  AWAIT_READY(isolator.get()->prepare(containerId, executorInfo));
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
+  AWAIT_READY(
+      isolator.get()->prepare(containerId, executorInfo, dir.get(), None()));
 
   // This first sample is likely to be empty because perf hasn't
   // completed yet but we should still have the required fields.
@@ -728,4 +769,376 @@ TEST_F(PerfEventIsolatorTest, ROOT_CGROUPS_Sample)
   delete isolator.get();
 }
 
+class SharedFilesystemIsolatorTest : public MesosTest {};
+
+
+// Test that a container can create a private view of a system
+// directory (/var/tmp). Check that a file written by a process inside
+// the container doesn't appear on the host filesystem but does appear
+// under the container's work directory.
+TEST_F(SharedFilesystemIsolatorTest, ROOT_RelativeVolume)
+{
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "filesystem/shared";
+
+  Try<Isolator*> isolator = SharedFilesystemIsolatorProcess::create(flags);
+  CHECK_SOME(isolator);
+
+  Try<Launcher*> launcher = LinuxLauncher::create(flags);
+  CHECK_SOME(launcher);
+
+  // Use /var/tmp so we don't mask the work directory (under /tmp).
+  const string containerPath = "/var/tmp";
+  ASSERT_TRUE(os::isdir(containerPath));
+
+  // Use a host path relative to the container work directory.
+  const string hostPath = strings::remove(containerPath, "/", strings::PREFIX);
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(
+      CREATE_VOLUME(containerPath, hostPath, Volume::RW));
+
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_container()->CopyFrom(containerInfo);
+
+  ContainerID containerId;
+  containerId.set_value(UUID::random().toString());
+
+  Future<Option<CommandInfo> > prepare =
+    isolator.get()->prepare(containerId, executorInfo, flags.work_dir, None());
+  AWAIT_READY(prepare);
+  ASSERT_SOME(prepare.get());
+
+  // The test will touch a file in container path.
+  const string file = path::join(containerPath, UUID::random().toString());
+  ASSERT_FALSE(os::exists(file));
+
+  // Manually run the isolator's preparation command first, then touch
+  // the file.
+  vector<string> args;
+  args.push_back("/bin/sh");
+  args.push_back("-x");
+  args.push_back("-c");
+  args.push_back(prepare.get().get().value() + " && touch " + file);
+
+  Try<pid_t> pid = launcher.get()->fork(
+      containerId,
+      "/bin/sh",
+      args,
+      Subprocess::FD(STDIN_FILENO),
+      Subprocess::FD(STDOUT_FILENO),
+      Subprocess::FD(STDERR_FILENO),
+      None(),
+      None(),
+      None());
+  ASSERT_SOME(pid);
+
+  // Set up the reaper to wait on the forked child.
+  Future<Option<int> > status = process::reap(pid.get());
+
+  AWAIT_READY(status);
+  EXPECT_SOME_EQ(0, status.get());
+
+  // Check the correct hierarchy was created under the container work
+  // directory.
+  string dir = "/";
+  foreach (const string& subdir, strings::tokenize(containerPath, "/")) {
+    dir = path::join(dir, subdir);
+
+    struct stat hostStat;
+    EXPECT_EQ(0, ::stat(dir.c_str(), &hostStat));
+
+    struct stat containerStat;
+    EXPECT_EQ(0,
+              ::stat(path::join(flags.work_dir, dir).c_str(), &containerStat));
+
+    EXPECT_EQ(hostStat.st_mode, containerStat.st_mode);
+    EXPECT_EQ(hostStat.st_uid, containerStat.st_uid);
+    EXPECT_EQ(hostStat.st_gid, containerStat.st_gid);
+  }
+
+  // Check it did *not* create a file in the host namespace.
+  EXPECT_FALSE(os::exists(file));
+
+  // Check it did create the file under the container's work directory
+  // on the host.
+  EXPECT_TRUE(os::exists(path::join(flags.work_dir, file)));
+
+  delete launcher.get();
+  delete isolator.get();
+}
+
+
+TEST_F(SharedFilesystemIsolatorTest, ROOT_AbsoluteVolume)
+{
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "filesystem/shared";
+
+  Try<Isolator*> isolator = SharedFilesystemIsolatorProcess::create(flags);
+  CHECK_SOME(isolator);
+
+  Try<Launcher*> launcher = LinuxLauncher::create(flags);
+  CHECK_SOME(launcher);
+
+  // We'll mount the absolute test work directory as /var/tmp in the
+  // container.
+  const string hostPath = flags.work_dir;
+  const string containerPath = "/var/tmp";
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(
+      CREATE_VOLUME(containerPath, hostPath, Volume::RW));
+
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_container()->CopyFrom(containerInfo);
+
+  ContainerID containerId;
+  containerId.set_value(UUID::random().toString());
+
+  Future<Option<CommandInfo> > prepare =
+    isolator.get()->prepare(containerId, executorInfo, flags.work_dir, None());
+  AWAIT_READY(prepare);
+  ASSERT_SOME(prepare.get());
+
+  // Test the volume mounting by touching a file in the container's
+  // /tmp, which should then be in flags.work_dir.
+  const string filename = UUID::random().toString();
+  ASSERT_FALSE(os::exists(path::join(containerPath, filename)));
+
+  vector<string> args;
+  args.push_back("/bin/sh");
+  args.push_back("-x");
+  args.push_back("-c");
+  args.push_back(prepare.get().get().value() +
+                 " && touch " +
+                 path::join(containerPath, filename));
+
+  Try<pid_t> pid = launcher.get()->fork(
+      containerId,
+      "/bin/sh",
+      args,
+      Subprocess::FD(STDIN_FILENO),
+      Subprocess::FD(STDOUT_FILENO),
+      Subprocess::FD(STDERR_FILENO),
+      None(),
+      None(),
+      None());
+  ASSERT_SOME(pid);
+
+  // Set up the reaper to wait on the forked child.
+  Future<Option<int> > status = process::reap(pid.get());
+
+  AWAIT_READY(status);
+  EXPECT_SOME_EQ(0, status.get());
+
+  // Check the file was created in flags.work_dir.
+  EXPECT_TRUE(os::exists(path::join(hostPath, filename)));
+
+  // Check it didn't get created in the host's view of containerPath.
+  EXPECT_FALSE(os::exists(path::join(containerPath, filename)));
+
+  delete launcher.get();
+  delete isolator.get();
+}
+
+
+class NamespacesPidIsolatorTest : public MesosTest {};
+
+
+TEST_F(NamespacesPidIsolatorTest, ROOT_PidNamespace)
+{
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "namespaces/pid";
+
+  string directory = os::getcwd(); // We're inside a temporary sandbox.
+
+  Fetcher fetcher;
+
+  Try<MesosContainerizer*> containerizer =
+    MesosContainerizer::create(flags, false, &fetcher);
+  ASSERT_SOME(containerizer);
+
+  ContainerID containerId;
+  containerId.set_value("test_container");
+
+  // Write the command's pid namespace inode and init name to files.
+  const string command =
+    "stat -c %i /proc/self/ns/pid > ns && (cat /proc/1/comm > init)";
+
+  process::Future<bool> launch = containerizer.get()->launch(
+      containerId,
+      CREATE_EXECUTOR_INFO("executor", command),
+      directory,
+      None(),
+      SlaveID(),
+      process::PID<Slave>(),
+      false);
+  AWAIT_READY(launch);
+  ASSERT_TRUE(launch.get());
+
+  // Wait on the container.
+  process::Future<containerizer::Termination> wait =
+    containerizer.get()->wait(containerId);
+  AWAIT_READY(wait);
+
+  // Check the executor exited correctly.
+  EXPECT_TRUE(wait.get().has_status());
+  EXPECT_EQ(0, wait.get().status());
+
+  // Check that the command was run in a different pid namespace.
+  Try<ino_t> testPidNamespace = ns::getns(::getpid(), "pid");
+  ASSERT_SOME(testPidNamespace);
+
+  Try<string> containerPidNamespace = os::read(path::join(directory, "ns"));
+  ASSERT_SOME(containerPidNamespace);
+
+  EXPECT_NE(stringify(testPidNamespace.get()),
+            strings::trim(containerPidNamespace.get()));
+
+  // Check that 'sh' is the container's 'init' process.
+  // This verifies that /proc has been correctly mounted for the container.
+  Try<string> init = os::read(path::join(directory, "init"));
+  ASSERT_SOME(init);
+
+  EXPECT_EQ("sh", strings::trim(init.get()));
+
+  delete containerizer.get();
+}
+
+
+// Username for the unprivileged user that will be created to test
+// unprivileged cgroup creation. It will be removed after the tests.
+// It is presumed this user does not normally exist.
+const string UNPRIVILEGED_USERNAME = "mesos.test.unprivileged.user";
+
+
+template <typename T>
+class UserCgroupIsolatorTest : public MesosTest
+{
+public:
+  static void SetUpTestCase()
+  {
+    // Remove the user in case it wasn't cleaned up from a previous
+    // test.
+    os::system("userdel -r " + UNPRIVILEGED_USERNAME);
+
+    ASSERT_EQ(0, os::system("useradd " + UNPRIVILEGED_USERNAME));
+  }
+
+
+  static void TearDownTestCase()
+  {
+    ASSERT_EQ(0, os::system("userdel -r " + UNPRIVILEGED_USERNAME));
+  }
+};
+
+
+// Test all isolators that use cgroups.
+typedef ::testing::Types<
+  CgroupsMemIsolatorProcess,
+  CgroupsCpushareIsolatorProcess,
+  CgroupsPerfEventIsolatorProcess> CgroupsIsolatorTypes;
+
+
+TYPED_TEST_CASE(UserCgroupIsolatorTest, CgroupsIsolatorTypes);
+
+
+TYPED_TEST(UserCgroupIsolatorTest, ROOT_CGROUPS_UserCgroup)
+{
+  slave::Flags flags;
+  flags.perf_events = "cpu-cycles"; // Needed for CgroupsPerfEventIsolator.
+
+  Try<Isolator*> isolator = TypeParam::create(flags);
+  CHECK_SOME(isolator);
+
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse("mem:1024;cpus:1").get()); // For cpu/mem isolators.
+
+  ContainerID containerId;
+  containerId.set_value("container");
+
+  AWAIT_READY(isolator.get()->prepare(
+        containerId,
+        executorInfo,
+        os::getcwd(),
+        UNPRIVILEGED_USERNAME));
+
+  // Isolators don't provide a way to determine the cgroups they use
+  // so we'll inspect the cgroups for an isolated dummy process.
+  pid_t pid = fork();
+  if (pid == 0) {
+    // Child just sleeps.
+    ::sleep(100);
+
+    ABORT("Child process should not reach here");
+  }
+  ASSERT_GT(pid, 0);
+
+  AWAIT_READY(isolator.get()->isolate(containerId, pid));
+
+  // Get the container's cgroups from /proc/$PID/cgroup. We're only
+  // interested in the non-root cgroups, i.e., we exclude those with
+  // paths "/", e.g., only cpu and cpuacct from this example:
+  // 6:blkio:/
+  // 5:perf_event:/
+  // 4:memory:/
+  // 3:freezer:/
+  // 2:cpuacct:/mesos
+  // 1:cpu:/mesos
+  // awk will then output "cpuacct/mesos\ncpu/mesos" as the cgroup(s).
+  ostringstream output;
+  Try<int> status = os::shell(
+      &output,
+      "grep -v '/$' /proc/" +
+      stringify(pid) +
+      "/cgroup | awk -F ':' '{print $2$3}'");
+
+  ASSERT_SOME(status);
+
+  // Kill the dummy child process.
+  ::kill(pid, SIGKILL);
+  int exitStatus;
+  EXPECT_NE(-1, ::waitpid(pid, &exitStatus, 0));
+
+  vector<string> cgroups = strings::tokenize(output.str(), "\n");
+  ASSERT_FALSE(cgroups.empty());
+
+  foreach (const string& cgroup, cgroups) {
+    // Check the user cannot manipulate the container's cgroup control
+    // files.
+    EXPECT_NE(0, os::system(
+          "su - " + UNPRIVILEGED_USERNAME +
+          " -c 'echo $$ >" +
+          path::join(flags.cgroups_hierarchy, cgroup, "cgroup.procs") +
+          "'"));
+
+    // Check the user can create a cgroup under the container's
+    // cgroup.
+    string userCgroup = path::join(cgroup, "user");
+
+    EXPECT_EQ(0, os::system(
+          "su - " +
+          UNPRIVILEGED_USERNAME +
+          " -c 'mkdir " +
+          path::join(flags.cgroups_hierarchy, userCgroup) +
+          "'"));
+
+    // Check the user can manipulate control files in the created
+    // cgroup.
+    EXPECT_EQ(0, os::system(
+          "su - " +
+          UNPRIVILEGED_USERNAME +
+          " -c 'echo $$ >" +
+          path::join(flags.cgroups_hierarchy, userCgroup, "cgroup.procs") +
+          "'"));
+  }
+
+  // Clean up the container. This will also remove the nested cgroups.
+  AWAIT_READY(isolator.get()->cleanup(containerId));
+
+  delete isolator.get();
+}
 #endif // __linux__

@@ -69,7 +69,9 @@ public:
 
   virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo)
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user)
   {
     if (promises.contains(containerId)) {
       return process::Failure("Container " + stringify(containerId) +
@@ -163,7 +165,7 @@ public:
     Try<ResourceStatistics> usage =
       mesos::internal::usage(pids.get(containerId).get(), false, true);
     if (usage.isError()) {
-      return Failure(usage.error());
+      return process::Failure(usage.error());
     }
     return usage.get();
   }
@@ -196,7 +198,7 @@ public:
     Try<ResourceStatistics> usage =
       mesos::internal::usage(pids.get(containerId).get(), true, false);
     if (usage.isError()) {
-      return Failure(usage.error());
+      return process::Failure(usage.error());
     }
     return usage.get();
   }

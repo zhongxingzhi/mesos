@@ -116,8 +116,18 @@ JSON::Object model(const Framework& framework)
   object.values["registered_time"] = framework.registeredTime.secs();
   object.values["unregistered_time"] = framework.unregisteredTime.secs();
   object.values["active"] = framework.active;
-  object.values["resources"] = model(framework.resources);
+
+  // TODO(bmahler): Consider deprecating this in favor of the split
+  // used and offered resources below.
+  object.values["resources"] =
+    model(framework.usedResources + framework.offeredResources);
+
+  // TODO(bmahler): Use these in the webui.
+  object.values["used_resources"] = model(framework.usedResources);
+  object.values["offered_resources"] = model(framework.offeredResources);
+
   object.values["hostname"] = framework.info.hostname();
+  object.values["webui_url"] = framework.info.webui_url();
 
   // TODO(benh): Consider making reregisteredTime an Option.
   if (framework.registeredTime != framework.reregisteredTime) {
@@ -179,6 +189,7 @@ JSON::Object model(const Slave& slave)
 
   object.values["resources"] = model(slave.info.resources());
   object.values["attributes"] = model(slave.info.attributes());
+  object.values["active"] = slave.active;
   return object;
 }
 
@@ -235,7 +246,7 @@ const string Master::Http::OBSERVE_HELP = HELP(
         "",
         "The following fields should be supplied in a POST:",
         "1. " + MONITOR_KEY + " - name of the monitor that is being reported",
-        "2. " + HOSTS_KEY + " - comma seperated list of hosts",
+        "2. " + HOSTS_KEY + " - comma separated list of hosts",
         "3. " + LEVEL_KEY + " - OK for healthy, anything else for unhealthy"));
 
 
@@ -366,7 +377,7 @@ Future<Response> Master::Http::stats(const Request& request)
   object.values["uptime"] = (Clock::now() - master->startTime).secs();
   object.values["elected"] = master->elected() ? 1 : 0;
   object.values["total_schedulers"] = master->frameworks.registered.size();
-  object.values["active_schedulers"] = master->getActiveFrameworks().size();
+  object.values["active_schedulers"] = master->_frameworks_active();
   object.values["activated_slaves"] = master->_slaves_active();
   object.values["deactivated_slaves"] = master->_slaves_inactive();
   object.values["outstanding_offers"] = master->offers.size();
@@ -405,21 +416,27 @@ Future<Response> Master::Http::stats(const Request& request)
         totalResources += resource;
       }
     }
-    foreach (const Resource& resource, slave->resourcesInUse) {
-      if (resource.type() == Value::SCALAR) {
-        usedResources += resource;
+    foreachvalue (const Resources& resources, slave->usedResources) {
+      foreach (const Resource& resource, resources) {
+        if (resource.type() == Value::SCALAR) {
+          usedResources += resource;
+        }
       }
     }
   }
 
   foreach (const Resource& resource, totalResources) {
     CHECK(resource.has_scalar());
+
     double total = resource.scalar().value();
     object.values[resource.name() + "_total"] = total;
-    Option<Resource> option = usedResources.get(resource);
-    CHECK(!option.isSome() || option.get().has_scalar());
-    double used = option.isSome() ? option.get().scalar().value() : 0.0;
+
+    Option<Value::Scalar> _used =
+      usedResources.get<Value::Scalar>(resource.name());
+
+    double used = _used.isSome() ? _used.get().value() : 0.0;
     object.values[resource.name() + "_used"] = used;
+
     double percent = used / total;
     object.values[resource.name() + "_percent"] = percent;
   }

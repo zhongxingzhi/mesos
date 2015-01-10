@@ -31,6 +31,7 @@
 
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
+#include <stout/lambda.hpp>
 #include <stout/none.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
@@ -72,12 +73,12 @@ struct StatusUpdateStream;
 class StatusUpdateManager
 {
 public:
-  StatusUpdateManager();
+  StatusUpdateManager(const Flags& flags);
   virtual ~StatusUpdateManager();
 
-  void initialize(
-      const Flags& flags,
-      const process::PID<Slave>& slave);
+  // Expects a callback 'forward' which gets called whenever there is
+  // a new status update that needs to be forwarded to the master.
+  void initialize(const lambda::function<void(StatusUpdate)>& forward);
 
   // TODO(vinod): Come up with better names/signatures for the
   // checkpointing and non-checkpointing 'update()' functions.
@@ -117,13 +118,16 @@ public:
       const std::string& rootDir,
       const Option<state::SlaveState>& state);
 
-  // TODO(vinod): Remove this hack once the new leader detector code is merged.
-  void newMasterDetected(const process::UPID& pid);
 
-  // Resend all the pending updates right away.
+  // Pause sending updates.
+  // This is useful when the slave is disconnected because a
+  // disconnected slave will drop the updates.
+  void pause();
+
+  // Unpause and resend all the pending updates right away.
   // This is useful when the updates were pending because there was
   // no master elected (e.g., during recovery) or framework failed over.
-  void flush();
+  void resume();
 
   // Closes all the status update streams corresponding to this framework.
   // NOTE: This stops retrying any pending status updates for this framework.
@@ -179,7 +183,7 @@ struct StatusUpdateStream
       // Open the updates file.
       Try<int> result = os::open(
           path.get(),
-          O_CREAT | O_WRONLY | O_APPEND | O_SYNC,
+          O_CREAT | O_WRONLY | O_APPEND | O_SYNC | O_CLOEXEC,
           S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
 
       if (result.isError()) {

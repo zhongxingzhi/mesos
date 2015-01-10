@@ -49,8 +49,14 @@
 #include "master/registrar.hpp"
 #include "master/repairer.hpp"
 
-#include "slave/containerizer/containerizer.hpp"
+#include "module/manager.hpp"
+
+#include "slave/gc.hpp"
 #include "slave/slave.hpp"
+#include "slave/status_update_manager.hpp"
+
+#include "slave/containerizer/containerizer.hpp"
+#include "slave/containerizer/fetcher.hpp"
 
 #include "state/in_memory.hpp"
 #include "state/log.hpp"
@@ -70,7 +76,10 @@ using mesos::internal::master::Registrar;
 using mesos::internal::master::Repairer;
 
 using mesos::internal::slave::Containerizer;
+using mesos::internal::slave::Fetcher;
+using mesos::internal::slave::GarbageCollector;
 using mesos::internal::slave::Slave;
+using mesos::internal::slave::StatusUpdateManager;
 
 using process::Owned;
 using process::PID;
@@ -100,6 +109,9 @@ static StandaloneMasterDetector* detector = NULL;
 static MasterContender* contender = NULL;
 static Option<Authorizer*> authorizer = None();
 static Files* files = NULL;
+static vector<GarbageCollector*>* garbageCollectors = NULL;
+static vector<StatusUpdateManager*>* statusUpdateManagers = NULL;
+static vector<Fetcher*>* fetchers = NULL;
 
 
 PID<Master> launch(const Flags& flags, Allocator* _allocator)
@@ -127,6 +139,15 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
     if (load.isError()) {
       EXIT(1) << "Failed to start a local cluster while loading "
               << "master flags from the environment: " << load.error();
+    }
+
+    // Load modules. Note that this covers both, master and slave
+    // specific modules as both use the same flag (--modules).
+    if (flags.modules.isSome()) {
+      Try<Nothing> result = modules::ModuleManager::load(flags.modules.get());
+      if (result.isError()) {
+        EXIT(1) << "Error loading modules: " << result.error();
+      }
     }
 
     if (flags.registry == "in_memory") {
@@ -193,6 +214,10 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
   PID<Master> pid = process::spawn(master);
 
+  garbageCollectors = new vector<GarbageCollector*>();
+  statusUpdateManagers = new vector<StatusUpdateManager*>();
+  fetchers = new vector<Fetcher*>();
+
   vector<UPID> pids;
 
   for (int i = 0; i < flags.num_slaves; i++) {
@@ -204,7 +229,13 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
               << "slave flags from the environment: " << load.error();
     }
 
-    Try<Containerizer*> containerizer = Containerizer::create(flags, true);
+    garbageCollectors->push_back(new GarbageCollector());
+    statusUpdateManagers->push_back(new StatusUpdateManager(flags));
+    fetchers->push_back(new Fetcher());
+
+    Try<Containerizer*> containerizer =
+      Containerizer::create(flags, true, fetchers->back());
+
     if (containerizer.isError()) {
       EXIT(1) << "Failed to create a containerizer: " << containerizer.error();
     }
@@ -214,8 +245,16 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
     // NOTE: At this point detector is already initialized by the
     // Master.
-    Slave* slave = new Slave(flags, detector, containerizer.get(), files);
+    Slave* slave = new Slave(
+        flags,
+        detector,
+        containerizer.get(),
+        files,
+        garbageCollectors->back(),
+        statusUpdateManagers->back());
+
     slaves[containerizer.get()] = slave;
+
     pids.push_back(process::spawn(slave));
   }
 
@@ -261,6 +300,27 @@ void shutdown()
 
     delete files;
     files = NULL;
+
+    foreach (GarbageCollector* gc, *garbageCollectors) {
+      delete gc;
+    }
+
+    delete garbageCollectors;
+    garbageCollectors = NULL;
+
+    foreach (StatusUpdateManager* statusUpdateManager, *statusUpdateManagers) {
+      delete statusUpdateManager;
+    }
+
+    delete statusUpdateManagers;
+    statusUpdateManagers = NULL;
+
+    foreach (Fetcher* fetcher, *fetchers) {
+      delete fetcher;
+    }
+
+    delete fetchers;
+    fetchers = NULL;
 
     delete registrar;
     registrar = NULL;

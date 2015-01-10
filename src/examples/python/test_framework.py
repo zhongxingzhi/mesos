@@ -27,7 +27,7 @@ import mesos.native
 TOTAL_TASKS = 5
 
 TASK_CPUS = 1
-TASK_MEM = 32
+TASK_MEM = 128
 
 class TestScheduler(mesos.interface.Scheduler):
     def __init__(self, executor):
@@ -42,16 +42,30 @@ class TestScheduler(mesos.interface.Scheduler):
         print "Registered with framework ID %s" % frameworkId.value
 
     def resourceOffers(self, driver, offers):
-        print "Got %d resource offers" % len(offers)
         for offer in offers:
             tasks = []
-            print "Got resource offer %s" % offer.id.value
-            if self.tasksLaunched < TOTAL_TASKS:
+            offerCpus = 0
+            offerMem = 0
+            for resource in offer.resources:
+                if resource.name == "cpus":
+                    offerCpus += resource.scalar.value
+                elif resource.name == "mem":
+                    offerMem += resource.scalar.value
+
+            print "Received offer %s with cpus: %s and mem: %s" \
+                  % (offer.id.value, offerCpus, offerMem)
+
+            remainingCpus = offerCpus
+            remainingMem = offerMem
+
+            while self.tasksLaunched < TOTAL_TASKS and \
+                  remainingCpus >= TASK_CPUS and \
+                  remainingMem >= TASK_MEM:
                 tid = self.tasksLaunched
                 self.tasksLaunched += 1
 
-                print "Accepting offer on %s to start task %d" \
-                      % (offer.hostname, tid)
+                print "Launching task %d using offer %s" \
+                      % (tid, offer.id.value)
 
                 task = mesos_pb2.TaskInfo()
                 task.task_id.value = str(tid)
@@ -72,10 +86,15 @@ class TestScheduler(mesos.interface.Scheduler):
                 tasks.append(task)
                 self.taskData[task.task_id.value] = (
                     offer.slave_id, task.executor.executor_id)
+
+                remainingCpus -= TASK_CPUS
+                remainingMem -= TASK_MEM
+
             driver.launchTasks(offer.id, tasks)
 
     def statusUpdate(self, driver, update):
-        print "Task %s is in state %d" % (update.task_id.value, update.state)
+        print "Task %s is in state %s" % \
+            (update.task_id.value, mesos_pb2.TaskState.Name(update.state))
 
         # Ensure the binary data came through.
         if update.data != "data with a \0 byte":
@@ -96,6 +115,13 @@ class TestScheduler(mesos.interface.Scheduler):
                 executor_id,
                 slave_id,
                 'data with a \0 byte')
+
+        if update.state == mesos_pb2.TASK_LOST or \
+           update.state == mesos_pb2.TASK_KILLED or \
+           update.state == mesos_pb2.TASK_FAILED:
+            print "Aborting because task %s is in unexpected state %s with message '%s'" \
+                % (update.task_id.value, mesos_pb2.TaskState.Name(update.state), update.message)
+            driver.abort()
 
     def frameworkMessage(self, driver, executorId, slaveId, message):
         self.messagesReceived += 1

@@ -31,15 +31,19 @@
 #include <stout/strings.hpp>
 
 #include "linux/cgroups.hpp"
+#include "linux/ns.hpp"
 
 #include "mesos/resources.hpp"
 
 #include "slave/containerizer/linux_launcher.hpp"
 
+#include "slave/containerizer/isolators/namespaces/pid.hpp"
+
 using namespace process;
 
 using std::list;
 using std::map;
+using std::set;
 using std::string;
 using std::vector;
 
@@ -75,21 +79,41 @@ Try<Launcher*> LinuxLauncher::create(const Flags& flags)
     return Error("Failed to create Linux launcher: " + hierarchy.error());
   }
 
+  // Ensure that no other subsystem is attached to the hierarchy.
+  Try<set<string> > subsystems = cgroups::subsystems(hierarchy.get());
+  if (subsystems.isError()) {
+    return Error(
+        "Failed to get the list of attached subsystems for hierarchy " +
+        hierarchy.get());
+  } else if (subsystems.get().size() != 1) {
+    return Error(
+        "Unexpected subsystems found attached to the hierarchy " +
+        hierarchy.get());
+  }
+
   LOG(INFO) << "Using " << hierarchy.get()
             << " as the freezer hierarchy for the Linux launcher";
 
-  // TODO(idownes): Inspect the isolation flag to determine namespaces
-  // to use.
   int namespaces = 0;
 
 #ifdef WITH_NETWORK_ISOLATOR
-  // The network port mapping isolator requires network (CLONE_NEWNET)
-  // and mount (CLONE_NEWNS) namespaces.
+  // The network port mapping isolator requires network namespaces
+  // (CLONE_NEWNET).
   if (strings::contains(flags.isolation, "network/port_mapping")) {
     namespaces |= CLONE_NEWNET;
-    namespaces |= CLONE_NEWNS;
   }
 #endif
+
+  if (strings::contains(flags.isolation, "filesystem/shared")) {
+    namespaces |= CLONE_NEWNS;
+  }
+
+  // The pid namespace isolator requires pid and mount namespaces (CLONE_NEWPID
+  // and CLONE_NEWNS).
+  if (strings::contains(flags.isolation, "namespaces/pid")) {
+    namespaces |= CLONE_NEWPID;
+    namespaces |= CLONE_NEWNS;
+  }
 
   return new LinuxLauncher(flags, namespaces, hierarchy.get());
 }
@@ -111,17 +135,6 @@ Future<Nothing> LinuxLauncher::recover(const std::list<state::RunState>& states)
     }
     const ContainerID& containerId = state.id.get();
 
-    Try<bool> exists = cgroups::exists(hierarchy, cgroup(containerId));
-
-    if (!exists.get()) {
-      // This may occur if the freezer cgroup was destroyed but the
-      // slave dies before noticing this. The containerizer will
-      // monitor the container's pid and notice that it has exited,
-      // triggering destruction of the container.
-      LOG(INFO) << "Couldn't find freezer cgroup for container " << containerId;
-      continue;
-    }
-
     if (state.forkedPid.isNone()) {
       return Failure("Executor pid is required to recover container " +
                      stringify(containerId));
@@ -140,7 +153,23 @@ Future<Nothing> LinuxLauncher::recover(const std::list<state::RunState>& states)
                      " for container " + stringify(containerId));
     }
 
+    // Store the pid now because if the freezer cgroup is absent
+    // (slave terminated after the cgroup is destroyed but before it
+    // was notified) then we'll still need it for the check in
+    // destroy() when we clean up.
     pids.put(containerId, pid);
+
+    Try<bool> exists = cgroups::exists(hierarchy, cgroup(containerId));
+
+    if (!exists.get()) {
+      // This may occur if the freezer cgroup was destroyed but the
+      // slave dies before noticing this. The containerizer will
+      // monitor the container's pid and notice that it has exited,
+      // triggering destruction of the container.
+      LOG(INFO) << "Couldn't find freezer cgroup for container "
+                << containerId << ", assuming already destroyed";
+      continue;
+    }
 
     cgroups.insert(cgroup(containerId));
   }
@@ -192,8 +221,8 @@ static pid_t clone(const lambda::function<int()>& func, int namespaces)
 
   return ::clone(
       childMain,
-      &stack[sizeof(stack)/sizeof(stack[0]) - 1],  // stack grows down
-      namespaces | SIGCHLD,   // Specify SIGCHLD as child termination signal
+      &stack[sizeof(stack)/sizeof(stack[0]) - 1],  // stack grows down.
+      namespaces | SIGCHLD,   // Specify SIGCHLD as child termination signal.
       (void*) &func);
 }
 
@@ -323,8 +352,6 @@ Try<pid_t> LinuxLauncher::fork(
     return Error("Failed to synchronize child process");
   }
 
-  // Store the pid (session id and process group id) if this is the
-  // first process forked for this container.
   if (!pids.contains(containerId)) {
     pids.put(containerId, child.get().pid());
   }
@@ -333,26 +360,47 @@ Try<pid_t> LinuxLauncher::fork(
 }
 
 
-Future<Nothing> _destroy(
-    const ContainerID& containerId,
-    const process::Future<Nothing>& destroyed)
-{
-  if (!destroyed.isReady()) {
-    return Failure("Failed to destroy launcher: " +
-                   (destroyed.isFailed() ? destroyed.failure() : "discarded"));
-  }
-
-  return Nothing();
-}
-
-
 Future<Nothing> LinuxLauncher::destroy(const ContainerID& containerId)
 {
+  if (!pids.contains(containerId)) {
+    return Failure("Unknown container");
+  }
+
   pids.erase(containerId);
 
+  // Just return if the cgroup was destroyed and the slave didn't receive the
+  // notification. See comment in recover().
+  Try<bool> exists = cgroups::exists(hierarchy, cgroup(containerId));
+  if (exists.isError()) {
+    return Failure("Failed to check existence of freezer cgroup: " +
+                   exists.error());
+  }
+
+  if (!exists.get()) {
+    return Nothing();
+  }
+
+  Result<ino_t> containerPidNs =
+    NamespacesPidIsolatorProcess::getNamespace(containerId);
+
+  if (containerPidNs.isSome()) {
+    LOG(INFO) << "Using pid namespace to destroy container " << containerId;
+
+    return ns::pid::destroy(containerPidNs.get())
+      .then(lambda::bind(
+            (Future<Nothing>(*)(const string&,
+                                const string&,
+                                const Duration&))(&cgroups::destroy),
+            hierarchy,
+            cgroup(containerId),
+            cgroups::DESTROY_TIMEOUT));
+  }
+
+  // Try to clean up using just the freezer cgroup.
   return cgroups::destroy(
-      hierarchy, cgroup(containerId), cgroups::DESTROY_TIMEOUT)
-    .onAny(lambda::bind(&_destroy, containerId, lambda::_1));
+      hierarchy,
+      cgroup(containerId),
+      cgroups::DESTROY_TIMEOUT);
 }
 
 

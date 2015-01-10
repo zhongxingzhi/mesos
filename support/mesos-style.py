@@ -17,10 +17,13 @@ active_rules = ['build/class',
                 'runtime/vlog',
                 'whitespace/blank_line',
                 'whitespace/comma',
+                'whitespace/end_of_line',
                 'whitespace/ending_newline',
                 'whitespace/forcolon',
                 'whitespace/indent',
                 'whitespace/line_length',
+                'whitespace/operators',
+                'whitespace/semicolon',
                 'whitespace/tab',
                 'whitespace/todo']
 

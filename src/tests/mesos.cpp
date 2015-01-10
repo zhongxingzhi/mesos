@@ -48,6 +48,8 @@
 #include "tests/mesos.hpp"
 
 using std::string;
+using testing::_;
+using testing::Invoke;
 
 using namespace process;
 
@@ -99,7 +101,7 @@ master::Flags MesosTest::CreateMasterFlags()
 
   CHECK_SOME(fd);
 
-  // JSON default format for credentials
+  // JSON default format for credentials.
   Credentials credentials;
   Credential* credential = credentials.add_credentials();
   credential->set_principal(DEFAULT_CREDENTIAL.principal());
@@ -120,6 +122,8 @@ master::Flags MesosTest::CreateMasterFlags()
 
   // On many test VMs, this default is too small.
   flags.registry_store_timeout = flags.registry_store_timeout * 5;
+
+  flags.authenticators = tests::flags.authenticators;
 
   return flags;
 }
@@ -168,6 +172,10 @@ slave::Flags MesosTest::CreateSlaveFlags()
   // Make sure that the slave uses the same 'docker' as the tests.
   flags.docker = tests::flags.docker;
 
+  if (tests::flags.isolation.isSome()) {
+    flags.isolation = tests::flags.isolation.get();
+  }
+
   return flags;
 }
 
@@ -185,7 +193,8 @@ Try<process::PID<master::Master> > MesosTest::StartMaster(
     const Option<master::Flags>& flags)
 {
   return cluster.masters.start(
-      allocator, flags.isNone() ? CreateMasterFlags() : flags.get());
+      flags.isNone() ? CreateMasterFlags() : flags.get(),
+      allocator);
 }
 
 
@@ -194,7 +203,9 @@ Try<process::PID<master::Master> > MesosTest::StartMaster(
     const Option<master::Flags>& flags)
 {
   return cluster.masters.start(
-      authorizer, flags.isNone() ? CreateMasterFlags() : flags.get());
+      flags.isNone() ? CreateMasterFlags() : flags.get(),
+      None(),
+      authorizer);
 }
 
 
@@ -230,7 +241,8 @@ Try<process::PID<slave::Slave> > MesosTest::StartSlave(
     const Option<slave::Flags>& flags)
 {
   return cluster.slaves.start(
-      containerizer, flags.isNone() ? CreateSlaveFlags() : flags.get());
+      flags.isNone() ? CreateSlaveFlags() : flags.get(),
+      containerizer);
 }
 
 
@@ -240,9 +252,9 @@ Try<process::PID<slave::Slave> > MesosTest::StartSlave(
     const Option<slave::Flags>& flags)
 {
   return cluster.slaves.start(
+      flags.isNone() ? CreateSlaveFlags() : flags.get(),
       containerizer,
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get());
+      detector);
 }
 
 
@@ -251,7 +263,22 @@ Try<PID<slave::Slave> > MesosTest::StartSlave(
     const Option<slave::Flags>& flags)
 {
   return cluster.slaves.start(
-      detector, flags.isNone() ? CreateSlaveFlags() : flags.get());
+      flags.isNone() ? CreateSlaveFlags() : flags.get(),
+      None(),
+      detector);
+}
+
+
+Try<PID<slave::Slave> > MesosTest::StartSlave(
+    MasterDetector* detector,
+    slave::GarbageCollector* gc,
+    const Option<slave::Flags>& flags)
+{
+  return cluster.slaves.start(
+      flags.isNone() ? CreateSlaveFlags() : flags.get(),
+      None(),
+      detector,
+      gc);
 }
 
 
@@ -263,9 +290,9 @@ Try<PID<slave::Slave> > MesosTest::StartSlave(
   slave::Containerizer* containerizer = new TestContainerizer(executor);
 
   Try<process::PID<slave::Slave> > pid = cluster.slaves.start(
-      containerizer,
-      detector,
-      flags.isNone() ? CreateSlaveFlags() : flags.get());
+      flags.isNone() ? CreateSlaveFlags() : flags.get(),
+          containerizer,
+      detector);
 
   if (pid.isError()) {
     delete containerizer;
@@ -319,9 +346,82 @@ void MesosTest::ShutdownSlaves()
 }
 
 
+MockSlave::MockSlave(const slave::Flags& flags,
+                     MasterDetector* detector,
+                     slave::Containerizer* containerizer)
+  : slave::Slave(
+      flags,
+      detector,
+      containerizer,
+      &files,
+      &gc,
+      statusUpdateManager = new slave::StatusUpdateManager(flags))
+{
+  // Set up default behaviors, calling the original methods.
+  EXPECT_CALL(*this, runTask(_, _, _, _, _)).
+      WillRepeatedly(Invoke(this, &MockSlave::unmocked_runTask));
+  EXPECT_CALL(*this, _runTask(_, _, _, _, _)).
+      WillRepeatedly(Invoke(this, &MockSlave::unmocked__runTask));
+  EXPECT_CALL(*this, killTask(_, _, _)).
+      WillRepeatedly(Invoke(this, &MockSlave::unmocked_killTask));
+  EXPECT_CALL(*this, removeFramework(_)).
+      WillRepeatedly(Invoke(this, &MockSlave::unmocked_removeFramework));
+}
+
+
+MockSlave::~MockSlave()
+{
+  delete statusUpdateManager;
+}
+
+
+void MockSlave::unmocked_runTask(
+    const process::UPID& from,
+    const FrameworkInfo& frameworkInfo,
+    const FrameworkID& frameworkId,
+    const std::string& pid,
+    const TaskInfo& task)
+{
+  slave::Slave::runTask(from, frameworkInfo, frameworkId, pid, task);
+}
+
+
+void MockSlave::unmocked__runTask(
+      const process::Future<bool>& future,
+      const FrameworkInfo& frameworkInfo,
+      const FrameworkID& frameworkId,
+      const std::string& pid,
+      const TaskInfo& task)
+{
+  slave::Slave::_runTask(future, frameworkInfo, frameworkId, pid, task);
+}
+
+
+void MockSlave::unmocked_killTask(
+      const process::UPID& from,
+      const FrameworkID& frameworkId,
+      const TaskID& taskId)
+{
+  slave::Slave::killTask(from, frameworkId, taskId);
+}
+
+
+void MockSlave::unmocked_removeFramework(slave::Framework* framework)
+{
+  slave::Slave::removeFramework(framework);
+}
+
+
 slave::Flags ContainerizerTest<slave::MesosContainerizer>::CreateSlaveFlags()
 {
   slave::Flags flags = MesosTest::CreateSlaveFlags();
+
+  // If the user has specified isolation on command-line, we better
+  // use it.
+  if (tests::flags.isolation.isSome()) {
+    flags.isolation = tests::flags.isolation.get();
+    return flags;
+  }
 
 #ifdef __linux__
   Result<string> user = os::user();
@@ -474,7 +574,7 @@ void ContainerizerTest<slave::MesosContainerizer>::TearDown()
       CHECK_SOME(cgroups);
 
       foreach (const string& cgroup, cgroups.get()) {
-        // Remove any cgroups that start with TEST_CGROUPS_ROOT
+        // Remove any cgroups that start with TEST_CGROUPS_ROOT.
         if (strings::startsWith(cgroup, TEST_CGROUPS_ROOT)) {
           AWAIT_READY(cgroups::destroy(hierarchy, cgroup));
         }

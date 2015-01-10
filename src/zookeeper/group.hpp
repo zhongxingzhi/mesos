@@ -7,6 +7,7 @@
 
 #include "process/future.hpp"
 #include "process/timer.hpp"
+#include "process/process.hpp"
 
 #include <stout/check.hpp>
 #include <stout/duration.hpp>
@@ -131,7 +132,9 @@ public:
 
   // Returns the result of trying to fetch the data associated with a
   // group membership.
-  process::Future<std::string> data(const Membership& membership);
+  // A None is returned if the specified membership doesn't exist,
+  // e.g., it can be removed before this call can read it content.
+  process::Future<Option<std::string> > data(const Membership& membership);
 
   // Returns a future that gets set when the group memberships differ
   // from the "expected" memberships specified.
@@ -173,7 +176,8 @@ public:
       const std::string& data,
       const Option<std::string>& label);
   process::Future<bool> cancel(const Group::Membership& membership);
-  process::Future<std::string> data(const Group::Membership& membership);
+  process::Future<Option<std::string> > data(
+      const Group::Membership& membership);
   process::Future<std::set<Group::Membership> > watch(
       const std::set<Group::Membership>& expected);
   process::Future<Option<int64_t> > session();
@@ -192,7 +196,7 @@ private:
       const std::string& data,
       const Option<std::string>& label);
   Result<bool> doCancel(const Group::Membership& membership);
-  Result<std::string> doData(const Group::Membership& membership);
+  Result<Option<std::string> > doData(const Group::Membership& membership);
 
   // Returns true if authentication is successful, false if the
   // failure is retryable and Error otherwise.
@@ -287,7 +291,7 @@ private:
     explicit Data(const Group::Membership& _membership)
       : membership(_membership) {}
     Group::Membership membership;
-    process::Promise<std::string> promise;
+    process::Promise<Option<std::string> > promise;
   };
 
   struct Watch

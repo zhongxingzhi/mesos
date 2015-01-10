@@ -128,6 +128,9 @@ private:
 
   void start()
   {
+    VLOG(2) << "Starting to wait for enough quorum of replicas before running "
+            << "recovery protocol, expected quroum size: " << stringify(quorum);
+
     // Wait until there are enough (i.e., quorum of) replicas in the
     // network to avoid unnecessary retries.
     chain = network->watch(quorum, Network::GREATER_THAN_OR_EQUAL_TO)
@@ -139,6 +142,8 @@ private:
 
   Future<Nothing> broadcast()
   {
+    VLOG(2) << "Broadcasting recover request to all replicas";
+
     // Broadcast recover request to all replicas.
     return network->broadcast(protocol::recover, RecoverRequest())
       .then(defer(self(), &Self::broadcasted, lambda::_1));
@@ -146,6 +151,8 @@ private:
 
   Future<Nothing> broadcasted(const set<Future<RecoverResponse> >& _responses)
   {
+    VLOG(2) << "Broadcast request completed";
+
     responses = _responses;
 
     // Reset the counters.
@@ -221,6 +228,13 @@ private:
       return result;
     }
 
+    // TODO(jieyu): Currently, we simply calculate the size of the
+    // cluster from the quorum size. In the future, we may want to
+    // allow users to specify the cluster size in case they want to
+    // use a non-standard quorum size (e.g., cluster size = 5, quorum
+    // size = 4).
+    size_t clusterSize = (2 * quorum) - 1;
+
     if (autoInitialize) {
       // The following code handles the auto-initialization. Our idea
       // is: we allow a replica in EMPTY status to become VOTING
@@ -249,14 +263,6 @@ private:
       // way, in our previous example, all replicas will be in
       // STARTING status before any of them can transit to VOTING
       // status.
-
-      // TODO(jieyu): Currently, we simply calculate the size of the
-      // cluster from the quorum size. In the future, we may wanna
-      // allow users to specify the cluster size in case they want to
-      // use a non-standard quorum size (e.g., cluster size = 5,
-      // quorum size = 4).
-      size_t clusterSize = (2 * quorum) - 1;
-
       switch (status) {
         case Metadata::EMPTY:
           if ((responsesReceived[Metadata::EMPTY] +
@@ -284,6 +290,19 @@ private:
           // Ignore all other cases.
           break;
       }
+    } else {
+      // Since auto initialization is disabled, we print an advisory
+      // message to remind the user to initialize the log manually.
+      if (responsesReceived[Metadata::EMPTY] >= clusterSize) {
+        LOG(WARNING) << "\n"
+                     << "----------------------------------------------------\n"
+                     << "Replicated log has not been initialized. Did you\n"
+                     << "forget to manually initialize the log (i.e.,\n"
+                     << "mesos-log initialize --path=<PATH>)? Note that all\n"
+                     << "replicas are not initialized and the above command\n"
+                     << "needs to be run on each host!\n"
+                     << "----------------------------------------------------";
+      }
     }
 
     // Handle the next response.
@@ -301,6 +320,8 @@ private:
         promise.discard();
         terminate(self());
       } else {
+        VLOG(2) << "Log recovery timed out waiting for responses, retrying";
+
         start(); // Re-run the recover protocol after timeout.
       }
     } else if (future.isFailed()) {
@@ -314,6 +335,9 @@ private:
       // request while it is changing its status).
       static const Duration T = Milliseconds(500);
       Duration d = T * (1.0 + (double) ::random() / RAND_MAX);
+      VLOG(2) << "Didn't receive enough responses for recovery, retrying "
+              << "in " << stringify(d);
+
       delay(d, self(), &Self::start);
     } else {
       promise.set(future.get().get());

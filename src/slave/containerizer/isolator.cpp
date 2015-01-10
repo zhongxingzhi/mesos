@@ -52,12 +52,16 @@ Future<Nothing> Isolator::recover(const list<state::RunState>& state)
 
 Future<Option<CommandInfo> > Isolator::prepare(
     const ContainerID& containerId,
-    const ExecutorInfo& executorInfo)
+    const ExecutorInfo& executorInfo,
+    const string& directory,
+    const Option<string>& user)
 {
   return dispatch(process.get(),
                   &IsolatorProcess::prepare,
                   containerId,
-                  executorInfo);
+                  executorInfo,
+                  directory,
+                  user);
 }
 
 

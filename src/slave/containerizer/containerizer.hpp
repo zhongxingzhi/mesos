@@ -35,6 +35,7 @@
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
+#include "slave/containerizer/fetcher.hpp"
 
 namespace mesos {
 namespace internal {
@@ -55,7 +56,10 @@ class Containerizer
 {
 public:
   // Attempts to create a containerizer as specified by 'isolation' in flags.
-  static Try<Containerizer*> create(const Flags& flags, bool local);
+  static Try<Containerizer*> create(
+      const Flags& flags,
+      bool local,
+      Fetcher* fetcher);
 
   // Determine slave resources from flags, probing the system or querying a
   // delegate.
@@ -133,14 +137,6 @@ std::map<std::string, std::string> executorEnvironment(
     const process::PID<Slave>& slavePid,
     bool checkpoint,
     const Duration& recoveryTimeout);
-
-
-std::map<std::string, std::string> fetcherEnvironment(
-    const CommandInfo& commandInfo,
-    const std::string& directory,
-    const Option<std::string>& user,
-    const Flags& flags);
-
 
 } // namespace slave {
 } // namespace internal {

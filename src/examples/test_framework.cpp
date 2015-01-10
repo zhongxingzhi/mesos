@@ -33,6 +33,8 @@
 #include <stout/os.hpp>
 #include <stout/stringify.hpp>
 
+#include "common/type_utils.hpp"
+
 #include "logging/flags.hpp"
 
 using namespace mesos;
@@ -49,7 +51,7 @@ using std::vector;
 using mesos::Resources;
 
 const int32_t CPUS_PER_TASK = 1;
-const int32_t MEM_PER_TASK = 32;
+const int32_t MEM_PER_TASK = 128;
 
 class TestScheduler : public Scheduler
 {
@@ -77,9 +79,9 @@ public:
   virtual void resourceOffers(SchedulerDriver* driver,
                               const vector<Offer>& offers)
   {
-    cout << "." << flush;
-    for (size_t i = 0; i < offers.size(); i++) {
-      const Offer& offer = offers[i];
+    foreach (const Offer& offer, offers) {
+      cout << "Received offer " << offer.id() << " with " << offer.resources()
+           << endl;
 
       static const Resources TASK_RESOURCES = Resources::parse(
           "cpus:" + stringify(CPUS_PER_TASK) +
@@ -90,11 +92,11 @@ public:
       // Launch tasks.
       vector<TaskInfo> tasks;
       while (tasksLaunched < totalTasks &&
-             TASK_RESOURCES <= remaining.flatten()) {
+             remaining.flatten().contains(TASK_RESOURCES)) {
         int taskId = tasksLaunched++;
 
-        cout << "Starting task " << taskId << " on "
-             << offer.hostname() << endl;
+        cout << "Launching task " << taskId << " using offer "
+             << offer.id() << endl;
 
         TaskInfo task;
         task.set_name("Task " + lexical_cast<string>(taskId));
@@ -102,7 +104,9 @@ public:
         task.mutable_slave_id()->MergeFrom(offer.slave_id());
         task.mutable_executor()->MergeFrom(executor);
 
-        Option<Resources> resources = remaining.find(TASK_RESOURCES, role);
+        Option<Resources> resources =
+          remaining.find(TASK_RESOURCES.flatten(role));
+
         CHECK_SOME(resources);
         task.mutable_resources()->MergeFrom(resources.get());
         remaining -= resources.get();
@@ -125,6 +129,18 @@ public:
 
     if (status.state() == TASK_FINISHED)
       tasksFinished++;
+
+    if (status.state() == TASK_LOST ||
+        status.state() == TASK_KILLED ||
+        status.state() == TASK_FAILED) {
+      cout << "Aborting because task " << taskId
+           << " is in unexpected state " << status.state()
+           << " with reason " << status.reason()
+           << " from source " << status.source()
+           << " with message '" << status.message() << "'"
+           << endl;
+      driver->abort();
+    }
 
     if (tasksFinished == totalTasks)
       driver->stop();

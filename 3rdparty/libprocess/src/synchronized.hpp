@@ -1,3 +1,6 @@
+#ifndef __SYNCHRONIZABLE_HPP__
+#define __SYNCHRONIZABLE_HPP__
+
 #include <pthread.h>
 
 #include <iostream>
@@ -31,8 +34,7 @@ public:
   void acquire()
   {
     if (!initialized) {
-      std::cerr << "synchronizable not initialized" << std::endl;
-      abort();
+      ABORT("synchronizable not initialized");
     }
     pthread_mutex_lock(&mutex);
   }
@@ -40,8 +42,7 @@ public:
   void release()
   {
     if (!initialized) {
-      std::cerr << "synchronizable not initialized" << std::endl;
-      abort();
+      ABORT("synchronizable not initialized");
     }
     pthread_mutex_unlock(&mutex);
   }
@@ -57,8 +58,7 @@ private:
       pthread_mutexattr_destroy(&attr);
       initialized = true;
     } else {
-      std::cerr << "synchronizable already initialized" << std::endl;
-      abort();
+      ABORT("synchronizable already initialized");
     }
   }
 
@@ -107,3 +107,5 @@ private:
 
 #define SYNCHRONIZED_INITIALIZER_RECURSIVE      \
   Synchronizable(PTHREAD_MUTEX_RECURSIVE)
+
+#endif // __SYNCHRONIZABLE_HPP__

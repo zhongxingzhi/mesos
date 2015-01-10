@@ -19,27 +19,17 @@
 #ifndef __CPUSHARE_ISOLATOR_HPP__
 #define __CPUSHARE_ISOLATOR_HPP__
 
-#include <mesos/resources.hpp>
-
-#include <process/future.hpp>
+#include <string>
 
 #include <stout/hashmap.hpp>
-#include <stout/try.hpp>
 
 #include "slave/containerizer/isolator.hpp"
 
-#include "slave/flags.hpp"
+#include "slave/containerizer/isolators/cgroups/constants.hpp"
 
 namespace mesos {
 namespace internal {
 namespace slave {
-
-// CPU subsystem constants.
-const uint64_t CPU_SHARES_PER_CPU = 1024;
-const uint64_t MIN_CPU_SHARES = 10;
-const Duration CPU_CFS_PERIOD = Milliseconds(100); // Linux default.
-const Duration MIN_CPU_CFS_QUOTA = Milliseconds(1);
-
 
 // Use the Linux cpu cgroup controller for cpu isolation which uses the
 // Completely Fair Scheduler (CFS).
@@ -57,7 +47,9 @@ public:
 
   virtual process::Future<Option<CommandInfo> > prepare(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo);
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const Option<std::string>& user);
 
   virtual process::Future<Nothing> isolate(
       const ContainerID& containerId,
@@ -79,7 +71,8 @@ public:
 private:
   CgroupsCpushareIsolatorProcess(
       const Flags& flags,
-      const hashmap<std::string, std::string>& hierarchies);
+      const hashmap<std::string, std::string>& hierarchies,
+      const std::vector<std::string>& subsystems);
 
   virtual process::Future<std::list<Nothing> > _cleanup(
       const ContainerID& containerId,
@@ -101,6 +94,12 @@ private:
 
   // Map from subsystem to hierarchy.
   hashmap<std::string, std::string> hierarchies;
+
+  // Subsystems used for this isolator. Typically, there are two
+  // elements in the vector: 'cpu' and 'cpuacct'. If cpu and cpuacct
+  // systems are co-mounted (e.g., systems using systemd), then there
+  // will be only one element in the vector which is 'cpu,cpuacct'.
+  std::vector<std::string> subsystems;
 
   // TODO(bmahler): Use Owned<Info>.
   hashmap<ContainerID, Info*> infos;

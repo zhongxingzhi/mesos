@@ -19,7 +19,6 @@
 #endif
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <fts.h>
 #include <glob.h>
 #include <libgen.h>
@@ -65,14 +64,18 @@
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 #include <stout/unreachable.hpp>
+#include <stout/version.hpp>
 
+#include <stout/os/close.hpp>
 #include <stout/os/exists.hpp>
+#include <stout/os/fcntl.hpp>
 #include <stout/os/fork.hpp>
 #include <stout/os/killtree.hpp>
 #ifdef __linux__
 #include <stout/os/linux.hpp>
 #endif // __linux__
 #include <stout/os/ls.hpp>
+#include <stout/os/open.hpp>
 #ifdef __APPLE__
 #include <stout/os/osx.hpp>
 #endif // __APPLE__
@@ -205,72 +208,6 @@ inline Try<bool> access(const std::string& path, int how)
     }
   }
   return true;
-}
-
-
-inline Try<int> open(const std::string& path, int oflag, mode_t mode = 0)
-{
-  int fd = ::open(path.c_str(), oflag, mode);
-
-  if (fd < 0) {
-    return ErrnoError();
-  }
-
-  return fd;
-}
-
-
-inline Try<Nothing> close(int fd)
-{
-  if (::close(fd) != 0) {
-    return ErrnoError();
-  }
-
-  return Nothing();
-}
-
-
-inline Try<Nothing> cloexec(int fd)
-{
-  int flags = ::fcntl(fd, F_GETFD);
-
-  if (flags == -1) {
-    return ErrnoError();
-  }
-
-  if (::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
-    return ErrnoError();
-  }
-
-  return Nothing();
-}
-
-
-inline Try<Nothing> nonblock(int fd)
-{
-  int flags = ::fcntl(fd, F_GETFL);
-
-  if (flags == -1) {
-    return ErrnoError();
-  }
-
-  if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-    return ErrnoError();
-  }
-
-  return Nothing();
-}
-
-
-inline Try<bool> isNonblock(int fd)
-{
-  int flags = ::fcntl(fd, F_GETFL);
-
-  if (flags == -1) {
-    return ErrnoError();
-  }
-
-  return (flags & O_NONBLOCK) != 0;
 }
 
 
@@ -615,8 +552,36 @@ inline int execvpe(const char* file, char** argv, char** envp)
 }
 
 
+inline Try<Nothing> chown(
+    uid_t uid,
+    gid_t gid,
+    const std::string& path,
+    bool recursive)
+{
+  if (recursive) {
+    // TODO(bmahler): Consider walking the file tree instead. We would need
+    // to be careful to not miss dotfiles.
+    std::string command =
+      "chown -R " + stringify(uid) + ':' + stringify(gid) + " '" + path + "'";
+
+    int status = os::system(command);
+    if (status != 0) {
+      return ErrnoError(
+          "Failed to execute '" + command +
+          "' (exit status: " + stringify(status) + ")");
+    }
+  } else {
+    if (::chown(path.c_str(), uid, gid) < 0) {
+      return ErrnoError();
+    }
+  }
+
+  return Nothing();
+}
+
+
 // Changes the specified path's user and group ownership to that of
-// the specified user..
+// the specified user.
 inline Try<Nothing> chown(
     const std::string& user,
     const std::string& path,
@@ -627,25 +592,7 @@ inline Try<Nothing> chown(
     return ErrnoError("Failed to get user information for '" + user + "'");
   }
 
-  if (recursive) {
-    // TODO(bmahler): Consider walking the file tree instead. We would need
-    // to be careful to not miss dotfiles.
-    std::string command = "chown -R " + stringify(passwd->pw_uid) + ':' +
-      stringify(passwd->pw_gid) + " '" + path + "'";
-
-    int status = os::system(command);
-    if (status != 0) {
-      return ErrnoError(
-          "Failed to execute '" + command +
-          "' (exit status: " + stringify(status) + ")");
-    }
-  } else {
-    if (::chown(path.c_str(), passwd->pw_uid, passwd->pw_gid) < 0) {
-      return ErrnoError();
-    }
-  }
-
-  return Nothing();
+  return chown(passwd->pw_uid, passwd->pw_gid, path, recursive);
 }
 
 
@@ -720,7 +667,7 @@ inline Result<uid_t> getuid(const Option<std::string>& user = None())
     }
   }
 
-  return Result<uid_t>(UNREACHABLE());
+  UNREACHABLE();
 }
 
 
@@ -775,7 +722,7 @@ inline Result<gid_t> getgid(const Option<std::string>& user = None())
     }
   }
 
-  return Result<gid_t>(UNREACHABLE());
+  UNREACHABLE();
 }
 
 
@@ -907,41 +854,6 @@ inline Result<std::string> user(Option<uid_t> uid = None())
       delete[] buffer;
     }
   }
-}
-
-
-inline Try<std::string> hostname()
-{
-  char host[512];
-
-  if (gethostname(host, sizeof(host)) < 0) {
-    return ErrnoError();
-  }
-
-  // Allocate temporary buffer for gethostbyname2_r.
-  size_t length = 1024;
-  char* temp = new char[length];
-
-  struct hostent he, *hep = NULL;
-  int result = 0;
-  int herrno = 0;
-
-  while ((result = gethostbyname2_r(host, AF_INET, &he, temp,
-                                    length, &hep, &herrno)) == ERANGE) {
-    // Enlarge the buffer.
-    delete[] temp;
-    length *= 2;
-    temp = new char[length];
-  }
-
-  if (result != 0 || hep == NULL) {
-    delete[] temp;
-    return Error(hstrerror(herrno));
-  }
-
-  std::string hostname = hep->h_name;
-  delete[] temp;
-  return hostname;
 }
 
 
@@ -1180,58 +1092,27 @@ inline Try<std::string> sysname()
 }
 
 
-// The OS release level.
-struct Release
-{
-  bool operator == (const Release& other)
-  {
-    return version == other.version &&
-      major == other.major &&
-      minor == other.minor;
-  }
-
-  bool operator < (const Release& other)
-  {
-    // Lexicographic ordering.
-    if (version != other.version) {
-      return version < other.version;
-    } else if (major != other.major) {
-      return major < other.major;
-    } else {
-      return minor < other.minor;
-    }
-  }
-
-  bool operator <= (const Release& other)
-  {
-    return *this < other || *this == other;
-  }
-
-  int version;
-  int major;
-  int minor;
-};
-
-
 // Return the OS release numbers.
-inline Try<Release> release()
+inline Try<Version> release()
 {
   Try<UTSInfo> info = uname();
   if (info.isError()) {
     return Error(info.error());
   }
 
-  Release r;
+  // TODO(karya): Replace sscanf with Version::parse() once Version
+  // starts supporting labels and build metadata.
+  int major, minor, patch;
   if (::sscanf(
           info.get().release.c_str(),
           "%d.%d.%d",
-          &r.version,
-          &r.major,
-          &r.minor) != 3) {
+          &major,
+          &minor,
+          &patch) != 3) {
     return Error("Failed to parse: " + info.get().release);
   }
 
-  return r;
+  return Version(major, minor, patch);
 }
 
 
@@ -1357,6 +1238,63 @@ inline Try<std::set<pid_t> > pids(Option<pid_t> group, Option<pid_t> session)
   return result;
 }
 
+
+namespace libraries {
+
+// Returns the full library name by adding prefix and extension to
+// library name.
+inline std::string expandName(const std::string& libraryName)
+{
+  const char* prefix = "lib";
+  const char* extension =
+#ifdef __linux__
+    ".so";
+#else
+    ".dylib";
+#endif
+
+  return prefix + libraryName + extension;
+}
+
+
+// Returns the current value of LD_LIBRARY_PATH environment variable.
+inline std::string paths()
+{
+  const char* environmentVariable =
+#ifdef __linux__
+    "LD_LIBRARY_PATH";
+#else
+    "DYLD_LIBRARY_PATH";
+#endif
+  return getenv(environmentVariable, false);
+}
+
+
+// Updates the value of LD_LIBRARY_PATH environment variable.
+inline void setPaths(const std::string& newPaths)
+{
+  const char* environmentVariable =
+#ifdef __linux__
+    "LD_LIBRARY_PATH";
+#else
+    "DYLD_LIBRARY_PATH";
+#endif
+  setenv(environmentVariable, newPaths);
+}
+
+
+// Append newPath to the current value of LD_LIBRARY_PATH environment
+// variable.
+inline void appendPaths(const std::string& newPaths)
+{
+  if (paths().empty()) {
+    setPaths(newPaths);
+  } else {
+    setPaths(paths() + ":" + newPaths);
+  }
+}
+
+} // namespace libraries {
 } // namespace os {
 
 #endif // __STOUT_OS_HPP__

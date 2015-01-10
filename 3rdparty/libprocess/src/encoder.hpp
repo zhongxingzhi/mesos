@@ -25,41 +25,48 @@ namespace process {
 
 const uint32_t GZIP_MINIMUM_BODY_LENGTH = 1024;
 
-typedef void (*Sender)(struct ev_loop*, ev_io*, int);
-
-extern void send_data(struct ev_loop*, ev_io*, int);
-extern void send_file(struct ev_loop*, ev_io*, int);
+// Forward declarations.
+class Encoder;
 
 
 class Encoder
 {
 public:
-  explicit Encoder(const Socket& _s) : s(_s) {}
+  enum Kind {
+    DATA,
+    FILE
+  };
+
+  explicit Encoder(const network::Socket& _s) : s(_s) {}
   virtual ~Encoder() {}
 
-  virtual Sender sender() = 0;
+  virtual Kind kind() const = 0;
 
-  Socket socket() const
+  virtual void backup(size_t length) = 0;
+
+  virtual size_t remaining() const = 0;
+
+  network::Socket socket() const
   {
     return s;
   }
 
 private:
-  const Socket s; // The socket this encoder is associated with.
+  const network::Socket s; // The socket this encoder is associated with.
 };
 
 
 class DataEncoder : public Encoder
 {
 public:
-  DataEncoder(const Socket& s, const std::string& _data)
+  DataEncoder(const network::Socket& s, const std::string& _data)
     : Encoder(s), data(_data), index(0) {}
 
   virtual ~DataEncoder() {}
 
-  virtual Sender sender()
+  virtual Kind kind() const
   {
-    return send_data;
+    return Encoder::DATA;
   }
 
   virtual const char* next(size_t* length)
@@ -91,7 +98,7 @@ private:
 class MessageEncoder : public DataEncoder
 {
 public:
-  MessageEncoder(const Socket& s, Message* _message)
+  MessageEncoder(const network::Socket& s, Message* _message)
     : DataEncoder(s, encode(_message)), message(_message) {}
 
   virtual ~MessageEncoder()
@@ -115,9 +122,12 @@ public:
       if (message->to.id != "") {
         out << "/" << message->to.id;
       }
-      out << "/" << message->name << " HTTP/1.0\r\n"
+
+      out << "/" << message->name << " HTTP/1.1\r\n"
           << "User-Agent: libprocess/" << message->from << "\r\n"
-          << "Connection: Keep-Alive\r\n";
+          << "Libprocess-From: " << message->from << "\r\n"
+          << "Connection: Keep-Alive\r\n"
+          << "Host: \r\n";
 
       if (message->body.size() > 0) {
         out << "Transfer-Encoding: chunked\r\n\r\n"
@@ -143,7 +153,7 @@ class HttpResponseEncoder : public DataEncoder
 {
 public:
   HttpResponseEncoder(
-      const Socket& s,
+      const network::Socket& s,
       const http::Response& response,
       const http::Request& request)
     : DataEncoder(s, encode(response, request)) {}
@@ -227,7 +237,7 @@ public:
 class FileEncoder : public Encoder
 {
 public:
-  FileEncoder(const Socket& s, int _fd, size_t _size)
+  FileEncoder(const network::Socket& s, int _fd, size_t _size)
     : Encoder(s), fd(_fd), size(_size), index(0) {}
 
   virtual ~FileEncoder()
@@ -235,9 +245,9 @@ public:
     os::close(fd);
   }
 
-  virtual Sender sender()
+  virtual Kind kind() const
   {
-    return send_file;
+    return Encoder::FILE;
   }
 
   virtual int next(off_t* offset, size_t* length)

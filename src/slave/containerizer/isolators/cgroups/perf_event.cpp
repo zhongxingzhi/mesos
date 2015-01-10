@@ -93,7 +93,9 @@ Try<Isolator*> CgroupsPerfEventIsolatorProcess::create(const Flags& flags)
   }
 
   Try<string> hierarchy = cgroups::prepare(
-      flags.cgroups_hierarchy, "perf_event", flags.cgroups_root);
+      flags.cgroups_hierarchy,
+      "perf_event",
+      flags.cgroups_root);
 
   if (hierarchy.isError()) {
     return Error("Failed to create perf_event cgroup: " + hierarchy.error());
@@ -211,7 +213,9 @@ Future<Nothing> CgroupsPerfEventIsolatorProcess::recover(
 
 Future<Option<CommandInfo> > CgroupsPerfEventIsolatorProcess::prepare(
     const ContainerID& containerId,
-    const ExecutorInfo& executorInfo)
+    const ExecutorInfo& executorInfo,
+    const string& directory,
+    const Option<string>& user)
 {
   if (infos.contains(containerId)) {
     return Failure("Container has already been prepared");
@@ -240,6 +244,19 @@ Future<Option<CommandInfo> > CgroupsPerfEventIsolatorProcess::prepare(
     Try<Nothing> create = cgroups::create(hierarchy, info->cgroup);
     if (create.isError()) {
       return Failure("Failed to prepare isolator: " + create.error());
+    }
+  }
+
+  // Chown the cgroup so the executor can create nested cgroups. Do
+  // not recurse so the control files are still owned by the slave
+  // user and thus cannot be changed by the executor.
+  if (user.isSome()) {
+    Try<Nothing> chown = os::chown(
+        user.get(),
+        path::join(hierarchy, info->cgroup),
+        false);
+    if (chown.isError()) {
+      return Failure("Failed to prepare isolator: " + chown.error());
     }
   }
 
@@ -329,8 +346,7 @@ Future<Nothing> CgroupsPerfEventIsolatorProcess::cleanup(
 Future<Nothing> CgroupsPerfEventIsolatorProcess::_cleanup(
     const ContainerID& containerId)
 {
-  if (!infos.contains(containerId))
-  {
+  if (!infos.contains(containerId)) {
     return Nothing();
   }
 

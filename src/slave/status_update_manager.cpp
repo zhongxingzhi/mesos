@@ -24,6 +24,7 @@
 #include <stout/foreach.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
+#include <stout/lambda.hpp>
 #include <stout/option.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/utils.hpp>
@@ -36,6 +37,8 @@
 #include "slave/slave.hpp"
 #include "slave/state.hpp"
 #include "slave/status_update_manager.hpp"
+
+using lambda::function;
 
 using std::string;
 
@@ -61,16 +64,14 @@ class StatusUpdateManagerProcess
   : public ProtobufProcess<StatusUpdateManagerProcess>
 {
 public:
-  StatusUpdateManagerProcess() {}
+  StatusUpdateManagerProcess(const Flags& flags);
   virtual ~StatusUpdateManagerProcess();
 
   // Explicitely use 'initialize' since we're overloading below.
   using process::ProcessBase::initialize;
 
   // StatusUpdateManager implementation.
-  void initialize(
-      const Flags& flags,
-      const PID<Slave>& slave);
+  void initialize(const function<void(StatusUpdate)>& forward);
 
   Future<Nothing> update(
       const StatusUpdate& update,
@@ -91,9 +92,8 @@ public:
       const string& rootDir,
       const Option<SlaveState>& state);
 
-  void newMasterDetected(const UPID& pid);
-
-  void flush();
+  void pause();
+  void resume();
 
   void cleanup(const FrameworkID& frameworkId);
 
@@ -135,11 +135,17 @@ private:
       const TaskID& taskId,
       const FrameworkID& frameworkId);
 
-  UPID master;
-  Flags flags;
-  PID<Slave> slave;
+  const Flags flags;
+  bool paused;
+
+  function<void(StatusUpdate)> forward_;
+
   hashmap<FrameworkID, hashmap<TaskID, StatusUpdateStream*> > streams;
 };
+
+
+StatusUpdateManagerProcess::StatusUpdateManagerProcess(const Flags& _flags)
+  : flags(_flags), paused(false) {}
 
 
 StatusUpdateManagerProcess::~StatusUpdateManagerProcess()
@@ -154,26 +160,24 @@ StatusUpdateManagerProcess::~StatusUpdateManagerProcess()
 
 
 void StatusUpdateManagerProcess::initialize(
-    const Flags& _flags,
-    const PID<Slave>& _slave)
+    const function<void(StatusUpdate)>& forward)
 {
-  flags = _flags;
-  slave = _slave;
+  forward_ = forward;
 }
 
 
-void StatusUpdateManagerProcess::newMasterDetected(const UPID& pid)
+void StatusUpdateManagerProcess::pause()
 {
-  LOG(INFO) << "New master detected at " << pid;
-  master = pid;
-
-  // Retry any pending status updates.
-  flush();
+  LOG(INFO) << "Pausing sending status updates";
+  paused = true;
 }
 
 
-void StatusUpdateManagerProcess::flush()
+void StatusUpdateManagerProcess::resume()
 {
+  LOG(INFO) << "Resuming sending status updates";
+  paused = false;
+
   foreachkey (const FrameworkID& frameworkId, streams) {
     foreachvalue (StatusUpdateStream* stream, streams[frameworkId]) {
       if (!stream->pending.empty()) {
@@ -256,18 +260,11 @@ Future<Nothing> StatusUpdateManagerProcess::recover(
         }
 
         // At the end of the replay, the stream is either terminated or
-        // contains only unacknowledged, if any, pending updates.
+        // contains only unacknowledged, if any, pending updates. The
+        // pending updates will be flushed after the slave
+        // re-registers with the master.
         if (stream->terminated) {
           cleanupStatusUpdateStream(task.id, framework.id);
-        } else {
-          // If a stream has pending updates after the replay,
-          // send the first pending update.
-          const Result<StatusUpdate>& next = stream->next();
-          CHECK(!next.isError());
-          if (next.isSome()) {
-            stream->timeout =
-              forward(next.get(), STATUS_UPDATE_RETRY_INTERVAL_MIN);
-          }
         }
       }
     }
@@ -350,7 +347,7 @@ Future<Nothing> StatusUpdateManagerProcess::_update(
 
   // Forward the status update to the master if this is the first in the stream.
   // Subsequent status updates will get sent in 'acknowledgement()'.
-  if (stream->pending.size() == 1) {
+  if (!paused && stream->pending.size() == 1) {
     CHECK(stream->timeout.isNone());
     const Result<StatusUpdate>& next = stream->next();
     if (next.isError()) {
@@ -369,18 +366,12 @@ Timeout StatusUpdateManagerProcess::forward(
     const StatusUpdate& update,
     const Duration& duration)
 {
-  if (master) {
-    LOG(INFO) << "Forwarding status update " << update << " to " << master;
+  CHECK(!paused);
 
-    StatusUpdateMessage message;
-    message.mutable_update()->MergeFrom(update);
-    message.set_pid(slave); // The ACK will be first received by the slave.
+  VLOG(1) << "Forwarding update " << update << " to the slave";
 
-    send(master, message);
-  } else {
-    LOG(WARNING) << "Not forwarding status update " << update
-                 << " because no master is elected yet";
-  }
+  // Forward the update.
+  forward_(update);
 
   // Send a message to self to resend after some delay if no ACK is received.
   return delay(duration,
@@ -454,7 +445,7 @@ Future<bool> StatusUpdateManagerProcess::acknowledgement(
                    << " but updates are still pending";
     }
     cleanupStatusUpdateStream(taskId, frameworkId);
-  } else if (next.isSome()) {
+  } else if (!paused && next.isSome()) {
     // Forward the next queued status update.
     stream->timeout = forward(next.get(), STATUS_UPDATE_RETRY_INTERVAL_MIN);
   }
@@ -466,6 +457,10 @@ Future<bool> StatusUpdateManagerProcess::acknowledgement(
 // TODO(vinod): There should be a limit on the retries.
 void StatusUpdateManagerProcess::timeout(const Duration& duration)
 {
+  if (paused) {
+    return;
+  }
+
   // Check and see if we should resend any status updates.
   foreachkey (const FrameworkID& frameworkId, streams) {
     foreachvalue (StatusUpdateStream* stream, streams[frameworkId]) {
@@ -548,9 +543,9 @@ void StatusUpdateManagerProcess::cleanupStatusUpdateStream(
 }
 
 
-StatusUpdateManager::StatusUpdateManager()
+StatusUpdateManager::StatusUpdateManager(const Flags& flags)
 {
-  process = new StatusUpdateManagerProcess();
+  process = new StatusUpdateManagerProcess(flags);
   spawn(process);
 }
 
@@ -564,10 +559,9 @@ StatusUpdateManager::~StatusUpdateManager()
 
 
 void StatusUpdateManager::initialize(
-    const Flags& flags,
-    const PID<Slave>& slave)
+    const function<void(StatusUpdate)>& forward)
 {
-  dispatch(process, &StatusUpdateManagerProcess::initialize, flags, slave);
+  dispatch(process, &StatusUpdateManagerProcess::initialize, forward);
 }
 
 
@@ -622,15 +616,15 @@ Future<Nothing> StatusUpdateManager::recover(
 }
 
 
-void StatusUpdateManager::newMasterDetected(const UPID& pid)
+void StatusUpdateManager::pause()
 {
-  dispatch(process, &StatusUpdateManagerProcess::newMasterDetected, pid);
+  dispatch(process, &StatusUpdateManagerProcess::pause);
 }
 
 
-void StatusUpdateManager::flush()
+void StatusUpdateManager::resume()
 {
-  dispatch(process, &StatusUpdateManagerProcess::flush);
+  dispatch(process, &StatusUpdateManagerProcess::resume);
 }
 
 

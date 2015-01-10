@@ -39,6 +39,17 @@
 #define DROP_MESSAGE(name, from, to)            \
   process::FutureMessage(name, from, to, true)
 
+// The mechanism of how we match method dispatches is done by
+// comparing std::type_info of the member function pointers. Because
+// of this, the method function pointer passed to either
+// FUTURE_DISPATCH or DROP_DISPATCH must match exactly the member
+// function that is passed to the dispatch method.
+// TODO(tnachen): In a situation where a base class has a virtual
+// function and that a derived class overrides, and if in unit tests
+// we want to verify it calls the exact derived member function, we
+// need to change how dispatch matching works. One possible way is to
+// move the dispatch matching logic at event dequeue time, as we then
+// have the actual Process the dispatch event is calling to.
 #define FUTURE_DISPATCH(pid, method)            \
   process::FutureDispatch(pid, method)
 
@@ -128,6 +139,69 @@ FutureSatisfy(process::Future<Nothing>* future)
   process::Promise<Nothing>* promise = new process::Promise<Nothing>();
   *future = promise->future();
   return PromiseSatisfy(promise, Nothing());
+}
+
+
+// This action invokes an "inner" action but captures the result and
+// stores a copy of it in a future. Note that this is implemented
+// similarly to the IgnoreResult action, which relies on the cast
+// operator to Action<F> which must occur (implicitly) before the
+// expression has completed, hence we can pass the Future<R>* all the
+// way through to our action "implementation".
+template <typename R, typename A>
+class FutureResultAction
+{
+public:
+  explicit FutureResultAction(process::Future<R>* future, const A& action)
+    : future(future),
+      action(action) {}
+
+  template <typename F>
+  operator ::testing::Action<F>() const
+  {
+    return ::testing::Action<F>(new Implementation<F>(future, action));
+  }
+
+private:
+  template <typename F>
+  class Implementation : public ::testing::ActionInterface<F>
+  {
+  public:
+    explicit Implementation(process::Future<R>* future, const A& action)
+      : action(action)
+    {
+      *future = promise.future();
+    }
+
+    virtual typename ::testing::ActionInterface<F>::Result Perform(
+        const typename ::testing::ActionInterface<F>::ArgumentTuple& args)
+    {
+      const typename ::testing::ActionInterface<F>::Result& result =
+        action.Perform(args);
+      promise.set(result);
+      return result;
+    }
+
+  private:
+    // Not copyable, not assignable.
+    Implementation(const Implementation&);
+    Implementation& operator = (const Implementation&);
+
+    process::Promise<R> promise;
+    const ::testing::Action<F> action;
+  };
+
+  process::Future<R>* future;
+  const A action;
+};
+
+
+template <typename R, typename A>
+FutureResultAction<R, A> FutureResult(
+    process::Future<R>* future,
+    const A& action)
+{
+  return FutureResultAction<R, A>(future, action);
 }
 
 
@@ -268,8 +342,8 @@ MATCHER_P2(DispatchMatcher, pid, method, "")
 {
   const DispatchEvent& event = ::std::tr1::get<0>(arg);
   return (testing::Matcher<UPID>(pid).Matches(event.pid) &&
-          testing::Matcher<std::string>(internal::canonicalize(method))
-          .Matches(event.method));
+          event.functionType.isSome() &&
+          *event.functionType.get() == typeid(method));
 }
 
 

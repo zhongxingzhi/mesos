@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+#include <signal.h>
+
 #include <gtest/gtest.h>
 
 #include <string>
@@ -27,12 +29,15 @@
 #include <stout/os.hpp>
 #include <stout/try.hpp>
 
+#include <stout/os/signals.hpp>
+
 #include "logging/logging.hpp"
 
 #include "messages/messages.hpp" // For GOOGLE_PROTOBUF_VERIFY_VERSION.
 
 #include "tests/environment.hpp"
 #include "tests/flags.hpp"
+#include "tests/module.hpp"
 
 using namespace mesos::internal;
 using namespace mesos::internal::tests;
@@ -80,6 +85,12 @@ int main(int argc, char** argv)
     exit(1);
   }
 
+  // Initialize Modules.
+  Try<Nothing> result = tests::initModules(flags.modules);
+  if (result.isError()) {
+    EXIT(1) << "Error initializing modules: " << result.error();
+  }
+
   // Initialize libprocess.
   process::initialize();
 
@@ -89,7 +100,15 @@ int main(int argc, char** argv)
   }
 
   // Initialize logging.
-  logging::initialize(argv[0], flags);
+  logging::initialize(argv[0], flags, true);
+
+  // We reset the signal handler setup by 'logging::initialize()'
+  // because some Mesos tests run an in-process ZooKeeper which
+  // results in SIGPIPE during ZooKeeeper server shutdown. See
+  // MESOS-1729 for details. This is ok because if a non-ZooKeeper
+  // test throws a SIGPIPE the default handler will still terminate
+  // the process, thus not masking SIGPIPE issues elsewhere.
+  os::signals::reset(SIGPIPE);
 
   // Initialize gmock/gtest.
   testing::InitGoogleTest(&argc, argv);

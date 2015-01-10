@@ -43,6 +43,8 @@
 #include <stout/os.hpp>
 #include <stout/stringify.hpp>
 
+#include "common/type_utils.hpp"
+
 #include "logging/flags.hpp"
 
 using namespace mesos;
@@ -61,7 +63,7 @@ using mesos::scheduler::Call;
 using mesos::scheduler::Event;
 
 const int32_t CPUS_PER_TASK = 1;
-const int32_t MEM_PER_TASK = 32;
+const int32_t MEM_PER_TASK = 128;
 
 class LowLevelScheduler : public process::Process<LowLevelScheduler>
 {
@@ -210,8 +212,8 @@ private:
   void resourceOffers(const vector<Offer>& offers)
   {
     foreach (const Offer& offer, offers) {
-      cout << "Offer '" << offer.id().value() << "' has "
-           << offer.resources() << endl;
+      cout << "Received offer " << offer.id() << " with " << offer.resources()
+           << endl;
 
       static const Resources TASK_RESOURCES = Resources::parse(
           "cpus:" + stringify(CPUS_PER_TASK) +
@@ -222,11 +224,11 @@ private:
       // Launch tasks.
       vector<TaskInfo> tasks;
       while (tasksLaunched < totalTasks &&
-             TASK_RESOURCES <= remaining.flatten()) {
+             remaining.flatten().contains(TASK_RESOURCES)) {
         int taskId = tasksLaunched++;
 
-        cout << "Starting task " << taskId << " on "
-             << offer.hostname() << endl;
+        cout << "Launching task " << taskId << " using offer "
+             << offer.id() << endl;
 
         TaskInfo task;
         task.set_name("Task " + lexical_cast<string>(taskId));
@@ -236,7 +238,7 @@ private:
         task.mutable_executor()->MergeFrom(executor);
 
         Option<Resources> resources =
-          remaining.find(TASK_RESOURCES, framework.role());
+          remaining.find(TASK_RESOURCES.flatten(framework.role()));
 
         CHECK_SOME(resources);
         task.mutable_resources()->MergeFrom(resources.get());
@@ -261,8 +263,7 @@ private:
 
   void statusUpdate(const string& uuid, const TaskStatus& status)
   {
-    cout << "Task " << status.task_id().value() << " is in state "
-         << TaskState_Name(status.state());
+    cout << "Task " << status.task_id() << " is in state " << status.state();
 
     if (status.has_message()) {
       cout << " with message '" << status.message() << "'";
@@ -282,6 +283,16 @@ private:
 
     if (status.state() == TASK_FINISHED) {
       ++tasksFinished;
+    }
+
+    if (status.state() == TASK_LOST ||
+        status.state() == TASK_KILLED ||
+        status.state() == TASK_FAILED) {
+      EXIT(1) << "Exiting because task " << status.task_id()
+              << " is in unexpected state " << status.state()
+              << " with reason " << status.reason()
+              << " from source " << status.source()
+              << " with message '" << status.message() << "'";
     }
 
     if (tasksFinished == totalTasks) {

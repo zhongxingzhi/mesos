@@ -17,17 +17,22 @@ function usage {
 cat <<EOF
 Apache Mesos apply patch tool.
 
-Usage: $0 [-h] [-r | -g] <ID Number>
+Usage: $0 [-h] [-n] [-r | -g] <ID Number>
 
   -h   Print this help message and exit
+  -n   Don't amend the commit message
   -r   Apply a patch from Review Board (default)
   -g   Apply a patch from Github
 EOF
 }
 
+AMEND=true
 REVIEW_LOCATION='reviewboard'
-while getopts ":hrg" opt; do
+while getopts ":nhrg" opt; do
   case $opt in
+    n)
+      AMEND=false
+      ;;
     r)
       REVIEW_LOCATION='reviewboard'
       ;;
@@ -62,7 +67,7 @@ fi
 
 atexit "rm -f ${REVIEW}.patch"
 
-wget --no-check-certificate -O ${REVIEW}.patch ${DIFF_URL} || \
+wget --no-check-certificate --no-verbose -O ${REVIEW}.patch ${DIFF_URL} || \
   { echo "${RED}Failed to download patch${NORMAL}"; exit 1; }
 
 git apply --index ${REVIEW}.patch || \
@@ -106,8 +111,11 @@ ${REVIEW_DETAILS}
 Review: ${REVIEW_URL}
 __EOF__
 )
+echo "Successfully applied: ${MESSAGE}"
 
 git commit --author="${AUTHOR}" -am "${MESSAGE}" || \
   { echo "${RED}Failed to commit patch${NORMAL}"; exit 1; }
 
-git commit --amend
+if $AMEND; then
+  git commit --amend
+fi

@@ -54,7 +54,7 @@ namespace internal {
 void dispatch(
     const UPID& pid,
     const memory::shared_ptr<lambda::function<void(ProcessBase*)> >& f,
-    const std::string& method = std::string());
+    const Option<const std::type_info*>& functionType = None());
 
 // For each return type (void, future, value) there is a dispatcher
 // function which should complete the picture. Given the process
@@ -71,7 +71,7 @@ void vdispatcher(
 {
   assert(process != NULL);
   T* t = dynamic_cast<T*>(process);
-  assert(t != NULL);
+  CHECK_NOTNULL(t);
   (*thunk)(t);
 }
 
@@ -82,9 +82,9 @@ void pdispatcher(
     memory::shared_ptr<lambda::function<Future<R>(T*)> > thunk,
     memory::shared_ptr<Promise<R> > promise)
 {
-  assert(process != NULL);
+  CHECK_NOTNULL(process);
   T* t = dynamic_cast<T*>(process);
-  assert(t != NULL);
+  CHECK_NOTNULL(t);
   promise->associate((*thunk)(t));
 }
 
@@ -95,19 +95,10 @@ void rdispatcher(
     memory::shared_ptr<lambda::function<R(T*)> > thunk,
     memory::shared_ptr<Promise<R> > promise)
 {
-  assert(process != NULL);
+  CHECK_NOTNULL(process);
   T* t = dynamic_cast<T*>(process);
-  assert(t != NULL);
+  CHECK_NOTNULL(t);
   promise->set((*thunk)(t));
-}
-
-
-// Canonicalizes a pointer to a member function (i.e., method) into a
-// bytes representation for comparison (e.g., in tests).
-template <typename Method>
-std::string canonicalize(Method method)
-{
-  return std::string(reinterpret_cast<const char*>(&method), sizeof(method));
 }
 
 } // namespace internal {
@@ -139,7 +130,7 @@ std::string canonicalize(Method method)
 //                        lambda::_1,
 //                        thunk)));
 //
-//   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
+//   internal::dispatch(pid, dispatcher, &typeid(method));
 // }
 
 template <typename T>
@@ -157,7 +148,7 @@ void dispatch(
                        lambda::_1,
                        thunk)));
 
-  internal::dispatch(pid, dispatcher, internal::canonicalize(method));
+  internal::dispatch(pid, dispatcher, &typeid(method));
 }
 
 template <typename T>
@@ -197,7 +188,7 @@ void dispatch(
                          lambda::_1,                                    \
                          thunk)));                                      \
                                                                         \
-    internal::dispatch(pid, dispatcher, internal::canonicalize(method)); \
+    internal::dispatch(pid, dispatcher, &typeid(method));               \
   }                                                                     \
                                                                         \
   template <typename T,                                                 \
@@ -249,7 +240,7 @@ void dispatch(
 //                        lambda::_1,
 //                        thunk, promise)));
 //
-//   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
+//   internal::dispatch(pid, dispatcher, &typeid(method));
 //
 //   return future;
 // }
@@ -272,7 +263,7 @@ Future<R> dispatch(
                        lambda::_1,
                        thunk, promise)));
 
-  internal::dispatch(pid, dispatcher, internal::canonicalize(method));
+  internal::dispatch(pid, dispatcher, &typeid(method));
 
   return future;
 }
@@ -318,7 +309,7 @@ Future<R> dispatch(
                          lambda::_1,                                    \
                          thunk, promise)));                             \
                                                                         \
-    internal::dispatch(pid, dispatcher, internal::canonicalize(method)); \
+    internal::dispatch(pid, dispatcher, &typeid(method));               \
                                                                         \
     return future;                                                      \
   }                                                                     \
@@ -374,7 +365,7 @@ Future<R> dispatch(
 //                        lambda::_1,
 //                        thunk, promise)));
 //
-//   internal::dispatch(pid, dispatcher, internal::canonicalize(method));
+//   internal::dispatch(pid, dispatcher, &typeid(method));
 //
 //   return future;
 // }
@@ -397,7 +388,7 @@ Future<R> dispatch(
                        lambda::_1,
                        thunk, promise)));
 
-  internal::dispatch(pid, dispatcher, internal::canonicalize(method));
+  internal::dispatch(pid, dispatcher, &typeid(method));
 
   return future;
 }
@@ -443,7 +434,7 @@ Future<R> dispatch(
                          lambda::_1,                                    \
                          thunk, promise)));                             \
                                                                         \
-    internal::dispatch(pid, dispatcher, internal::canonicalize(method)); \
+    internal::dispatch(pid, dispatcher, &typeid(method));               \
                                                                         \
     return future;                                                      \
   }                                                                     \

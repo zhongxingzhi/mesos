@@ -25,10 +25,13 @@
 #include <process/future.hpp>
 #include <process/owned.hpp>
 
+#include <stout/strings.hpp>
+
 #include <mesos/mesos.hpp>
 
 #include "slave/flags.hpp"
 
+#include "slave/containerizer/fetcher.hpp"
 #include "slave/containerizer/isolator.hpp"
 #include "slave/containerizer/launcher.hpp"
 
@@ -47,210 +50,10 @@ using std::map;
 using std::string;
 using std::vector;
 
-namespace mesos {
-namespace internal {
-namespace slave {
-
-// Forward declaration.
-map<string, string> fetcherEnvironment(
-    const CommandInfo& commandInfo,
-    const string& directory,
-    const Option<string>& user,
-    const Flags& flags);
-
-}  // namespace slave {
-}  // namespace internal {
-}  // namespace mesos {
-
-class MesosContainerizerProcessTest : public ::testing::Test {};
-
-
-TEST_F(MesosContainerizerProcessTest, Simple)
-{
-  CommandInfo commandInfo;
-  CommandInfo::URI uri;
-  uri.set_value("hdfs:///uri");
-  uri.set_executable(false);
-  commandInfo.add_uris()->MergeFrom(uri);
-
-  string directory = "/tmp/directory";
-  Option<string> user = "user";
-
-  Flags flags;
-  flags.frameworks_home = "/tmp/frameworks";
-  flags.hadoop_home = "/tmp/hadoop";
-
-  map<string, string> environment =
-    fetcherEnvironment(commandInfo, directory, user, flags);
-  EXPECT_EQ(5u, environment.size());
-  EXPECT_EQ("hdfs:///uri+0X", environment["MESOS_EXECUTOR_URIS"]);
-  EXPECT_EQ(directory, environment["MESOS_WORK_DIRECTORY"]);
-  EXPECT_EQ(user.get(), environment["MESOS_USER"]);
-  EXPECT_EQ(flags.frameworks_home, environment["MESOS_FRAMEWORKS_HOME"]);
-  EXPECT_EQ(flags.hadoop_home, environment["HADOOP_HOME"]);
-}
-
-
-TEST_F(MesosContainerizerProcessTest, MultipleURIs)
-{
-  CommandInfo commandInfo;
-  CommandInfo::URI uri;
-  uri.set_value("hdfs:///uri1");
-  uri.set_executable(false);
-  commandInfo.add_uris()->MergeFrom(uri);
-  uri.set_value("hdfs:///uri2");
-  uri.set_executable(true);
-  commandInfo.add_uris()->MergeFrom(uri);
-
-  string directory = "/tmp/directory";
-  Option<string> user("user");
-
-  Flags flags;
-  flags.frameworks_home = "/tmp/frameworks";
-  flags.hadoop_home = "/tmp/hadoop";
-
-  map<string, string> environment =
-    fetcherEnvironment(commandInfo, directory, user, flags);
-
-  EXPECT_EQ(5u, environment.size());
-  EXPECT_EQ(
-      "hdfs:///uri1+0X hdfs:///uri2+1X", environment["MESOS_EXECUTOR_URIS"]);
-  EXPECT_EQ(directory, environment["MESOS_WORK_DIRECTORY"]);
-  EXPECT_EQ(user.get(), environment["MESOS_USER"]);
-  EXPECT_EQ(flags.frameworks_home, environment["MESOS_FRAMEWORKS_HOME"]);
-  EXPECT_EQ(flags.hadoop_home, environment["HADOOP_HOME"]);
-}
-
-
-TEST_F(MesosContainerizerProcessTest, NoUser)
-{
-  CommandInfo commandInfo;
-  CommandInfo::URI uri;
-  uri.set_value("hdfs:///uri");
-  uri.set_executable(false);
-  commandInfo.add_uris()->MergeFrom(uri);
-
-  string directory = "/tmp/directory";
-
-  Flags flags;
-  flags.frameworks_home = "/tmp/frameworks";
-  flags.hadoop_home = "/tmp/hadoop";
-
-  map<string, string> environment =
-    fetcherEnvironment(commandInfo, directory, None(), flags);
-
-  EXPECT_EQ(4u, environment.size());
-  EXPECT_EQ("hdfs:///uri+0X", environment["MESOS_EXECUTOR_URIS"]);
-  EXPECT_EQ(directory, environment["MESOS_WORK_DIRECTORY"]);
-  EXPECT_EQ(flags.frameworks_home, environment["MESOS_FRAMEWORKS_HOME"]);
-  EXPECT_EQ(flags.hadoop_home, environment["HADOOP_HOME"]);
-}
-
-
-TEST_F(MesosContainerizerProcessTest, EmptyHadoop)
-{
-  CommandInfo commandInfo;
-  CommandInfo::URI uri;
-  uri.set_value("hdfs:///uri");
-  uri.set_executable(false);
-  commandInfo.add_uris()->MergeFrom(uri);
-
-  string directory = "/tmp/directory";
-  Option<string> user = "user";
-
-  Flags flags;
-  flags.frameworks_home = "/tmp/frameworks";
-  flags.hadoop_home = "";
-
-  map<string, string> environment =
-    fetcherEnvironment(commandInfo, directory, user, flags);
-
-  EXPECT_EQ(4u, environment.size());
-  EXPECT_EQ("hdfs:///uri+0X", environment["MESOS_EXECUTOR_URIS"]);
-  EXPECT_EQ(directory, environment["MESOS_WORK_DIRECTORY"]);
-  EXPECT_EQ(user.get(), environment["MESOS_USER"]);
-  EXPECT_EQ(flags.frameworks_home, environment["MESOS_FRAMEWORKS_HOME"]);
-}
-
-
-TEST_F(MesosContainerizerProcessTest, NoHadoop)
-{
-  CommandInfo commandInfo;
-  CommandInfo::URI uri;
-  uri.set_value("hdfs:///uri");
-  uri.set_executable(false);
-  commandInfo.add_uris()->MergeFrom(uri);
-
-  string directory = "/tmp/directory";
-  Option<string> user = "user";
-
-  Flags flags;
-  flags.frameworks_home = "/tmp/frameworks";
-
-  map<string, string> environment =
-    fetcherEnvironment(commandInfo, directory, user, flags);
-
-  EXPECT_EQ(4u, environment.size());
-  EXPECT_EQ("hdfs:///uri+0X", environment["MESOS_EXECUTOR_URIS"]);
-  EXPECT_EQ(directory, environment["MESOS_WORK_DIRECTORY"]);
-  EXPECT_EQ(user.get(), environment["MESOS_USER"]);
-  EXPECT_EQ(flags.frameworks_home, environment["MESOS_FRAMEWORKS_HOME"]);
-}
-
-
-TEST_F(MesosContainerizerProcessTest, NoExtract)
-{
-  CommandInfo commandInfo;
-  CommandInfo::URI uri;
-  uri.set_value("hdfs:///uri");
-  uri.set_executable(false);
-  uri.set_extract(false);
-  commandInfo.add_uris()->MergeFrom(uri);
-
-  string directory = "/tmp/directory";
-  Option<string> user = "user";
-
-  Flags flags;
-  flags.frameworks_home = "/tmp/frameworks";
-  flags.hadoop_home = "/tmp/hadoop";
-
-  map<string, string> environment =
-    fetcherEnvironment(commandInfo, directory, user, flags);
-  EXPECT_EQ(5u, environment.size());
-  EXPECT_EQ("hdfs:///uri+0N", environment["MESOS_EXECUTOR_URIS"]);
-  EXPECT_EQ(directory, environment["MESOS_WORK_DIRECTORY"]);
-  EXPECT_EQ(user.get(), environment["MESOS_USER"]);
-  EXPECT_EQ(flags.frameworks_home, environment["MESOS_FRAMEWORKS_HOME"]);
-  EXPECT_EQ(flags.hadoop_home, environment["HADOOP_HOME"]);
-}
-
-
-TEST_F(MesosContainerizerProcessTest, NoExtractExecutable)
-{
-  CommandInfo commandInfo;
-  CommandInfo::URI uri;
-  uri.set_value("hdfs:///uri");
-  uri.set_executable(true);
-  uri.set_extract(false);
-  commandInfo.add_uris()->MergeFrom(uri);
-
-  string directory = "/tmp/directory";
-  Option<string> user = "user";
-
-  Flags flags;
-  flags.frameworks_home = "/tmp/frameworks";
-  flags.hadoop_home = "/tmp/hadoop";
-
-  map<string, string> environment =
-    fetcherEnvironment(commandInfo, directory, user, flags);
-  EXPECT_EQ(5u, environment.size());
-  EXPECT_EQ("hdfs:///uri+1N", environment["MESOS_EXECUTOR_URIS"]);
-  EXPECT_EQ(directory, environment["MESOS_WORK_DIRECTORY"]);
-  EXPECT_EQ(user.get(), environment["MESOS_USER"]);
-  EXPECT_EQ(flags.frameworks_home, environment["MESOS_FRAMEWORKS_HOME"]);
-  EXPECT_EQ(flags.hadoop_home, environment["HADOOP_HOME"]);
-}
-
+using testing::_;
+using testing::DoAll;
+using testing::Invoke;
+using testing::Return;
 
 class MesosContainerizerIsolatorPreparationTest :
   public tests::TemporaryDirectoryTest
@@ -259,6 +62,7 @@ public:
   // Construct a MesosContainerizer with TestIsolator(s) which use the provided
   // 'prepare' command(s).
   Try<MesosContainerizer*> CreateContainerizer(
+      Fetcher* fetcher,
       const vector<Option<CommandInfo> >& prepares)
   {
     vector<Owned<Isolator> > isolators;
@@ -283,18 +87,20 @@ public:
     return new MesosContainerizer(
         flags,
         false,
+        fetcher,
         Owned<Launcher>(launcher.get()),
         isolators);
   }
 
 
   Try<MesosContainerizer*> CreateContainerizer(
+      Fetcher* fetcher,
       const Option<CommandInfo>& prepare)
   {
     vector<Option<CommandInfo> > prepares;
     prepares.push_back(prepare);
 
-    return CreateContainerizer(prepares);
+    return CreateContainerizer(fetcher, prepares);
   }
 };
 
@@ -305,7 +111,10 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptSucceeds)
   string directory = os::getcwd(); // We're inside a temporary sandbox.
   string file = path::join(directory, "child.script.executed");
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer = CreateContainerizer(
+      &fetcher,
       CREATE_COMMAND_INFO("touch " + file));
   CHECK_SOME(containerizer);
 
@@ -349,7 +158,10 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptFails)
   string directory = os::getcwd(); // We're inside a temporary sandbox.
   string file = path::join(directory, "child.script.executed");
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer = CreateContainerizer(
+      &fetcher,
       CREATE_COMMAND_INFO("touch " + file + " && exit 1"));
   CHECK_SOME(containerizer);
 
@@ -403,7 +215,10 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, MultipleScripts)
   // This will fail, either first or after the successful command.
   prepares.push_back(CREATE_COMMAND_INFO("touch " + file2 + " && exit 1"));
 
-  Try<MesosContainerizer*> containerizer = CreateContainerizer(prepares);
+  Fetcher fetcher;
+
+  Try<MesosContainerizer*> containerizer =
+    CreateContainerizer(&fetcher, prepares);
   CHECK_SOME(containerizer);
 
   ContainerID containerId;
@@ -449,9 +264,11 @@ TEST_F(MesosContainerizerExecuteTest, IoRedirection)
   slave::Flags flags;
   flags.launcher_dir = path::join(tests::flags.build_dir, "src");
 
+  Fetcher fetcher;
+
   // Use local=false so std{err,out} are redirected to files.
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   ASSERT_SOME(containerizer);
 
   ContainerID containerId;
@@ -484,8 +301,105 @@ TEST_F(MesosContainerizerExecuteTest, IoRedirection)
   EXPECT_EQ(0, wait.get().status());
 
   // Check that std{err, out} was redirected.
-  EXPECT_SOME_EQ(errMsg + "\n", os::read(path::join(directory, "stderr")));
+  // NOTE: Fetcher uses GLOG, which outputs extra information to
+  // stderr.
+  Try<string> stderr = os::read(path::join(directory, "stderr"));
+  ASSERT_SOME(stderr);
+  EXPECT_TRUE(strings::contains(stderr.get(), errMsg));
+
   EXPECT_SOME_EQ(outMsg + "\n", os::read(path::join(directory, "stdout")));
 
   delete containerizer.get();
+}
+
+
+class MesosContainerizerDestroyTest : public tests::TemporaryDirectoryTest {};
+
+class MockMesosContainerizerProcess : public MesosContainerizerProcess
+{
+public:
+  MockMesosContainerizerProcess(
+      const Flags& flags,
+      bool local,
+      Fetcher* fetcher,
+      const process::Owned<Launcher>& launcher,
+      const std::vector<process::Owned<Isolator>>& isolators)
+    : MesosContainerizerProcess(flags, local, fetcher, launcher, isolators)
+  {
+    // NOTE: See TestContainerizer::setup for why we use
+    // 'EXPECT_CALL' and 'WillRepeatedly' here instead of
+    // 'ON_CALL' and 'WillByDefault'.
+    EXPECT_CALL(*this, exec(_, _))
+      .WillRepeatedly(Invoke(this, &MockMesosContainerizerProcess::_exec));
+  }
+
+  MOCK_METHOD2(
+      exec,
+      process::Future<bool>(
+          const ContainerID& containerId,
+          int pipeWrite));
+
+  process::Future<bool> _exec(
+      const ContainerID& containerId,
+      int pipeWrite)
+  {
+    return MesosContainerizerProcess::exec(
+        containerId,
+        pipeWrite);
+  }
+};
+
+
+// Destroying a mesos containerizer while it is fetching should
+// complete without waiting for the fetching to finish.
+TEST_F(MesosContainerizerDestroyTest, DestroyWhileFetching)
+{
+  slave::Flags flags;
+  Try<Launcher*> launcher = PosixLauncher::create(flags);
+  ASSERT_SOME(launcher);
+  std::vector<process::Owned<Isolator>> isolators;
+
+  Fetcher fetcher;
+
+  MockMesosContainerizerProcess* process = new MockMesosContainerizerProcess(
+      flags,
+      true,
+      &fetcher,
+      Owned<Launcher>(launcher.get()),
+      isolators);
+
+  Future<Nothing> exec;
+  Promise<bool> promise;
+  // Letting exec hang to simulate a long fetch.
+  EXPECT_CALL(*process, exec(_, _))
+    .WillOnce(DoAll(FutureSatisfy(&exec),
+                    Return(promise.future())));
+
+  MesosContainerizer containerizer((Owned<MesosContainerizerProcess>(process)));
+
+  ContainerID containerId;
+  containerId.set_value("test_container");
+
+  TaskInfo taskInfo;
+  CommandInfo commandInfo;
+  taskInfo.mutable_command()->MergeFrom(commandInfo);
+
+  containerizer.launch(
+      containerId,
+      taskInfo,
+      CREATE_EXECUTOR_INFO("executor", "exit 0"),
+      os::getcwd(),
+      None(),
+      SlaveID(),
+      process::PID<Slave>(),
+      false);
+
+  Future<containerizer::Termination> wait = containerizer.wait(containerId);
+
+  AWAIT_READY(exec);
+
+  containerizer.destroy(containerId);
+
+  // The container should still exit even if fetch didn't complete.
+  AWAIT_READY(wait);
 }

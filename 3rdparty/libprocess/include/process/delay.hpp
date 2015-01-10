@@ -4,6 +4,7 @@
 #ifndef __PROCESS_DELAY_HPP__
 #define __PROCESS_DELAY_HPP__
 
+#include <process/clock.hpp>
 #include <process/dispatch.hpp>
 #include <process/timer.hpp>
 
@@ -38,9 +39,9 @@ Timer delay(const Duration& duration,
     lambda::bind(internal::dispatch,
                  pid,
                  dispatcher,
-                 internal::canonicalize(method));
+                 &typeid(method));
 
-  return Timer::create(duration, dispatch);
+  return Clock::timer(duration, dispatch);
 }
 
 
@@ -85,9 +86,9 @@ Timer delay(const Duration& duration,
       lambda::bind(internal::dispatch,                                  \
                    pid,                                                 \
                    dispatcher,                                          \
-                   internal::canonicalize(method));                     \
+                   &typeid(method));                                    \
                                                                         \
-    return Timer::create(duration, dispatch);                           \
+    return Clock::timer(duration, dispatch);                            \
   }                                                                     \
                                                                         \
   template <typename T,                                                 \

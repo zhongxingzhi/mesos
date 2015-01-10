@@ -38,6 +38,8 @@
 #include "linux/routing/route.hpp"
 #include "linux/routing/utils.hpp"
 
+#include "linux/routing/diagnosis/diagnosis.hpp"
+
 #include "linux/routing/filter/arp.hpp"
 #include "linux/routing/filter/icmp.hpp"
 #include "linux/routing/filter/ip.hpp"
@@ -70,9 +72,9 @@ protected:
   {
     ASSERT_SOME(routing::check())
       << "-------------------------------------------------------------\n"
-      << "We cannot run any routing tests because your libnl\n"
-      << "library is not new enough. You can either install a\n"
-      << "new libnl library, or disable this test case\n"
+      << "We cannot run any routing tests because either your libnl\n"
+      << "library or kernel is not new enough. You can either upgrade,\n"
+      << "or disable this test case\n"
       << "-------------------------------------------------------------";
   }
 };
@@ -228,6 +230,22 @@ TEST_F(RoutingTest, Lo)
 }
 
 
+TEST_F(RoutingTest, INETSockets)
+{
+  Try<vector<diagnosis::socket::Info> > infos =
+    diagnosis::socket::infos(AF_INET, diagnosis::socket::state::ALL);
+
+  EXPECT_SOME(infos);
+
+  foreach (const diagnosis::socket::Info& info, infos.get()) {
+    // Both source and destination IPs should be present since
+    // 'AF_INET' is asked for.
+    EXPECT_SOME(info.sourceIP);
+    EXPECT_SOME(info.destinationIP);
+  }
+}
+
+
 TEST_F(RoutingVethTest, ROOT_LinkCreate)
 {
   ASSERT_SOME(link::create(TEST_VETH_LINK, TEST_PEER_LINK, None()));
@@ -253,8 +271,11 @@ TEST_F(RoutingVethTest, ROOT_LinkRemove)
 }
 
 
-// Network namespace is not available until Linux 2.6.24.
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24)
+// An old glibc might not have this symbol.
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET 0x40000000
+#endif
+
 
 // Entry point of the child process (used in clone()).
 static int child(void*)
@@ -266,8 +287,6 @@ static int child(void*)
 
   // Should not reach here.
   ABORT("Child process should not reach here");
-
-  return -1;
 }
 
 
@@ -300,7 +319,6 @@ TEST_F(RoutingVethTest, ROOT_LinkCreatePid)
   ASSERT_TRUE(WIFSIGNALED(status));
   EXPECT_EQ(SIGKILL, WTERMSIG(status));
 }
-#endif
 
 
 TEST_F(RoutingVethTest, ROOT_LinkWait)

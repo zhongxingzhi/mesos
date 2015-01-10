@@ -31,16 +31,19 @@ EXTRA_DIST =					\
   tests/option_tests.cpp			\
   tests/os_tests.cpp				\
   tests/os/sendfile_tests.cpp			\
-  tests/os/setns_tests.cpp			\
   tests/os/signals_tests.cpp			\
+  tests/path_tests.cpp				\
   tests/proc_tests.cpp				\
   tests/protobuf_tests.cpp			\
   tests/protobuf_tests.pb.cc			\
   tests/protobuf_tests.pb.h			\
   tests/protobuf_tests.proto			\
+  tests/result_tests.cpp			\
   tests/set_tests.cpp				\
   tests/some_tests.cpp				\
   tests/strings_tests.cpp			\
   tests/subcommand_tests.cpp			\
+  tests/svn_tests.cpp				\
   tests/thread_tests.cpp			\
-  tests/uuid_tests.cpp
+  tests/uuid_tests.cpp				\
+  tests/version_tests.cpp

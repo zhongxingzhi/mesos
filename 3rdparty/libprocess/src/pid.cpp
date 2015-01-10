@@ -16,6 +16,7 @@
 #include <process/pid.hpp>
 #include <process/process.hpp>
 
+#include <stout/net.hpp>
 #include <stout/os.hpp>
 
 #include "config.hpp"
@@ -47,8 +48,7 @@ UPID::UPID(const std::string& s)
 UPID::UPID(const ProcessBase& process)
 {
   id = process.self().id;
-  ip = process.self().ip;
-  port = process.self().port;
+  node = process.self().node;
 }
 
 
@@ -62,12 +62,7 @@ UPID::operator std::string() const
 
 ostream& operator << (ostream& stream, const UPID& pid)
 {
-  // Call inet_ntop since inet_ntoa is not thread-safe!
-  char ip[INET_ADDRSTRLEN];
-  if (inet_ntop(AF_INET, (in_addr *) &pid.ip, ip, INET_ADDRSTRLEN) == NULL)
-    memset(ip, 0, INET_ADDRSTRLEN);
-
-  stream << pid.id << "@" << ip << ":" << pid.port;
+  stream << pid.id << "@" << pid.node;
   return stream;
 }
 
@@ -75,8 +70,8 @@ ostream& operator << (ostream& stream, const UPID& pid)
 istream& operator >> (istream& stream, UPID& pid)
 {
   pid.id = "";
-  pid.ip = 0;
-  pid.port = 0;
+  pid.node.ip = 0;
+  pid.node.port = 0;
 
   string str;
   if (!(stream >> str)) {
@@ -93,8 +88,7 @@ istream& operator >> (istream& stream, UPID& pid)
 
   string id;
   string host;
-  uint32_t ip;
-  uint16_t port;
+  Node node;
 
   size_t index = str.find('@');
 
@@ -116,53 +110,26 @@ istream& operator >> (istream& stream, UPID& pid)
     return stream;
   }
 
-  hostent he, *hep;
-  char* temp;
-  size_t length;
-  int result;
-  int herrno;
+  //TODO(evelinad): Extend this to support IPv6
+  Try<uint32_t> ip = net::getIP(host, AF_INET);
 
-  // Allocate temporary buffer for gethostbyname2_r.
-  length = 1024;
-  temp = new char[length];
-
-  while ((result = gethostbyname2_r(
-      host.c_str(), AF_INET, &he, temp, length, &hep, &herrno)) == ERANGE) {
-    // Enlarge the buffer.
-    delete[] temp;
-    length *= 2;
-    temp = new char[length];
-  }
-
-  if (result != 0 || hep == NULL) {
-    VLOG(2) << "Failed to parse host '" << host
-            << "' because " << hstrerror(herrno);
-    delete[] temp;
+  if (ip.isError()) {
+    VLOG(2) << ip.error();
     stream.setstate(std::ios_base::badbit);
     return stream;
   }
 
-  if (hep->h_addr_list[0] == NULL) {
-    VLOG(2) << "Got no addresses for '" << host << "'";
-    delete[] temp;
-    stream.setstate(std::ios_base::badbit);
-    return stream;
-  }
-
-  ip = *((uint32_t*) hep->h_addr_list[0]);
-
-  delete[] temp;
+  node.ip = ip.get();
 
   str = str.substr(index + 1);
 
-  if (sscanf(str.c_str(), "%hu", &port) != 1) {
+  if (sscanf(str.c_str(), "%hu", &node.port) != 1) {
     stream.setstate(std::ios_base::badbit);
     return stream;
   }
 
   pid.id = id;
-  pid.ip = ip;
-  pid.port = port;
+  pid.node = node;
 
   return stream;
 }
@@ -172,8 +139,8 @@ size_t hash_value(const UPID& pid)
 {
   size_t seed = 0;
   boost::hash_combine(seed, pid.id);
-  boost::hash_combine(seed, pid.ip);
-  boost::hash_combine(seed, pid.port);
+  boost::hash_combine(seed, pid.node.ip);
+  boost::hash_combine(seed, pid.node.port);
   return seed;
 }
 

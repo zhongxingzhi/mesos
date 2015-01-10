@@ -33,19 +33,25 @@
 #include <process/io.hpp>
 #include <process/owned.hpp>
 #include <process/pid.hpp>
+#include <process/reap.hpp>
 #include <process/subprocess.hpp>
 
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/try.hpp>
 
+#include "common/http.hpp"
+
 #include "master/flags.hpp"
 #include "master/master.hpp"
 
 #include "slave/constants.hpp"
-#include "slave/gc.hpp"
 #include "slave/flags.hpp"
+#include "slave/gc.hpp"
+#include "slave/graceful_shutdown.hpp"
 #include "slave/slave.hpp"
+
+#include "slave/containerizer/fetcher.hpp"
 
 #include "slave/containerizer/mesos/containerizer.hpp"
 
@@ -59,11 +65,12 @@ using namespace mesos::internal::tests;
 
 using mesos::internal::master::Master;
 
-using mesos::internal::slave::GarbageCollectorProcess;
-using mesos::internal::slave::Slave;
 using mesos::internal::slave::Containerizer;
+using mesos::internal::slave::Fetcher;
+using mesos::internal::slave::GarbageCollectorProcess;
 using mesos::internal::slave::MesosContainerizer;
 using mesos::internal::slave::MesosContainerizerProcess;
+using mesos::internal::slave::Slave;
 
 using process::Clock;
 using process::Future;
@@ -79,7 +86,10 @@ using testing::_;
 using testing::AtMost;
 using testing::DoAll;
 using testing::Eq;
+using testing::Invoke;
+using testing::InvokeWithoutArgs;
 using testing::Return;
+using testing::SaveArg;
 
 // Those of the overall Mesos master/slave/scheduler/driver tests
 // that seem vaguely more slave than master-related are in this file.
@@ -98,8 +108,10 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
   // Set the isolation flag so we know a MesoContainerizer will be created.
   flags.isolation = "posix/cpu,posix/mem";
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   CHECK_SOME(containerizer);
 
   Try<PID<Slave> > slave = StartSlave(containerizer.get());
@@ -388,6 +400,131 @@ TEST_F(SlaveTest, MesosExecutorWithOverride)
 }
 
 
+// Test that we don't let task arguments bleed over as
+// mesos-executor args. For more details of this see MESOS-1873.
+//
+// This assumes the ability to execute '/bin/echo --author'.
+TEST_F(SlaveTest, MesosExecutorCommandTaskWithArgsList)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Need flags for 'executor_registration_timeout'.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "posix/cpu,posix/mem";
+
+  Fetcher fetcher;
+
+  Try<MesosContainerizer*> containerizer =
+    MesosContainerizer::create(flags, false, &fetcher);
+  CHECK_SOME(containerizer);
+
+  Try<PID<Slave> > slave = StartSlave(containerizer.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  // Launch a task with the command executor.
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+
+  // Command executor will run as user running test.
+  CommandInfo command;
+  command.set_shell(false);
+  command.set_value("/bin/echo");
+  command.add_arguments("/bin/echo");
+  command.add_arguments("--author");
+
+  task.mutable_command()->MergeFrom(command);
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+
+  AWAIT_READY(statusFinished);
+  EXPECT_EQ(TASK_FINISHED, statusFinished.get().state());
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// Don't let args from the CommandInfo struct bleed over into
+// mesos-executor forking. For more details of this see MESOS-1873.
+TEST_F(SlaveTest, GetExecutorInfo)
+{
+  // Create a thin dummy Slave to access underlying getExecutorInfo().
+  // Testing this method should not necessarily require an integration
+  // test as with most other methods here.
+  slave::Flags flags = CreateSlaveFlags();
+  TestContainerizer containerizer;
+  StandaloneMasterDetector detector;
+  Files files;
+  slave::StatusUpdateManager updateManager(flags);
+
+  slave::GarbageCollector gc;
+  Slave slave(flags, &detector, &containerizer, &files, &gc, &updateManager);
+
+  FrameworkID frameworkId;
+  frameworkId.set_value("20141010-221431-251662764-60288-32120-0000");
+
+  // Launch a task with the command executor.
+  TaskInfo task;
+  task.set_name("task");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->set_value(
+      "20141010-221431-251662764-60288-32120-0001");
+  task.mutable_resources()->MergeFrom(
+      Resources::parse("cpus:0.1;mem:32").get());
+
+  CommandInfo command;
+  command.set_shell(false);
+  command.set_value("/bin/echo");
+  command.add_arguments("/bin/echo");
+  command.add_arguments("--author");
+
+  task.mutable_command()->MergeFrom(command);
+
+  const ExecutorInfo& executor = slave.getExecutorInfo(frameworkId, task);
+
+  // Now assert that it actually is running mesos-executor without any
+  // bleedover from the command we intend on running.
+  EXPECT_TRUE(executor.command().shell());
+  EXPECT_FALSE(executor.command().has_container());
+  EXPECT_EQ(0, executor.command().arguments_size());
+  EXPECT_NE(string::npos, executor.command().value().find("mesos-executor"));
+}
+
 // This test runs a command without the command user field set. The
 // command will verify the assumption that the command is run as the
 // slave user (in this case, root).
@@ -400,8 +537,10 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "posix/cpu,posix/mem";
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   CHECK_SOME(containerizer);
 
   Try<PID<Slave> > slave = StartSlave(containerizer.get());
@@ -435,9 +574,15 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
   CHECK_SOME(user) << "Failed to get current user name"
                    << (user.isError() ? ": " + user.error() : "");
 
+  const string helper =
+      path::join(tests::flags.build_dir, "src", "active-user-test-helper");
+
   // Command executor will run as user running test.
   CommandInfo command;
-  command.set_value("test `whoami` = " + user.get());
+  command.set_shell(false);
+  command.set_value(helper);
+  command.add_arguments(helper);
+  command.add_arguments(user.get());
 
   task.mutable_command()->MergeFrom(command);
 
@@ -470,7 +615,7 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
 // specified user. We use (and assume the precense) of the
 // unprivileged 'nobody' user which should be available on both Linux
 // and Mac OS X.
-TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
+TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithUser)
 {
   // TODO(nnielsen): Introduce STOUT abstraction for user verification
   // instead of flat getpwnam call.
@@ -488,8 +633,10 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "posix/cpu,posix/mem";
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   CHECK_SOME(containerizer);
 
   Try<PID<Slave> > slave = StartSlave(containerizer.get());
@@ -519,9 +666,15 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
   task.mutable_resources()->MergeFrom(offers.get()[0].resources());
 
+  const string helper =
+      path::join(tests::flags.build_dir, "src", "active-user-test-helper");
+
   CommandInfo command;
-  command.set_value("test `whoami` = " + testUser);
   command.set_user(testUser);
+  command.set_shell(false);
+  command.set_value(helper);
+  command.add_arguments(helper);
+  command.add_arguments(testUser);
 
   task.mutable_command()->MergeFrom(command);
 
@@ -707,6 +860,65 @@ TEST_F(SlaveTest, MetricsInStatsEndpoint)
 
   EXPECT_EQ(1u, stats.values.count("slave/valid_framework_messages"));
   EXPECT_EQ(1u, stats.values.count("slave/invalid_framework_messages"));
+
+  EXPECT_EQ(1u, stats.values.count("slave/cpus_total"));
+  EXPECT_EQ(1u, stats.values.count("slave/cpus_used"));
+  EXPECT_EQ(1u, stats.values.count("slave/cpus_percent"));
+
+  EXPECT_EQ(1u, stats.values.count("slave/mem_total"));
+  EXPECT_EQ(1u, stats.values.count("slave/mem_used"));
+  EXPECT_EQ(1u, stats.values.count("slave/mem_percent"));
+
+  EXPECT_EQ(1u, stats.values.count("slave/disk_total"));
+  EXPECT_EQ(1u, stats.values.count("slave/disk_used"));
+  EXPECT_EQ(1u, stats.values.count("slave/disk_percent"));
+
+  Shutdown();
+}
+
+
+TEST_F(SlaveTest, StateEndpoint)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  flags.resources = "cpus:4;mem:2048;disk:512;ports:[33000-34000]";
+  flags.attributes = "rack:abc;host:myhost";
+
+  Try<PID<Slave> > slave = StartSlave(flags);
+  ASSERT_SOME(slave);
+
+  Future<process::http::Response> response =
+    process::http::get(slave.get(), "state.json");
+
+  AWAIT_READY(response);
+
+  EXPECT_SOME_EQ(
+      "application/json",
+      response.get().headers.get("Content-Type"));
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+
+  ASSERT_SOME(parse);
+
+  JSON::Object state = parse.get();
+
+  // Check if 'resources' matches.
+  Try<Resources> resources = Resources::parse(
+      flags.resources.get(), flags.default_role);
+
+  ASSERT_SOME(resources);
+
+  ASSERT_EQ(1u, state.values.count("resources"));
+  EXPECT_EQ(state.values["resources"], JSON::Value(model(resources.get())));
+
+  // Check if 'attributes' matches.
+  Attributes attributes = Attributes::parse(flags.attributes.get());
+
+  ASSERT_EQ(1u, state.values.count("attributes"));
+  EXPECT_EQ(state.values["attributes"], JSON::Value(model(attributes)));
 
   Shutdown();
 }
@@ -985,4 +1197,548 @@ TEST_F(SlaveTest, PingTimeoutSomePings)
 
   AWAIT_READY(detected);
   AWAIT_READY(slaveReregisteredMessage);
+}
+
+
+// This test ensures that a killTask() can happen between runTask()
+// and _runTask() and then gets "handled properly". This means that
+// the task never gets started, but also does not get lost. The end
+// result is status TASK_KILLED. Essentially, killing the task is
+// realized while preparing to start it. See MESOS-947. This test
+// removes the framework and proves that removeFramework() is
+// called. See MESOS-1945.
+TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  StandaloneMasterDetector detector(master.get());
+
+  MockSlave slave(CreateSlaveFlags(), &detector, &containerizer);
+  process::spawn(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(0);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .Times(0);
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(0);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillRepeatedly(FutureArg<1>(&status));
+
+  EXPECT_CALL(slave, runTask(_, _, _, _, _))
+    .WillOnce(Invoke(&slave, &MockSlave::unmocked_runTask));
+
+  // Saved arguments from Slave::_runTask().
+  Future<bool> future;
+  FrameworkInfo frameworkInfo;
+  FrameworkID frameworkId;
+
+  // Skip what Slave::_runTask() normally does, save its arguments for
+  // later, tie reaching the critical moment when to kill the task to
+  // a future.
+  Future<Nothing> _runTask;
+  EXPECT_CALL(slave, _runTask(_, _, _, _, _))
+    .WillOnce(DoAll(FutureSatisfy(&_runTask),
+                    SaveArg<0>(&future),
+                    SaveArg<1>(&frameworkInfo),
+                    SaveArg<2>(&frameworkId)));
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(_runTask);
+
+  // Since this is the only task ever for this framework, the
+  // framework should get removed in Slave::killTask().
+  // Thus we can observe that this happens before Shutdown().
+  Future<Nothing> removeFramework;
+  EXPECT_CALL(slave, removeFramework(_))
+    .WillOnce(DoAll(Invoke(&slave, &MockSlave::unmocked_removeFramework),
+                    FutureSatisfy(&removeFramework)));
+
+  Future<Nothing> killTask;
+  EXPECT_CALL(slave, killTask(_, _, _))
+    .WillOnce(DoAll(Invoke(&slave, &MockSlave::unmocked_killTask),
+                    FutureSatisfy(&killTask)));
+
+  driver.killTask(task.task_id());
+
+  AWAIT_READY(killTask);
+  slave.unmocked__runTask(
+      future, frameworkInfo, frameworkId, master.get(), task);
+
+  AWAIT_READY(removeFramework);
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_KILLED, status.get().state());
+
+  driver.stop();
+  driver.join();
+
+  process::terminate(slave);
+  process::wait(slave);
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// This test verifies that when a slave re-registers with the master
+// it correctly includes the latest and status update task states.
+TEST_F(SlaveTest, ReregisterWithStatusUpdateTaskState)
+{
+  // Start a master.
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  // Create a StandaloneMasterDetector to enable the slave to trigger
+  // re-registration later.
+  StandaloneMasterDetector detector(master.get());
+
+  // Start a slave.
+  Try<PID<Slave> > slave = StartSlave(&exec, &detector);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 2, 1024, "*"))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  ExecutorDriver* execDriver;
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .WillOnce(SaveArg<0>(&execDriver));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  // Signal when the first update is dropped.
+  Future<StatusUpdateMessage> statusUpdateMessage =
+    DROP_PROTOBUF(StatusUpdateMessage(), _, master.get());
+
+  Future<Nothing> __statusUpdate = FUTURE_DISPATCH(_, &Slave::__statusUpdate);
+
+  driver.start();
+
+  // Pause the clock to avoid status update retries.
+  Clock::pause();
+
+  // Wait until TASK_RUNNING is sent to the master.
+  AWAIT_READY(statusUpdateMessage);
+
+  // Ensure status update manager handles TASK_RUNNING update.
+  AWAIT_READY(__statusUpdate);
+
+  Future<Nothing> __statusUpdate2 = FUTURE_DISPATCH(_, &Slave::__statusUpdate);
+
+  // Now send TASK_FINISHED update.
+  TaskStatus finishedStatus;
+  finishedStatus = statusUpdateMessage.get().update().status();
+  finishedStatus.set_state(TASK_FINISHED);
+  execDriver->sendStatusUpdate(finishedStatus);
+
+  // Ensure status update manager handles TASK_FINISHED update.
+  AWAIT_READY(__statusUpdate2);
+
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  // Drop any updates to the failed over master.
+  DROP_PROTOBUFS(StatusUpdateMessage(), _, master.get());
+
+  // Simulate a new master detected event on the slave,
+  // so that the slave will do a re-registration.
+  detector.appoint(master.get());
+
+  // Capture and inspect the slave reregistration message.
+  AWAIT_READY(reregisterSlaveMessage);
+
+  ASSERT_EQ(1, reregisterSlaveMessage.get().tasks_size());
+
+  // The latest state of the task should be TASK_FINISHED.
+  ASSERT_EQ(TASK_FINISHED, reregisterSlaveMessage.get().tasks(0).state());
+
+  // The status update state of the task should be TASK_RUNNING.
+  ASSERT_EQ(TASK_RUNNING,
+            reregisterSlaveMessage.get().tasks(0).status_update_state());
+
+  // The status update uuid should match the TASK_RUNNING's uuid.
+  ASSERT_EQ(statusUpdateMessage.get().update().uuid(),
+            reregisterSlaveMessage.get().tasks(0).status_update_uuid());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// This test verifies that label values can be set for tasks and that
+// they are exposed over the slave state endpoint.
+TEST_F(SlaveTest, TaskLabels)
+{
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Try<PID<Slave>> slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  // Add three labels to the task (two of which share the same key).
+  Labels* labels = task.mutable_labels();
+
+  Label* label1 = labels->add_labels();
+  label1->set_key("foo");
+  label1->set_value("bar");
+
+  Label* label2 = labels->add_labels();
+  label2->set_key("bar");
+  label2->set_value("baz");
+
+  Label* label3 = labels->add_labels();
+  label3->set_key("bar");
+  label3->set_value("qux");
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<Nothing> update;
+  EXPECT_CALL(containerizer,
+              update(_, Resources(offers.get()[0].resources())))
+    .WillOnce(DoAll(FutureSatisfy(&update),
+                    Return(Future<Nothing>())));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  AWAIT_READY(update);
+
+  // Verify label key and value in slave state.json.
+  Future<process::http::Response> response =
+    process::http::get(slave.get(), "state.json");
+  AWAIT_READY(response);
+
+  EXPECT_SOME_EQ(
+      "application/json",
+      response.get().headers.get("Content-Type"));
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::Array> labelsObject = parse.get().find<JSON::Array>(
+      "frameworks[0].executors[0].tasks[0].labels");
+  EXPECT_SOME(labelsObject);
+
+  JSON::Array labelsObject_ = labelsObject.get();
+
+  // Verify the content of 'foo:bar' pair.
+  Try<JSON::Value> expected = JSON::parse(
+      "{"
+      "  \"key\":\"foo\","
+      "  \"value\":\"bar\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[0], expected.get());
+
+
+  // Verify the content of 'bar:baz' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"bar\","
+      "  \"value\":\"baz\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[1], expected.get());
+
+
+  // Verify the content of 'bar:qux' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"bar\","
+      "  \"value\":\"qux\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[2], expected.get());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// This test checks that the mechanism of calculating nested graceful
+// shutdown periods does not break the default behaviour and works as
+// expected.
+TEST_F(SlaveTest, ShutdownGracePeriod)
+{
+  Duration defaultTimeout = slave::EXECUTOR_SHUTDOWN_GRACE_PERIOD;
+  Duration customTimeout = Seconds(10);
+
+  // We used to have a signal escalation timeout constant responsibe
+  // for graceful shutdown period in the CommandExecutor. Make sure
+  // the default behaviour (3s) persists.
+  EXPECT_EQ(Seconds(3), slave::getExecutorGracePeriod(defaultTimeout));
+
+  // The new logic uses a certain delta to calculate nested timeouts.
+  EXPECT_EQ(Duration::zero(), slave::getExecutorGracePeriod(Duration::zero()));
+  EXPECT_EQ(Seconds(2), slave::getContainerizerGracePeriod(Duration::zero()));
+  EXPECT_EQ(customTimeout + Seconds(2),
+            slave::getContainerizerGracePeriod(customTimeout));
+
+  // The grace period in ExecutorProcess should be bigger than the
+  // grace period in an executor.
+  EXPECT_GT(slave::getExecGracePeriod(defaultTimeout),
+            slave::getExecutorGracePeriod(defaultTimeout));
+
+  // Check the graceful shutdown periods that reach the executor in
+  // protobuf messages.
+  // NOTE: We check only the message contents and *not* the value
+  // stored by the executor.
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.executor_shutdown_grace_period = slave::EXECUTOR_SHUTDOWN_GRACE_PERIOD;
+
+  Try<PID<Slave>> slave = StartSlave(&containerizer, flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_FALSE(offers.get().empty());
+  Offer offer = offers.get()[0];
+
+  // Create one task with shutdown grace period set and one without.
+  TaskInfo taskCustom;
+  taskCustom.set_name("Task with custom grace shutdown period");
+  taskCustom.mutable_task_id()->set_value("custom");
+  taskCustom.mutable_slave_id()->MergeFrom(offer.slave_id());
+  taskCustom.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+  taskCustom.mutable_resources()->CopyFrom(
+      Resources::parse("cpus:0.1;mem:64").get());
+  taskCustom.mutable_executor()->mutable_command()->set_grace_period_seconds(
+      Seconds(customTimeout).value());
+
+  TaskInfo taskDefault;
+  taskDefault.set_name("Task with default grace shutdown period");
+  taskDefault.mutable_task_id()->set_value("default");
+  taskDefault.mutable_slave_id()->MergeFrom(offer.slave_id());
+  taskDefault.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+  taskDefault.mutable_resources()->CopyFrom(
+      Resources::parse("cpus:0.1;mem:64").get());
+
+  ASSERT_TRUE(Resources(offer.resources()).contains(
+      taskCustom.resources() + taskDefault.resources()));
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(taskCustom);
+  tasks.push_back(taskDefault);
+
+  Future<TaskInfo> task1, task2;
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(FutureArg<1>(&task1))
+    .WillOnce(FutureArg<1>(&task2));
+
+  driver.launchTasks(offer.id(), tasks);
+
+  AWAIT_READY(task1);
+  AWAIT_READY(task2);
+
+  // Currently (14 Nov 2014) grace periods customized by frameworks
+  // are ignored.
+  EXPECT_DOUBLE_EQ(
+      Seconds(defaultTimeout).value(),
+      task1.get().executor().command().grace_period_seconds());
+  EXPECT_DOUBLE_EQ
+      (Seconds(defaultTimeout).value(),
+      task2.get().executor().command().grace_period_seconds());
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+
+// This test runs a long-living task responsive to SIGTERM and
+// attempts to kill it gracefully.
+TEST_F(SlaveTest, MesosExecutorGracefulShutdown)
+{
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Explicitly set the grace period for slave default.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.executor_shutdown_grace_period = slave::EXECUTOR_SHUTDOWN_GRACE_PERIOD;
+
+  // Ensure escalation timeout is more than the maximal reap interval.
+  auto timeout = slave::getExecutorGracePeriod(
+      slave::EXECUTOR_SHUTDOWN_GRACE_PERIOD);
+  EXPECT_LT(process::MAX_REAP_INTERVAL(), timeout);
+
+  Fetcher fetcher;
+  Try<MesosContainerizer*> containerizer = MesosContainerizer::create(
+      flags, true, &fetcher);
+  ASSERT_SOME(containerizer);
+
+  Try<PID<Slave>> slave = StartSlave(containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_FALSE(offers.get().empty());
+  Offer offer = offers.get()[0];
+
+  // Launch a long-running task responsive to SIGTERM.
+  TaskInfo taskResponsive = createTask(offer, "sleep 1000");
+  vector<TaskInfo> tasks;
+  tasks.push_back(taskResponsive);
+
+  Future<TaskStatus> statusRunning, statusKilled;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusKilled));
+
+  driver.launchTasks(offer.id(), tasks);
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+
+  driver.killTask(taskResponsive.task_id());
+
+  AWAIT_READY(statusKilled);
+  EXPECT_EQ(TASK_KILLED, statusKilled.get().state());
+
+  // CommandExecutor supports graceful shutdown in sending SIGTERM
+  // first. If the task obeys, it will be reaped and we get
+  // appropriate status message.
+  // NOTE: strsignal() behaves differently on Mac OS and Linux.
+  // TODO(alex): By now we have no better way to extract the kill
+  // reason. Change this once we have level 2 enums for task states.
+  EXPECT_TRUE(statusKilled.get().has_message());
+  EXPECT_NE(std::string::npos, statusKilled.get().message().find("Terminated"));
+
+  // Stop the driver while the task is running.
+  driver.stop();
+  driver.join();
+
+  Shutdown();  // Must shutdown before 'containerizer' gets deallocated.
+  delete containerizer.get();
 }

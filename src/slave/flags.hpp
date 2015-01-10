@@ -21,11 +21,16 @@
 
 #include <string>
 
+#include <stout/bytes.hpp>
 #include <stout/duration.hpp>
 #include <stout/flags.hpp>
 #include <stout/option.hpp>
 
+#include "common/parse.hpp"
+
 #include "logging/flags.hpp"
+
+#include "messages/messages.hpp"
 
 #include "slave/constants.hpp"
 
@@ -41,7 +46,8 @@ public:
     add(&Flags::hostname,
         "hostname",
         "The hostname the slave should report.\n"
-        "If left unset, system hostname will be used (recommended).");
+        "If left unset, the hostname is resolved from the IP address\n"
+        "that the slave binds to.");
 
     add(&Flags::version,
         "version",
@@ -59,7 +65,8 @@ public:
         "Isolation mechanisms to use, e.g., 'posix/cpu,posix/mem', or\n"
         "'cgroups/cpu,cgroups/mem', or network/port_mapping\n"
         "(configure with flag: --with-network-isolator to enable),\n"
-        "or 'external'.",
+        "or 'external', or load an alternate isolator module using\n"
+        "the --modules flag.",
         "posix/cpu,posix/mem");
 
     add(&Flags::default_role,
@@ -74,7 +81,7 @@ public:
     add(&Flags::attributes,
         "attributes",
         "Attributes of machine, in the form:\n"
-        "rack:2 or 'rack:2,u:1'");
+        "rack:2 or 'rack:2;u:1'");
 
     add(&Flags::work_dir,
         "work_dir",
@@ -125,8 +132,10 @@ public:
 
     add(&Flags::executor_shutdown_grace_period,
         "executor_shutdown_grace_period",
-        "Amount of time to wait for an executor\n"
-        "to shut down (e.g., 60secs, 3mins, etc)",
+        "Amount of time to wait for an executor to shut down\n"
+        "(e.g., 60s, 3min, etc). If the flag value is too small\n"
+        "(less than 3s), there may not be enough time for the\n"
+        "executor to react and can result in a hard shutdown.",
         EXECUTOR_SHUTDOWN_GRACE_PERIOD);
 
     add(&Flags::gc_delay,
@@ -136,6 +145,15 @@ public:
         "Note that this delay may be shorter depending on\n"
         "the available disk usage.",
         GC_DELAY);
+
+    add(&Flags::gc_disk_headroom,
+        "gc_disk_headroom",
+        "Adjust disk headroom used to calculate maximum executor\n"
+        "directory age. Age is calculated by:\n"
+        "gc_delay * max(0.0, (1.0 - gc_disk_headroom - disk usage))\n"
+        "every --disk_watch_interval duration. gc_disk_headroom must\n"
+        "be a value between 0.0 and 1.0",
+        GC_DISK_HEADROOM);
 
     add(&Flags::disk_watch_interval,
         "disk_watch_interval",
@@ -152,6 +170,7 @@ public:
     // TODO(vinod): Consider killing this flag and always checkpoint.
     add(&Flags::checkpoint,
         "checkpoint",
+        "This flag is deprecated and will be removed in a future release.\n"
         "Whether to checkpoint slave and frameworks information\n"
         "to disk. This enables a restarted slave to recover\n"
         "status updates and reconnect with (--recover=reconnect) or\n"
@@ -284,6 +303,7 @@ public:
         "The default container image to use if not specified by a task,\n"
         "when using external containerizer.\n");
 
+    // Docker containerizer flags.
     add(&Flags::docker,
         "docker",
         "The absolute path to the docker executable for docker\n"
@@ -295,6 +315,39 @@ public:
         "The absolute path for the directory in the container where the\n"
         "sandbox is mapped to.\n",
         "/mnt/mesos/sandbox");
+
+    add(&Flags::docker_remove_delay,
+        "docker_remove_delay",
+        "The amount of time to wait before removing docker containers\n"
+        "(e.g., 3days, 2weeks, etc).\n",
+        DOCKER_REMOVE_DELAY);
+
+    add(&Flags::default_container_info,
+        "default_container_info",
+        "JSON formatted ContainerInfo that will be included into\n"
+        "any ExecutorInfo that does not specify a ContainerInfo.\n"
+        "\n"
+        "See the ContainerInfo protobuf in mesos.proto for\n"
+        "the expected format.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "\"type\": \"MESOS\",\n"
+        "\"volumes\": [\n"
+        "  {\n"
+        "    \"host_path\": \"./.private/tmp\",\n"
+        "    \"container_path\": \"/tmp\",\n"
+        "    \"mode\": \"RW\"\n"
+        "  }\n"
+        " ]\n"
+        "}"
+        );
+
+    add(&Flags::docker_stop_timeout,
+        "docker_stop_timeout",
+        "The time as a duration for docker to wait after stopping an instance\n"
+        "before it kills that instance.",
+        Seconds(0));
 
 #ifdef WITH_NETWORK_ISOLATOR
     add(&Flags::ephemeral_ports_per_container,
@@ -313,7 +366,74 @@ public:
         "lo_name",
         "The name of the loopback network interface (e.g., lo). If it is\n"
         "not specified, the network isolator will try to guess it.");
+
+    add(&Flags::egress_rate_limit_per_container,
+        "egress_rate_limit_per_container",
+        "The limit of the egress traffic for each container, in Bytes/s.\n"
+        "If not specified or specified as zero, the network isolator will\n"
+        "impose no limits to containers' egress traffic throughput.\n"
+        "This flag uses the Bytes type, defined in stout.");
+
+    add(&Flags::network_enable_socket_statistics,
+        "network_enable_socket_statistics",
+        "Whether to collect socket statistics (e.g., TCP RTT) for\n"
+        "each container.",
+        false);
 #endif // WITH_NETWORK_ISOLATOR
+
+    // This help message for --modules flag is the same for
+    // {master,slave,tests}/flags.hpp and should always be kept in
+    // sync.
+    // TODO(karya): Remove the JSON example and add reference to the
+    // doc file explaining the --modules flag.
+    add(&Flags::modules,
+        "modules",
+        "List of modules to be loaded and be available to the internal\n"
+        "subsystems.\n"
+        "\n"
+        "Use --modules=filepath to specify the list of modules via a\n"
+        "file containing a JSON formatted string. 'filepath' can be\n"
+        "of the form 'file:///path/to/file' or '/path/to/file'.\n"
+        "\n"
+        "Use --modules=\"{...}\" to specify the list of modules inline.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "  \"libraries\": [\n"
+        "    {\n"
+        "      \"file\": \"/path/to/libfoo.so\",\n"
+        "      \"modules\": [\n"
+        "        {\n"
+        "          \"name\": \"org_apache_mesos_bar\",\n"
+        "          \"parameters\": [\n"
+        "            {\n"
+        "              \"key\": \"X\",\n"
+        "              \"value\": \"Y\"\n"
+        "            }\n"
+        "          ]\n"
+        "        },\n"
+        "        {\n"
+        "          \"name\": \"org_apache_mesos_baz\"\n"
+        "        }\n"
+        "      ]\n"
+        "    },\n"
+        "    {\n"
+        "      \"name\": \"qux\",\n"
+        "      \"modules\": [\n"
+        "        {\n"
+        "          \"name\": \"org_apache_mesos_norf\"\n"
+        "        }\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}");
+
+    add(&Flags::authenticatee,
+        "authenticatee",
+        "Authenticatee implementation to use when authenticating against the\n"
+        "master. Use the default '" + DEFAULT_AUTHENTICATEE + "', or\n"
+        "load an alternate authenticatee module using --modules.",
+        DEFAULT_AUTHENTICATEE);
   }
 
   bool version;
@@ -331,6 +451,7 @@ public:
   Duration executor_registration_timeout;
   Duration executor_shutdown_grace_period;
   Duration gc_delay;
+  double gc_disk_headroom;
   Duration disk_watch_interval;
   Duration resource_monitoring_interval;
   bool checkpoint;
@@ -355,11 +476,18 @@ public:
   Option<std::string> default_container_image;
   std::string docker;
   std::string docker_sandbox_directory;
+  Duration docker_remove_delay;
+  Option<ContainerInfo> default_container_info;
+  Duration docker_stop_timeout;
 #ifdef WITH_NETWORK_ISOLATOR
   uint16_t ephemeral_ports_per_container;
   Option<std::string> eth0_name;
   Option<std::string> lo_name;
+  Option<Bytes> egress_rate_limit_per_container;
+  bool network_enable_socket_statistics;
 #endif
+  Option<Modules> modules;
+  std::string authenticatee;
 };
 
 } // namespace slave {

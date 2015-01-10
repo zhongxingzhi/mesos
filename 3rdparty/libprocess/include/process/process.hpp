@@ -121,13 +121,13 @@ protected:
   HttpRequestHandler;
 
   // Setup a handler for an HTTP request.
-  bool route(
+  void route(
       const std::string& name,
       const Option<std::string>& help,
       const HttpRequestHandler& handler);
 
   template <typename T>
-  bool route(
+  void route(
       const std::string& name,
       const Option<std::string>& help,
       Future<http::Response> (T::*method)(const http::Request&))
@@ -137,7 +137,7 @@ protected:
     // multiple callback interfaces).
     HttpRequestHandler handler =
       lambda::bind(method, dynamic_cast<T*>(this), lambda::_1);
-    return route(name, help, handler);
+    route(name, help, handler);
   }
 
   // Provide the static asset(s) at the specified _absolute_ path for
@@ -270,16 +270,15 @@ void initialize(const std::string& delegate = "");
 
 
 /**
- * Returns the IP address associated with this instance of the
- * library.
+ * Clean up the library.
  */
-uint32_t ip();
+void finalize();
 
 
 /**
- * Returns the port associated with this instance of the library.
+ * Returns the node associated with this instance of the library.
  */
-uint16_t port();
+Node node();
 
 
 /**

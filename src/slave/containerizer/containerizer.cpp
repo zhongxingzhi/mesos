@@ -26,6 +26,7 @@
 #include <stout/hashmap.hpp>
 #include <stout/net.hpp>
 #include <stout/stringify.hpp>
+#include <stout/strings.hpp>
 #include <stout/uuid.hpp>
 
 #include "slave/flags.hpp"
@@ -67,8 +68,13 @@ Try<Resources> Containerizer::resources(const Flags& flags)
 
   Resources resources = parsed.get();
 
-  // CPU resource.
-  if (!resources.cpus().isSome()) {
+  // NOTE: We need to check for the "cpus" string within the flag
+  // because once Resources are parsed, we cannot distinguish between
+  //  (1) "cpus:0", and
+  //  (2) no cpus specified.
+  // We only auto-detect cpus in case (2).
+  // The same logic applies for the other resources!
+  if (!strings::contains(flags.resources.get(""), "cpus")) {
     // No CPU specified so probe OS or resort to DEFAULT_CPUS.
     double cpus;
     Try<long> cpus_ = os::cpus();
@@ -88,7 +94,7 @@ Try<Resources> Containerizer::resources(const Flags& flags)
   }
 
   // Memory resource.
-  if (!resources.mem().isSome()) {
+  if (!strings::contains(flags.resources.get(""), "mem")) {
     // No memory specified so probe OS or resort to DEFAULT_MEM.
     Bytes mem;
     Try<os::Memory> mem_ = os::memory();
@@ -113,7 +119,7 @@ Try<Resources> Containerizer::resources(const Flags& flags)
   }
 
   // Disk resource.
-  if (!resources.disk().isSome()) {
+  if (!strings::contains(flags.resources.get(""), "disk")) {
     // No disk specified so probe OS or resort to DEFAULT_DISK.
     Bytes disk;
 
@@ -141,7 +147,7 @@ Try<Resources> Containerizer::resources(const Flags& flags)
   }
 
   // Network resource.
-  if (!resources.ports().isSome()) {
+  if (!strings::contains(flags.resources.get(""), "ports")) {
     // No ports specified so resort to DEFAULT_PORTS.
     resources += Resources::parse(
         "ports",
@@ -153,13 +159,24 @@ Try<Resources> Containerizer::resources(const Flags& flags)
 }
 
 
-Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
+Try<Containerizer*> Containerizer::create(
+    const Flags& flags,
+    bool local,
+    Fetcher* fetcher)
 {
   if (flags.isolation == "external") {
     LOG(WARNING) << "The 'external' isolation flag is deprecated, "
                  << "please update your flags to"
                  << " '--containerizers=external'.";
-    return ExternalContainerizer::create(flags, local);
+
+    Try<ExternalContainerizer*> containerizer =
+      ExternalContainerizer::create(flags);
+    if (containerizer.isError()) {
+      return Error("Could not create ExternalContainerizer: " +
+                   containerizer.error());
+    }
+
+    return containerizer.get();
   }
 
   // TODO(benh): We need to store which containerizer or
@@ -171,7 +188,7 @@ Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
   foreach (const string& type, strings::split(flags.containerizers, ",")) {
     if (type == "mesos") {
       Try<MesosContainerizer*> containerizer =
-        MesosContainerizer::create(flags, local);
+        MesosContainerizer::create(flags, local, fetcher);
       if (containerizer.isError()) {
         return Error("Could not create MesosContainerizer: " +
                      containerizer.error());
@@ -180,7 +197,7 @@ Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
       }
     } else if (type == "docker") {
       Try<DockerContainerizer*> containerizer =
-        DockerContainerizer::create(flags);
+        DockerContainerizer::create(flags, fetcher);
       if (containerizer.isError()) {
         return Error("Could not create DockerContainerizer: " +
                      containerizer.error());
@@ -188,8 +205,8 @@ Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
         containerizers.push_back(containerizer.get());
       }
     } else if (type == "external") {
-      Try<Containerizer*> containerizer =
-        ExternalContainerizer::create(flags, local);
+      Try<ExternalContainerizer*> containerizer =
+        ExternalContainerizer::create(flags);
       if (containerizer.isError()) {
         return Error("Could not create ExternalContainerizer: " +
                      containerizer.error());
@@ -269,46 +286,24 @@ map<string, string> executorEnvironment(
   env["MESOS_SLAVE_PID"] = stringify(slavePid);
   env["MESOS_CHECKPOINT"] = checkpoint ? "1" : "0";
 
+  // We expect the graceful shutdown timeout to be set either by a
+  // framework or to default value from slave's flags. In case it is
+  // absent for some reason, use the hardcoded default.
+  if (executorInfo.command().has_grace_period_seconds()) {
+    env["MESOS_SHUTDOWN_GRACE_PERIOD"] =
+      stringify(Seconds(executorInfo.command().grace_period_seconds()));
+  } else {
+    LOG(WARNING) << "CommandInfo.grace_period flag is not set, "
+                 << "using default value: " << EXECUTOR_SHUTDOWN_GRACE_PERIOD;
+    env["MESOS_SHUTDOWN_GRACE_PERIOD"] =
+      stringify(EXECUTOR_SHUTDOWN_GRACE_PERIOD);
+  }
+
   if (checkpoint) {
     env["MESOS_RECOVERY_TIMEOUT"] = stringify(recoveryTimeout);
   }
 
   return env;
-}
-
-
-// Helper method to build the environment map used to launch fetcher.
-map<string, string> fetcherEnvironment(
-    const CommandInfo& commandInfo,
-    const std::string& directory,
-    const Option<std::string>& user,
-    const Flags& flags)
-{
-  // Prepare the environment variables to pass to mesos-fetcher.
-  string uris = "";
-  foreach (const CommandInfo::URI& uri, commandInfo.uris()) {
-    uris += uri.value() + "+" +
-    (uri.has_executable() && uri.executable() ? "1" : "0") +
-    (uri.extract() ? "X" : "N");
-    uris += " ";
-  }
-  // Remove extra space at the end.
-  uris = strings::trim(uris);
-
-  map<string, string> environment;
-  environment["MESOS_EXECUTOR_URIS"] = uris;
-  environment["MESOS_WORK_DIRECTORY"] = directory;
-  if (user.isSome()) {
-    environment["MESOS_USER"] = user.get();
-  }
-  if (!flags.frameworks_home.empty()) {
-    environment["MESOS_FRAMEWORKS_HOME"] = flags.frameworks_home;
-  }
-  if (!flags.hadoop_home.empty()) {
-    environment["HADOOP_HOME"] = flags.hadoop_home;
-  }
-
-  return environment;
 }
 
 

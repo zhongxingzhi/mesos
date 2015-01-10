@@ -29,6 +29,7 @@
 
 #include <process/collect.hpp>
 #include <process/defer.hpp>
+#include <process/io.hpp>
 #include <process/pid.hpp>
 #include <process/subprocess.hpp>
 
@@ -44,12 +45,16 @@
 #include <stout/stringify.hpp>
 
 #include <stout/os/exists.hpp>
-#include <stout/os/setns.hpp>
+
+#include "common/status_utils.hpp"
 
 #include "linux/fs.hpp"
+#include "linux/ns.hpp"
 
 #include "linux/routing/route.hpp"
 #include "linux/routing/utils.hpp"
+
+#include "linux/routing/diagnosis/diagnosis.hpp"
 
 #include "linux/routing/filter/arp.hpp"
 #include "linux/routing/filter/icmp.hpp"
@@ -74,12 +79,14 @@ using namespace routing::filter;
 using namespace routing::queueing;
 
 using std::cerr;
+using std::cout;
 using std::dec;
 using std::endl;
 using std::hex;
 using std::list;
 using std::ostringstream;
 using std::set;
+using std::sort;
 using std::string;
 using std::vector;
 
@@ -123,6 +130,7 @@ static net::IP LOOPBACK_IP = net::IP::fromDotDecimal("127.0.0.1/8").get();
 // The well known ports. Used for sanity check.
 static const Interval<uint16_t> WELL_KNOWN_PORTS =
   (Bound<uint16_t>::closed(0), Bound<uint16_t>::open(1024));
+
 
 /////////////////////////////////////////////////
 // Helper functions for the isolator.
@@ -427,7 +435,7 @@ int PortMappingUpdate::execute()
   }
 
   // Enter the network namespace.
-  Try<Nothing> setns = os::setns(flags.pid.get(), "net");
+  Try<Nothing> setns = ns::setns(flags.pid.get(), "net");
   if (setns.isError()) {
     cerr << "Failed to enter the network namespace of pid " << flags.pid.get()
          << ": " << setns.error() << endl;
@@ -456,6 +464,97 @@ int PortMappingUpdate::execute()
         return 1;
       }
     }
+  }
+
+  return 0;
+}
+
+/////////////////////////////////////////////////
+// Implementation for PortMappingStatistics.
+/////////////////////////////////////////////////
+
+const std::string PortMappingStatistics::NAME = "statistics";
+
+
+PortMappingStatistics::Flags::Flags()
+{
+  add(&help,
+      "help",
+      "Prints this help message",
+      false);
+
+  add(&pid,
+      "pid",
+      "The pid of the process whose namespaces we will enter");
+}
+
+
+int PortMappingStatistics::execute()
+{
+  if (flags.help) {
+    cerr << "Usage: " << name() << " [OPTIONS]" << endl << endl
+         << "Supported options:" << endl
+         << flags.usage();
+    return 0;
+  }
+
+  if (flags.pid.isNone()) {
+    cerr << "The pid is not specified" << endl;
+    return 1;
+  }
+
+  // Enter the network namespace.
+  Try<Nothing> setns = ns::setns(flags.pid.get(), "net");
+  if (setns.isError()) {
+    // This could happen if the executor exits before this function is
+    // invoked. We do not log here to avoid spurious logging.
+    return 1;
+  }
+
+  // NOTE: If the underlying library uses the older version of kernel
+  // API, the family argument passed in may not be honored.
+  Try<vector<diagnosis::socket::Info> > infos =
+    diagnosis::socket::infos(AF_INET, diagnosis::socket::state::ALL);
+
+  if (infos.isError()) {
+    cerr << "Failed to retrieve the socket information" << endl;
+  }
+
+  vector<uint32_t> RTTs;
+  foreach (const diagnosis::socket::Info& info, infos.get()) {
+    // We double check on family regardless.
+    if (info.family != AF_INET) {
+      continue;
+    }
+
+    // We consider all sockets that have non-zero rtt value.
+    if (info.tcpInfo.isSome() && info.tcpInfo.get().tcpi_rtt != 0) {
+      RTTs.push_back(info.tcpInfo.get().tcpi_rtt);
+    }
+  }
+
+  // Only print to stdout when we have results.
+  if (RTTs.size() > 0) {
+    std::sort(RTTs.begin(), RTTs.end());
+
+    // NOTE: The size of RTTs is usually within 1 million so we don't
+    // need to worry about overflow here.
+    // TODO(jieyu): Right now, we choose to use "Nearest rank" for
+    // simplicity. Consider directly using the Statistics abstraction
+    // which computes "Linear interpolation between closest ranks".
+    // http://en.wikipedia.org/wiki/Percentile
+    size_t p50 = RTTs.size() * 50 / 100;
+    size_t p90 = RTTs.size() * 90 / 100;
+    size_t p95 = RTTs.size() * 95 / 100;
+    size_t p99 = RTTs.size() * 99 / 100;
+
+    JSON::Object object;
+    object.values["net_tcp_rtt_microsecs_p50"] = RTTs[p50];
+    object.values["net_tcp_rtt_microsecs_p90"] = RTTs[p90];
+    object.values["net_tcp_rtt_microsecs_p95"] = RTTs[p95];
+    object.values["net_tcp_rtt_microsecs_p99"] = RTTs[p99];
+
+    cout << stringify(object);
   }
 
   return 0;
@@ -608,7 +707,7 @@ Try<Isolator*> PortMappingIsolatorProcess::create(const Flags& flags)
 
   // Verify that the network namespace is available by checking the
   // existence of the network namespace handle of the current process.
-  if (os::namespaces().count("net") == 0) {
+  if (ns::namespaces().count("net") == 0) {
     return Error(
         "Using network isolator requires network namespace. "
         "Make sure your kernel is newer than 3.4");
@@ -815,6 +914,49 @@ Try<Isolator*> PortMappingIsolatorProcess::create(const Flags& flags)
 
   LOG(INFO) << "Using " << lo.get() << " as the loopback interface";
 
+  // If egress rate limit is provided, do a sanity check that it is
+  // not greater than the host physical link speed.
+  Option<Bytes> egressRateLimitPerContainer;
+  if (flags.egress_rate_limit_per_container.isSome()) {
+    // Read host physical link speed from /sys/class/net/eth0/speed.
+    // This value is in MBits/s.
+    Try<string> value =
+      os::read(path::join("/sys/class/net", eth0.get(), "speed"));
+
+    if (value.isError()) {
+      return Error(
+          "Failed to read " +
+          path::join("/sys/class/net", eth0.get(), "speed") +
+          ": " + value.error());
+    }
+
+    Try<uint64_t> hostLinkSpeed = numify<uint64_t>(strings::trim(value.get()));
+    CHECK_SOME(hostLinkSpeed);
+
+    // It could be possible that the nic driver doesn't support
+    // reporting physical link speed. In that case, report error.
+    if (hostLinkSpeed.get() == 0xFFFFFFFF) {
+      return Error(
+          "Network Isolator failed to determine link speed for " + eth0.get());
+    }
+
+    // Convert host link speed to Bytes/s for comparason.
+    if (hostLinkSpeed.get() * 1000000 / 8 <
+        flags.egress_rate_limit_per_container.get().bytes()) {
+      return Error(
+          "The given egress traffic limit for containers " +
+          stringify(flags.egress_rate_limit_per_container.get().bytes()) +
+          " Bytes/s is greater than the host link speed " +
+          stringify(hostLinkSpeed.get() * 1000000 / 8) + " Bytes/s");
+    }
+
+    if (flags.egress_rate_limit_per_container.get() != Bytes(0)) {
+      egressRateLimitPerContainer = flags.egress_rate_limit_per_container.get();
+    } else {
+      LOG(WARNING) << "Ignoring the given zero egress rate limit";
+    }
+  }
+
   // Get the host IP, MAC and default gateway.
   Result<net::IP> hostIP = net::ip(eth0.get());
   if (!hostIP.isSome()) {
@@ -890,6 +1032,7 @@ Try<Isolator*> PortMappingIsolatorProcess::create(const Flags& flags)
   // feature only exists on kernel 3.6 or newer.
   const string loRouteLocalnet =
     path::join("/proc/sys/net/ipv4/conf", lo.get(), "route_localnet");
+
   if (!os::exists(loRouteLocalnet)) {
     // TODO(jieyu): Consider supporting running the isolator if this
     // feature is not available. We need to conditionally disable
@@ -952,6 +1095,47 @@ Try<Isolator*> PortMappingIsolatorProcess::create(const Flags& flags)
     return Error(
         "Failed to enable accept_local for " + lo.get() +
         ": " + write.error());
+  }
+
+  // Reading host network configurations. Each container will match
+  // these configurations.
+  hashset<string> procs;
+
+  // TODO(jieyu): The following is a partial list of all the
+  // configurations. In the future, we may want to expose these
+  // configurations using ContainerInfo.
+
+  // The kernel will use a default value for the following
+  // configurations inside a container. Therefore, we need to set them
+  // in the container to match that on the host.
+  procs.insert("/proc/sys/net/core/somaxconn");
+
+  // As of kernel 3.10, the following configurations are shared
+  // between host and containers, and therefore are not required to be
+  // set in containers. We keep them here just in case the kernel
+  // changes in the future.
+  procs.insert("/proc/sys/net/core/netdev_max_backlog");
+  procs.insert("/proc/sys/net/core/rmem_max");
+  procs.insert("/proc/sys/net/core/wmem_max");
+  procs.insert("/proc/sys/net/ipv4/tcp_keepalive_time");
+  procs.insert("/proc/sys/net/ipv4/tcp_keepalive_intvl");
+  procs.insert("/proc/sys/net/ipv4/tcp_keepalive_probes");
+  procs.insert("/proc/sys/net/ipv4/tcp_max_syn_backlog");
+  procs.insert("/proc/sys/net/ipv4/tcp_rmem");
+  procs.insert("/proc/sys/net/ipv4/tcp_retries2");
+  procs.insert("/proc/sys/net/ipv4/tcp_synack_retries");
+  procs.insert("/proc/sys/net/ipv4/tcp_wmem");
+  procs.insert("/proc/sys/net/ipv4/neigh/default/gc_thresh1");
+  procs.insert("/proc/sys/net/ipv4/neigh/default/gc_thresh2");
+  procs.insert("/proc/sys/net/ipv4/neigh/default/gc_thresh3");
+
+  hashmap<string, string> hostNetworkConfigurations;
+  foreach (const string& proc, procs) {
+    Try<string> value = os::read(proc);
+    if (value.isSome()) {
+      LOG(INFO) << proc << " = '" << strings::trim(value.get()) << "'";
+      hostNetworkConfigurations[proc] = strings::trim(value.get());
+    }
   }
 
   // Self bind mount BIND_MOUNT_ROOT. Since we use a new mount
@@ -1035,6 +1219,8 @@ Try<Isolator*> PortMappingIsolatorProcess::create(const Flags& flags)
           hostIP.get(),
           hostEth0MTU.get(),
           hostDefaultGateway.get(),
+          hostNetworkConfigurations,
+          egressRateLimitPerContainer,
           nonEphemeralPorts,
           ephemeralPortsAllocator)));
 }
@@ -1251,7 +1437,9 @@ PortMappingIsolatorProcess::_recover(pid_t pid)
 
 Future<Option<CommandInfo> > PortMappingIsolatorProcess::prepare(
     const ContainerID& containerId,
-    const ExecutorInfo& executorInfo)
+    const ExecutorInfo& executorInfo,
+    const string& directory,
+    const Option<string>& user)
 {
   if (unmanaged.contains(containerId)) {
     return Failure("Asked to prepare an unmanaged container");
@@ -1361,6 +1549,19 @@ Future<Nothing> PortMappingIsolatorProcess::isolate(
     return Failure(
         "Failed to create virtual ethernet pair: " +
         createVethPair.error());
+  }
+
+  // Disable IPv6 for veth as IPv6 packets won't be forwarded anyway.
+  const string disableIPv6 =
+    path::join("/proc/sys/net/ipv6/conf", veth(pid), "disable_ipv6");
+
+  if (os::exists(disableIPv6)) {
+    Try<Nothing> write = os::write(disableIPv6, "1");
+    if (write.isError()) {
+      return Failure(
+          "Failed to disable IPv6 for " + veth(pid) +
+          ": " + write.error());
+    }
   }
 
   // Sets the MAC address of veth to match the MAC address of the host
@@ -1561,28 +1762,27 @@ Future<Limitation> PortMappingIsolatorProcess::watch(
 
 
 void PortMappingIsolatorProcess::_update(
-    const Future<Option<int> >& status,
-    const ContainerID& containerId)
+    const ContainerID& containerId,
+    const Future<Option<int> >& status)
 {
   if (!status.isReady()) {
     ++metrics.updating_container_ip_filters_errors;
 
-    LOG(ERROR) << "Failed to launch the launcher for updating container "
+    LOG(ERROR) << "Failed to start a process for updating container "
                << containerId << ": "
                << (status.isFailed() ? status.failure() : "discarded");
   } else if (status.get().isNone()) {
     ++metrics.updating_container_ip_filters_errors;
 
-    LOG(ERROR) << "The launcher for updating container " << containerId
+    LOG(ERROR) << "The process for updating container " << containerId
                << " is not expected to be reaped elsewhere";
-
   } else if (status.get().get() != 0) {
     ++metrics.updating_container_ip_filters_errors;
 
-    LOG(ERROR) << "Received non-zero exit status " << status.get().get()
-               << " from the launcher for updating container " << containerId;
+    LOG(ERROR) << "The process for updating container " << containerId << " "
+               << WSTRINGIFY(status.get().get());
   } else {
-    LOG(INFO) << "The launcher for updating container " << containerId
+    LOG(INFO) << "The process for updating container " << containerId
               << " finished successfully";
   }
 }
@@ -1744,8 +1944,8 @@ Future<Nothing> PortMappingIsolatorProcess::update(
     .onAny(defer(
         PID<PortMappingIsolatorProcess>(this),
         &PortMappingIsolatorProcess::_update,
-        lambda::_1,
-        containerId))
+        containerId,
+        lambda::_1))
     .then(lambda::bind(&_nothing));
 }
 
@@ -1779,48 +1979,161 @@ Future<ResourceStatistics> PortMappingIsolatorProcess::usage(
         "Failed to retrieve statistics on link " +
         veth(info->pid.get()) + ": " + stat.error());
   } else if (stat.isNone()) {
-     return Failure(
-         "Failed to find link: " + veth(info->pid.get()));
+    return Failure("Failed to find link: " + veth(info->pid.get()));
   }
 
-  Option<uint64_t> rx_packets = stat.get().get("rx_packets");
+  // Note: The RX/TX statistics on the two ends of the veth are the
+  // exact opposite, because of its 'tunnel' nature. We sample on the
+  // host end of the veth pair, which means we have to reverse RX and
+  // TX to reflect statistics inside the container.
+
+  // +----------+                    +----------+
+  // |          |                    |          |
+  // |          |RX<--------------+TX|          |
+  // |          |                    |          |
+  // |   veth   |                    |   eth0   |
+  // |          |                    |          |
+  // |          |TX+-------------->RX|          |
+  // |          |                    |          |
+  // +----------+                    +----------+
+
+  Option<uint64_t> rx_packets = stat.get().get("tx_packets");
   if (rx_packets.isSome()) {
     result.set_net_rx_packets(rx_packets.get());
   }
 
-  Option<uint64_t> rx_bytes = stat.get().get("rx_bytes");
+  Option<uint64_t> rx_bytes = stat.get().get("tx_bytes");
   if (rx_bytes.isSome()) {
     result.set_net_rx_bytes(rx_bytes.get());
   }
 
-  Option<uint64_t> rx_errors = stat.get().get("rx_errors");
+  Option<uint64_t> rx_errors = stat.get().get("tx_errors");
   if (rx_errors.isSome()) {
     result.set_net_rx_errors(rx_errors.get());
   }
 
-  Option<uint64_t> rx_dropped = stat.get().get("rx_dropped");
+  Option<uint64_t> rx_dropped = stat.get().get("tx_dropped");
   if (rx_dropped.isSome()) {
     result.set_net_rx_dropped(rx_dropped.get());
   }
 
-  Option<uint64_t> tx_packets = stat.get().get("tx_packets");
+  Option<uint64_t> tx_packets = stat.get().get("rx_packets");
   if (tx_packets.isSome()) {
     result.set_net_tx_packets(tx_packets.get());
   }
 
-  Option<uint64_t> tx_bytes = stat.get().get("tx_bytes");
+  Option<uint64_t> tx_bytes = stat.get().get("rx_bytes");
   if (tx_bytes.isSome()) {
     result.set_net_tx_bytes(tx_bytes.get());
   }
 
-  Option<uint64_t> tx_errors = stat.get().get("tx_errors");
+  Option<uint64_t> tx_errors = stat.get().get("rx_errors");
   if (tx_errors.isSome()) {
     result.set_net_tx_errors(tx_errors.get());
   }
 
-  Option<uint64_t> tx_dropped = stat.get().get("tx_dropped");
+  Option<uint64_t> tx_dropped = stat.get().get("rx_dropped");
   if (tx_dropped.isSome()) {
     result.set_net_tx_dropped(tx_dropped.get());
+  }
+
+  if (!flags.network_enable_socket_statistics) {
+    return result;
+  }
+
+  // Retrieve the socket information from inside the container.
+  PortMappingStatistics statistics;
+  statistics.flags.pid = info->pid.get();
+
+  vector<string> argv(2);
+  argv[0] = "mesos-network-helper";
+  argv[1] = PortMappingStatistics::NAME;
+
+  // We don't need STDIN; we need STDOUT for the result; we leave
+  // STDERR as is to log to slave process.
+  Try<Subprocess> s = subprocess(
+      path::join(flags.launcher_dir, "mesos-network-helper"),
+      argv,
+      Subprocess::PATH("/dev/null"),
+      Subprocess::PIPE(),
+      Subprocess::FD(STDERR_FILENO),
+      statistics.flags);
+
+  if (s.isError()) {
+    return Failure("Failed to launch the statistics subcommand: " + s.error());
+  }
+
+  // TODO(chzhcn): it is possible for the subprocess to block on
+  // writing to its end of the pipe and never exit because the pipe
+  // has limited buffer size, but we have been careful to send very
+  // few bytes so this shouldn't be a problem.
+  return s.get().status()
+    .then(defer(
+        PID<PortMappingIsolatorProcess>(this),
+        &PortMappingIsolatorProcess::_usage,
+        result,
+        s.get()));
+}
+
+
+Future<ResourceStatistics> PortMappingIsolatorProcess::_usage(
+    const ResourceStatistics& result,
+    const Subprocess& s)
+{
+  CHECK_READY(s.status());
+
+  Option<int> status = s.status().get();
+
+  if (status.isNone()) {
+    return Failure(
+        "The process for getting network statistics is unexpectedly reaped");
+  } else if (status.get() != 0) {
+    return Failure(
+        "The process for getting network statistics has non-zero exit code: " +
+        WSTRINGIFY(status.get()));
+  }
+
+  return io::read(s.out().get())
+    .then(defer(
+        PID<PortMappingIsolatorProcess>(this),
+        &PortMappingIsolatorProcess::__usage,
+        result,
+        lambda::_1));
+}
+
+
+Future<ResourceStatistics> PortMappingIsolatorProcess::__usage(
+    ResourceStatistics result,
+    const Future<string>& out)
+{
+  CHECK_READY(out);
+
+  // NOTE: It's possible the subprocess has no output.
+  if (out.get().size() > 0) {
+    Try<JSON::Object> object = JSON::parse<JSON::Object>(out.get());
+    if (object.isError()) {
+      return Failure(
+          "Failed to parse the output from the process that gets the "
+          "network statistics: " + object.error());
+    }
+
+    Result<JSON::Number> p50 =
+      object.get().find<JSON::Number>("net_tcp_rtt_microsecs_p50");
+    Result<JSON::Number> p90 =
+      object.get().find<JSON::Number>("net_tcp_rtt_microsecs_p90");
+    Result<JSON::Number> p95 =
+      object.get().find<JSON::Number>("net_tcp_rtt_microsecs_p95");
+    Result<JSON::Number> p99 =
+      object.get().find<JSON::Number>("net_tcp_rtt_microsecs_p99");
+
+    if (!p50.isSome() || !p90.isSome() || !p95.isSome() || !p99.isSome()) {
+      return Failure("Failed to get TCP RTT statistics");
+    }
+
+    result.set_net_tcp_rtt_microsecs_p50(p50.get().value);
+    result.set_net_tcp_rtt_microsecs_p90(p90.get().value);
+    result.set_net_tcp_rtt_microsecs_p95(p95.get().value);
+    result.set_net_tcp_rtt_microsecs_p99(p99.get().value);
   }
 
   return result;
@@ -2015,11 +2328,11 @@ Try<Nothing> PortMappingIsolatorProcess::_cleanup(Info* _info)
   // someone entered into the container for debugging purpose. In that
   // case remove will fail, which is okay, because we only leaked an
   // empty file, which could also be reused later if the pid (the name
-  // of the file) is used again. However, we still return error to
-  // indicate that the cleanup hasn't been successful.
+  // of the file) is used again.
   Try<Nothing> rm = os::rm(target);
   if (rm.isError()) {
-    errors.push_back("Failed to remove " + target + ": " + rm.error());
+    LOG(WARNING) << "Failed to remove bind mount '" << target
+                 << "' during cleanup: " << rm.error();
   }
 
   // We manually remove veth to avoid having to wait for the kernel to
@@ -2194,7 +2507,7 @@ Try<Nothing> PortMappingIsolatorProcess::removeHostIPFilters(
   // removed is important. We need to remove filters on host eth0 and
   // host lo first before we remove filters on veth.
 
-  // Remove the IP packet filter from host eth0 to veth of the container
+  // Remove the IP packet filter from host eth0 to veth of the container.
   Try<bool> hostEth0ToVeth = filter::ip::remove(
       eth0,
       ingress::HANDLE,
@@ -2213,7 +2526,7 @@ Try<Nothing> PortMappingIsolatorProcess::removeHostIPFilters(
                << " to " << veth << " does not exist";
   }
 
-  // Remove the IP packet filter from host lo to veth of the container
+  // Remove the IP packet filter from host lo to veth of the container.
   Try<bool> hostLoToVeth = filter::ip::remove(
       lo,
       ingress::HANDLE,
@@ -2304,7 +2617,7 @@ Try<Nothing> PortMappingIsolatorProcess::removeHostIPFilters(
 
 // This function returns the scripts that need to be run in child
 // context before child execs to complete network isolation.
-// TODO(jieyu): Use the launcher abstraction to remove most of the
+// TODO(jieyu): Use the Subcommand abstraction to remove most of the
 // logic here. Completely remove this function once we can assume a
 // newer kernel where 'setns' works for mount namespaces.
 string PortMappingIsolatorProcess::scripts(Info* info)
@@ -2314,14 +2627,12 @@ string PortMappingIsolatorProcess::scripts(Info* info)
   script << "#!/bin/sh\n";
   script << "set -x\n";
 
-  // Remount /proc and /sys to show a separate networking stack.
-  // These should be done by a FilesystemIsolator in the future.
-  script << "mount -n -o remount -t sysfs none /sys\n";
-  script << "mount -n -o remount -t proc none /proc\n";
-
   // Mark the mount point BIND_MOUNT_ROOT as slave mount so that
   // changes in the container will not be propagated to the host.
   script << "mount --make-rslave " << BIND_MOUNT_ROOT << "\n";
+
+  // Disable IPv6 as IPv6 packets won't be forwarded anyway.
+  script << "echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6\n";
 
   // Configure lo and eth0.
   script << "ip link set " << lo << " address " << hostMAC
@@ -2335,7 +2646,7 @@ string PortMappingIsolatorProcess::scripts(Info* info)
          << net::IP(hostDefaultGateway.address()) << "\n";
 
   // Restrict the ephemeral ports that can be used by the container.
-  script << "echo -e " << info->ephemeralPorts.lower() << "\t"
+  script << "echo " << info->ephemeralPorts.lower() << " "
          << (info->ephemeralPorts.upper() - 1)
          << " > /proc/sys/net/ipv4/ip_local_port_range\n";
 
@@ -2349,6 +2660,15 @@ string PortMappingIsolatorProcess::scripts(Info* info)
   // is dropped. This feature exists on 3.6 kernel or newer.
   if (os::exists(path::join("/proc/sys/net/ipv4/conf", lo, "route_localnet"))) {
     script << "echo 1 > /proc/sys/net/ipv4/conf/" << lo << "/route_localnet\n";
+  }
+
+  // Configure container network to match host network configurations.
+  foreachpair (const string& proc,
+               const string& value,
+               hostNetworkConfigurations) {
+    script << "if [ -f \"" << proc << "\" ]; then\n";
+    script << " echo '" << value << "' > " << proc << "\n";
+    script << "fi\n";
   }
 
   // Set up filters on lo and eth0.
@@ -2405,6 +2725,24 @@ string PortMappingIsolatorProcess::scripts(Info* info)
   // Display the filters created on eth0 and lo.
   script << "tc filter show dev " << eth0 << " parent ffff:\n";
   script << "tc filter show dev " << lo << " parent ffff:\n";
+
+  // If throughput limit for container egress traffic exists, use HTB
+  // qdisc to achieve traffic shaping.
+  // TBF has some known issues with GSO packets.
+  // https://git.kernel.org/cgit/linux/kernel/git/davem/net.git/:
+  // e43ac79a4bc6ca90de4ba10983b4ca39cd215b4b
+  // Additionally, HTB has a simpler interface for just capping the
+  // throughput. TBF requires other parameters such as 'burst' that
+  // HTB already has default values for.
+  if (egressRateLimitPerContainer.isSome()) {
+    script << "tc qdisc add dev " << eth0 << " root handle 1: htb default 1\n";
+    script << "tc class add dev " << eth0 << " parent 1: classid 1:1 htb rate "
+           << egressRateLimitPerContainer.get().bytes() * 8 << "bit\n";
+
+    // Display the htb qdisc and class created on eth0.
+    script << "tc qdisc show dev " << eth0 << "\n";
+    script << "tc class show dev " << eth0 << "\n";
+  }
 
   return script.str();
 }
